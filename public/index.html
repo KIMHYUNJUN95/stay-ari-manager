@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <title>HARU Dashboard</title>
+
+    <!-- PWA 설정 -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    <meta name="theme-color" content="#0071E3" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="HARU" />
+
+    <!-- iOS 아이콘 -->
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/icon-192.svg" />
+
+    <!-- 파비콘 -->
+    <link rel="icon" type="image/svg+xml" href="%PUBLIC_URL%/icon-192.svg" />
+
+    <!-- 서비스 워커 등록 -->
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function () {
+                navigator.serviceWorker.register('/sw.js').then(function (registration) {
+                    console.log('ServiceWorker 등록 성공:', registration.scope);
+                }, function (err) {
+                    console.log('ServiceWorker 등록 실패:', err);
+                });
+            });
+        }
+    </script>
+</head>
+
+<body>
+    <noscript>자바스크립트가 필요합니다.</noscript>
+    <div id="root"></div>
+</body>
+
+</html>

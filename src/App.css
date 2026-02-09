@@ -1,0 +1,178 @@
+/* 전체 폰트 및 배경 설정 */
+body {
+  margin: 0;
+  padding: 0;
+  font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, Roboto, 'Helvetica Neue', 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
+  background-color: #f0f2f5; /* 연한 회색 배경 */
+  color: #333;
+}
+
+/* 앱 전체 컨테이너 (중앙 정렬 카드) */
+.app-container {
+  max-width: 800px;
+  margin: 40px auto;
+  background-color: white;
+  padding: 30px;
+  border-radius: 16px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+}
+
+/* 상단 메뉴바 */
+.nav-bar {
+  display: flex;
+  justify-content: center;
+  gap: 15px;
+  margin-bottom: 30px;
+  padding: 10px;
+  background-color: #f8f9fa;
+  border-radius: 12px;
+}
+
+.nav-link {
+  text-decoration: none;
+  font-weight: 700;
+  padding: 12px 20px;
+  border-radius: 8px;
+  transition: all 0.2s ease;
+  color: #555;
+}
+
+.nav-link:hover {
+  background-color: #e9ecef;
+}
+
+/* 메뉴별 포인트 컬러 */
+.nav-stats { color: #2c3e50; }
+.nav-add { color: #007bff; }
+.nav-cancel { color: #dc3545; }
+
+/* 폼 스타일 (입력 페이지) */
+.form-container {
+  max-width: 500px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+.form-title {
+  text-align: center;
+  margin-bottom: 30px;
+  font-size: 1.5rem;
+}
+
+.input-group {
+  margin-bottom: 20px;
+}
+
+.input-label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: #495057;
+}
+
+.input-field {
+  width: 100%;
+  padding: 12px;
+  font-size: 16px;
+  border: 1px solid #dee2e6;
+  border-radius: 8px;
+  box-sizing: border-box; /* 패딩 포함 크기 계산 */
+  transition: border-color 0.2s;
+}
+
+.input-field:focus {
+  outline: none;
+  border-color: #007bff;
+  box-shadow: 0 0 0 3px rgba(0, 123, 255, 0.1);
+}
+
+/* 버튼 스타일 */
+.btn-submit {
+  width: 100%;
+  padding: 14px;
+  font-size: 18px;
+  font-weight: bold;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  margin-top: 10px;
+  transition: transform 0.1s;
+}
+
+.btn-submit:active {
+  transform: scale(0.98);
+}
+
+.btn-blue { background-color: #007bff; }
+.btn-blue:hover { background-color: #0056b3; }
+
+.btn-red { background-color: #dc3545; }
+.btn-red:hover { background-color: #c82333; }
+
+.btn-green { background-color: #28a745; }
+.btn-green:hover { background-color: #218838; }
+
+/* 통계 페이지 스타일 */
+.stats-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 25px;
+  padding-bottom: 15px;
+  border-bottom: 2px solid #f1f3f5;
+}
+
+.month-picker {
+  padding: 8px 12px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 15px;
+}
+
+.building-card {
+  border: 1px solid #eee;
+  border-radius: 12px;
+  overflow: hidden;
+  margin-bottom: 30px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.03);
+}
+
+.building-header {
+  background-color: #f8f9fa;
+  padding: 15px 20px;
+  font-weight: 700;
+  font-size: 1.1rem;
+  border-bottom: 1px solid #eee;
+  color: #343a40;
+}
+
+/* 테이블 스타일 */
+.stats-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: center;
+}
+
+.stats-table th {
+  background-color: #fff;
+  color: #868e96;
+  font-weight: 600;
+  padding: 12px;
+  border-bottom: 1px solid #eee;
+  font-size: 0.9rem;
+}
+
+.stats-table td {
+  padding: 12px;
+  border-bottom: 1px solid #f8f9fa;
+  color: #495057;
+}
+
+.stats-table tr:last-child td {
+  border-bottom: none;
+}
+
+/* 강조 텍스트 */
+.highlight-fire { color: #e03131; font-weight: 800; }
+.highlight-warn { color: #1c7ed6; font-weight: 700; }
