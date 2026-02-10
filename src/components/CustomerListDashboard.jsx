@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { collection, getDocs, query, where } from "firebase/firestore";
 import { db } from '../firebase';
+import { useUser } from '../contexts/UserContext';
 
 // -----------------------------------------------------------------------------
 // [CONSTANTS & LOGIC] Data Management (Preserved)
@@ -61,6 +62,7 @@ const formatRoom = (room) => {
 // -----------------------------------------------------------------------------
 
 const CustomerListDashboard = () => {
+  const { companyId } = useUser();
   const [loading, setLoading] = useState(true);
   const [reservations, setReservations] = useState([]);
   const [searchTerm, setSearchTerm] = useState("");
@@ -68,14 +70,24 @@ const CustomerListDashboard = () => {
   const [sortBy, setSortBy] = useState("recent"); // recent, name, totalSpent
 
   useEffect(() => {
-    fetchCustomerData();
-  }, []);
+    if (companyId) {
+      fetchCustomerData();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companyId]);
 
   const fetchCustomerData = async () => {
+    if (!companyId) {
+      console.warn('⚠️ No companyId for CustomerListDashboard');
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     try {
       const q = query(
         collection(db, "reservations"),
+        where("companyId", "==", companyId),
         where("status", "==", "confirmed")
       );
       const snapshot = await getDocs(q);

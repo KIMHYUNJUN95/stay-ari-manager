@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { collection, getDocs, query, where } from "firebase/firestore";
 import { db } from './firebase';
+import { useUser } from './contexts/UserContext';
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import DatePicker from 'react-datepicker';
 import 'react-datepicker/dist/react-datepicker.css';
@@ -207,6 +208,7 @@ const getRoomEN = (room) => {
 };
 
 const RevenueDashboard = () => {
+  const { companyId } = useUser();
   // 현재 기수를 기본값으로 설정
   const [selectedPeriod, setSelectedPeriod] = useState(getCurrentPeriod());
   const [comparePeriod, setComparePeriod] = useState(getCurrentPeriod() - 1);
@@ -266,13 +268,14 @@ const RevenueDashboard = () => {
 
   // Effect: Standard Mode -> Auto Fetch / Custom Mode -> Fetch only when verifiedConfig updates
   useEffect(() => {
+    if (!companyId) return;
     if (viewMode === 'standard') {
       fetchRevenueData();
     } else if (viewMode === 'custom_compare' && verifiedConfig) {
       fetchRevenueData();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPeriod, comparePeriod, dateMode, selectedYear, selectedMonth, selectedWeekDate, selectedDay, customStartDate, customEndDate, viewMode, verifiedConfig]);
+  }, [companyId, selectedPeriod, comparePeriod, dateMode, selectedYear, selectedMonth, selectedWeekDate, selectedDay, customStartDate, customEndDate, viewMode, verifiedConfig]);
 
   // Search Button Handler
   const handleSearch = () => {
@@ -439,6 +442,12 @@ const RevenueDashboard = () => {
   };
 
   const fetchRevenueData = async () => {
+    if (!companyId) {
+      console.warn('⚠️ No companyId for RevenueDashboard');
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
 
     try {
@@ -451,6 +460,7 @@ const RevenueDashboard = () => {
       // 전체 데이터 가져오기 (2023년부터)
       const q = query(
         collection(db, "reservations"),
+        where("companyId", "==", companyId),
         where("status", "==", "confirmed")
       );
 

@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { collection, query, where, getDocs } from 'firebase/firestore';
 import { db } from '../firebase';
 import { BUILDING_NAMES_EN } from '../constants/buildingData';
+import { useUser } from '../contexts/UserContext';
 
 const SYNC_INTERVAL = 15 * 60 * 1000; // 15 minutes in milliseconds (백엔드 auto-sync와 동기화)
 
@@ -30,6 +31,7 @@ const generateUUID = () => {
  * - Modifications (📝)
  */
 export const useNotifications = () => {
+  const { companyId } = useUser();
   const [notifications, setNotifications] = useState([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
@@ -56,10 +58,16 @@ export const useNotifications = () => {
   }, []);
 
   // Fetch all confirmed reservations from Firestore
-  const fetchReservations = useCallback(async () => {
+  const fetchReservations = useCallback(async (currentCompanyId) => {
     try {
+      if (!currentCompanyId) {
+        console.warn('⚠️ No companyId available for notifications');
+        return null;
+      }
+
       const reservationsQuery = query(
         collection(db, 'reservations'),
+        where('companyId', '==', currentCompanyId),
         where('status', 'in', ['confirmed', 'canceled'])
       );
 
@@ -69,6 +77,7 @@ export const useNotifications = () => {
         ...doc.data()
       }));
 
+      console.log(`🔔 Fetched ${reservations.length} reservations for company ${currentCompanyId}`);
       return reservations;
     } catch (error) {
       console.error('Failed to fetch reservations:', error);
@@ -262,11 +271,16 @@ export const useNotifications = () => {
 
   // Main sync function - fetches data and generates notifications
   const syncReservations = useCallback(async (isManual = false) => {
+    if (!companyId) {
+      console.warn('⚠️ Cannot sync notifications: no companyId');
+      return;
+    }
+
     setIsLoading(true);
 
     try {
       // Fetch latest reservations
-      const fetchedReservations = await fetchReservations();
+      const fetchedReservations = await fetchReservations(companyId);
 
       if (!fetchedReservations) {
         // Silent retry on network error
@@ -389,10 +403,15 @@ export const useNotifications = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [fetchReservations, compareAndNotify, notifications, compressReservations]);
+  }, [companyId, fetchReservations, compareAndNotify, notifications, compressReservations]);
 
   // Set up 15-minute polling interval
   useEffect(() => {
+    if (!companyId) {
+      console.log('⏳ Waiting for companyId to initialize notifications...');
+      return;
+    }
+
     // Initial sync after 5 seconds
     const initialTimer = setTimeout(() => {
       syncReservations();
@@ -407,7 +426,7 @@ export const useNotifications = () => {
       clearTimeout(initialTimer);
       clearInterval(intervalId);
     };
-  }, [syncReservations]);
+  }, [companyId, syncReservations]);
 
   // Mark notification as read
   const markAsRead = useCallback((notificationId) => {

@@ -2,6 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import { collection, getDocs, query, where } from "firebase/firestore";
 import { db } from '../firebase';
+import { useUser } from '../contexts/UserContext';
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 
 // 건물 정렬 순서
@@ -93,6 +94,7 @@ const getOccupiedDaysSet = (reservations, monthStart, monthEnd) => {
 };
 
 const OccupancyRateDashboard = () => {
+  const { companyId } = useUser();
   const currentDate = new Date();
   const [selectedYear, setSelectedYear] = useState(currentDate.getFullYear());
   const [selectedMonth, setSelectedMonth] = useState(currentDate.getMonth() + 1);
@@ -118,8 +120,11 @@ const OccupancyRateDashboard = () => {
   const [overallRate, setOverallRate] = useState(0); // 전체 가동률
 
   useEffect(() => {
-    fetchOccupancyData();
-  }, [selectedMonthStr]);
+    if (companyId) {
+      fetchOccupancyData();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companyId, selectedMonthStr]);
 
   const fetchOccupancyData = async () => {
     setLoading(true);
@@ -156,9 +161,16 @@ const OccupancyRateDashboard = () => {
       const oldestMonth = monthsToFetch[0];
       const latestMonth = monthsToFetch[monthsToFetch.length - 1];
 
+      if (!companyId) {
+        console.warn('⚠️ No companyId for OccupancyRateDashboard');
+        setLoading(false);
+        return;
+      }
+
       // 모든 예약 데이터 가져오기 (status 필터 제거 - 취소 제외는 클라이언트에서 처리)
       const q = query(
         collection(db, "reservations"),
+        where("companyId", "==", companyId),
         where("arrival", "<=", latestMonth.end)  // arrival 기준
       );
 

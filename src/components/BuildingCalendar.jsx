@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { collection, getDocs, query, where, addDoc, writeBatch, doc } from "firebase/firestore";
 import { useNavigate } from 'react-router-dom';
 import { db, auth } from '../firebase';
+import { useUser } from '../contexts/UserContext';
 import dayjs from 'dayjs';
 import axios from 'axios';
 
@@ -1725,6 +1726,7 @@ const dayBtnStyle = {
 
 // 메인 캘린더 컴포넌트
 function BuildingCalendar() {
+  const { companyId } = useUser();
 
   const [selectedBuilding, setSelectedBuilding] = useState("아라키초A");
   const [currentDate, setCurrentDate] = useState(new Date());
@@ -2296,6 +2298,12 @@ function BuildingCalendar() {
 
   // 예약 데이터 새로고침 함수 (외부에서 호출 가능)
   const fetchReservations = useCallback(async () => {
+    if (!companyId) {
+      console.warn('⚠️ No companyId for BuildingCalendar');
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     try {
       // 뷰 모드에 따른 날짜 범위 계산
@@ -2318,6 +2326,7 @@ function BuildingCalendar() {
         const promises = BUILDING_ORDER.map(b => {
           const q = query(
             collection(db, "reservations"),
+            where("companyId", "==", companyId),
             where("building", "==", b),
             where("status", "in", statuses)
           );

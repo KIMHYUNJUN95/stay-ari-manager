@@ -2,6 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import { collection, getDocs, query, where } from "firebase/firestore";
 import { db } from '../firebase';
+import { useUser } from '../contexts/UserContext';
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 
 // 건물 정렬 순서
@@ -424,6 +425,7 @@ const MONTHS = [
 
 // 룸 이름 포맷팅 (호 제거 및 영문 변환)
 const RoomPerformanceDashboard = () => {
+  const { companyId } = useUser();
   const currentDate = getTokyoDate();
 
   const [viewMode, setViewMode] = useState("weekly"); // weekly | monthly
@@ -452,8 +454,11 @@ const RoomPerformanceDashboard = () => {
   const [lowOccupancyRooms, setLowOccupancyRooms] = useState([]);
 
   useEffect(() => {
-    fetchData();
-  }, [viewMode, selectedDate, weekDirection]);
+    if (companyId) {
+      fetchData();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companyId, viewMode, selectedDate, weekDirection]);
 
   const fetchData = async () => {
     setLoading(true);
@@ -524,9 +529,16 @@ const RoomPerformanceDashboard = () => {
       }
 
       // Firestore 쿼리 - 필요한 기간의 모든 예약 가져오기
+      if (!companyId) {
+        console.warn('⚠️ No companyId for RoomPerformanceDashboard');
+        setLoading(false);
+        return;
+      }
+
       const oldestStart = trendRanges[0]?.start || previousRange.start;
       const q = query(
         collection(db, "reservations"),
+        where("companyId", "==", companyId),
         where("departure", ">=", oldestStart),
         where("status", "==", "confirmed")
       );

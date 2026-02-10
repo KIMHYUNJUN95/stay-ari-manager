@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 // 파이어베이스 및 데이터 관련 기능을 파일 내부에서 직접 정의하여 경로 오류 해결
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { getFirestore, collection, getDocs, query, where } from "firebase/firestore";
+import { useUser } from '../contexts/UserContext';
 
 // --- 1. 파이어베이스 설정 (경로 오류 방지를 위한 인라인 포함) ---
 const firebaseConfig = {
@@ -49,6 +50,7 @@ const BUILDING_DATA = {
 const DAIKYO_SOLD_DATE = "2026-01-26";
 
 function StatsAnalysis() {
+  const { companyId } = useUser();
   const currentDate = new Date();
   const [selectedYear, setSelectedYear] = useState(currentDate.getFullYear());
   const [selectedMonth, setSelectedMonth] = useState(currentDate.getMonth() + 1);
@@ -71,12 +73,19 @@ function StatsAnalysis() {
   const YEARS = Array.from({length: 11}, (_, i) => currentDate.getFullYear() - 5 + i);
 
   const calculateStats = async () => {
+    if (!companyId) {
+      console.warn('⚠️ No companyId for StatsAnalysis');
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     setStats(null);
 
     // 1. 선택한 달의 데이터 쿼리
     const q = query(
       collection(db, "reservations"),
+      where("companyId", "==", companyId),
       where("date", ">=", `${targetMonth}-01`),
       where("date", "<=", `${targetMonth}-31`)
     );

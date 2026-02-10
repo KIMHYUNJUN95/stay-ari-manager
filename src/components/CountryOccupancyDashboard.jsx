@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { collection, getDocs, query, where } from "firebase/firestore";
 import { db } from '../firebase';
+import { useUser } from '../contexts/UserContext';
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 
 // Country code to English name mapping
@@ -171,6 +172,7 @@ const PIE_COLORS = [
 ];
 
 const CountryOccupancyDashboard = () => {
+  const { companyId } = useUser();
   const [loading, setLoading] = useState(true);
   const [selectedPeriod, setSelectedPeriod] = useState('all'); // all, thisYear, thisMonth
   const [countryData, setCountryData] = useState([]);
@@ -178,7 +180,10 @@ const CountryOccupancyDashboard = () => {
   const [totalReservations, setTotalReservations] = useState(0);
 
   useEffect(() => {
-    fetchCountryData();
+    if (companyId) {
+      fetchCountryData();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedPeriod]);
 
@@ -199,15 +204,23 @@ const CountryOccupancyDashboard = () => {
 
       // 쿼리 생성 (확정된 예약만)
       let q;
+      if (!companyId) {
+        console.warn('⚠️ No companyId for CountryOccupancyDashboard');
+        setLoading(false);
+        return;
+      }
+
       if (startDate) {
         q = query(
           collection(db, "reservations"),
+          where("companyId", "==", companyId),
           where("status", "==", "confirmed"),
           where("arrival", ">=", startDate)
         );
       } else {
         q = query(
           collection(db, "reservations"),
+          where("companyId", "==", companyId),
           where("status", "==", "confirmed")
         );
       }

@@ -4,6 +4,7 @@
 import React, { useState, useEffect } from 'react';
 import { collection, query, where, onSnapshot } from "firebase/firestore";
 import { db } from '../firebase';
+import { useUser } from '../contexts/UserContext';
 
 // 건물 이름 영어 매핑 (Performance Dashboard와 동일)
 const BUILDING_NAMES_EN = {
@@ -68,6 +69,7 @@ const parseLocalDate = (dateStr) => {
 };
 
 const TodaySummaryDashboard = () => {
+  const { companyId } = useUser();
   const [loading, setLoading] = useState(true);
   const [lastUpdate, setLastUpdate] = useState(null);
   
@@ -140,8 +142,15 @@ const TodaySummaryDashboard = () => {
     // ============================================================
     // 🔴 실시간 리스너: confirmed 예약 전체
     // ============================================================
+    if (!companyId) {
+      console.warn('⚠️ No companyId for TodaySummaryDashboard');
+      setLoading(false);
+      return;
+    }
+
     const mainQuery = query(
       collection(db, "reservations"),
+      where("companyId", "==", companyId),
       where("status", "==", "confirmed")
     );
 
@@ -417,7 +426,7 @@ const TodaySummaryDashboard = () => {
     return () => {
       unsubscribeMain();
     };
-  }, []);
+  }, [companyId]);
 
   // ========================================
   // 유틸리티 함수

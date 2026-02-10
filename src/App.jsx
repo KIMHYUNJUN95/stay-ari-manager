@@ -1,11 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { HashRouter as Router, Routes, Route, useNavigate, useLocation } from 'react-router-dom';
-import { collection, getDocs, query, where } from "firebase/firestore";
+import { collection, getDocs, query, where, doc, getDoc } from "firebase/firestore";
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut } from "firebase/auth";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 
 // ★ 핵심: firebase.js 에서 db, auth 가져오기
 import { db, auth } from './firebase';
+import { UserProvider, useUser } from './contexts/UserContext';
 import RevenueDashboard from './RevenueDashboard.jsx';
 import CleaningDashboard from './components/CleaningDashboard.jsx';
 import OccupancyRateDashboard from './components/OccupancyRateDashboard.jsx';
@@ -15,6 +16,7 @@ import AiChatbot from './components/AiChatbot';
 import BuildingCalendar from './components/BuildingCalendar.jsx';
 import RoomLinksDashboard from './components/RoomLinksDashboard.jsx';
 import CustomerListDashboard from './components/CustomerListDashboard.jsx';
+import MessagesDashboard from './components/MessagesDashboard.jsx';
 import RoomPerformanceDashboard from './components/RoomPerformanceDashboard.jsx';
 import PriceChangeHistory from './components/PriceChangeHistory.jsx';
 import SalesLog from './components/SalesLog.jsx';
@@ -22,6 +24,11 @@ import SalesLogDashboard from './components/SalesLogDashboard.jsx';
 import DesignPreview from './components/DesignPreview.jsx';
 import NewLayout from './components/NewLayout.jsx';
 import ArrivalsAndDeparturesDashboard from './components/ArrivalsAndDeparturesDashboard.jsx';
+import SignUpForm from './components/SignUpForm.jsx';
+import GoogleSignUpForm from './components/GoogleSignUpForm.jsx';
+import PhoneSignIn from './components/PhoneSignIn.jsx';
+import InviteCodeManager from './components/InviteCodeManager.jsx';
+import MyProfile from './components/MyProfile.jsx';
 
 // ★★★ 서버 주소 ★★★
 const GET_ARRIVALS_URL = "https://us-central1-my-booking-app-3f0e7.cloudfunctions.net/getTodayArrivals";
@@ -475,12 +482,52 @@ const BUILDING_DATA = {
 // 로그인 컴포넌트
 // ==============================
 function LoginPage() {
-  const [isSignUp, setIsSignUp] = useState(false);
+  const [showSignUp, setShowSignUp] = useState(false);
+  const [showGoogleSignUp, setShowGoogleSignUp] = useState(false);
+  const [showPhoneSignIn, setShowPhoneSignIn] = useState(false);
+  const [googleUser, setGoogleUser] = useState(null);
   const [email, setEmail] = useState("");
   const [pw, setPw] = useState("");
-  const [confirmPw, setConfirmPw] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // Show Phone SignIn
+  if (showPhoneSignIn) {
+    return (
+      <PhoneSignIn
+        onBack={() => setShowPhoneSignIn(false)}
+      />
+    );
+  }
+
+  // Show Google SignUp Form
+  if (showGoogleSignUp && googleUser) {
+    return (
+      <GoogleSignUpForm
+        googleUser={googleUser}
+        onSuccess={() => {
+          setShowGoogleSignUp(false);
+          setGoogleUser(null);
+        }}
+        onCancel={() => {
+          setShowGoogleSignUp(false);
+          setGoogleUser(null);
+          // Sign out the Google user since they cancelled
+          signOut(auth);
+        }}
+      />
+    );
+  }
+
+  // Show Email SignUp Form
+  if (showSignUp) {
+    return (
+      <SignUpForm
+        onSuccess={() => setShowSignUp(false)}
+        onBackToLogin={() => setShowSignUp(false)}
+      />
+    );
+  }
 
   // 이메일 로그인
   const login = async () => {
@@ -500,43 +547,38 @@ function LoginPage() {
     }
   };
 
-  // 이메일 회원가입
-  const signUp = async () => {
-    if (!email || !pw || !confirmPw) {
-      setError("Please fill in all fields");
-      return;
-    }
-
-    if (pw !== confirmPw) {
-      setError("Passwords do not match");
-      return;
-    }
-
-    if (pw.length < 6) {
-      setError("Password must be at least 6 characters");
-      return;
-    }
-
-    setLoading(true);
-    setError("");
-    try {
-      await createUserWithEmailAndPassword(auth, email, pw);
-      // 회원가입 성공 시 자동 로그인됨
-    } catch (err) {
-      setError(getErrorMessage(err.code));
-    } finally {
-      setLoading(false);
-    }
-  };
-
   // Google 로그인
   const googleLogin = async () => {
     setLoading(true);
     setError("");
+
     try {
       const provider = new GoogleAuthProvider();
-      await signInWithPopup(auth, provider);
+      const result = await signInWithPopup(auth, provider);
+      const user = result.user;
+
+      console.log('🔵 Google login successful:', user.email);
+
+      // Check if user document exists in Firestore
+      const userDocRef = doc(db, 'users', user.uid);
+      const userDocSnap = await getDoc(userDocRef);
+
+      if (userDocSnap.exists()) {
+        // Existing user - login complete (onAuthStateChanged will handle redirect)
+        console.log('✅ Existing Google user - logging in');
+      } else {
+        // New user - show GoogleSignUpForm to complete profile
+        console.log('🆕 New Google user - showing sign up form');
+        setGoogleUser({
+          uid: user.uid,
+          email: user.email,
+          displayName: user.displayName,
+          photoURL: user.photoURL
+        });
+        setShowGoogleSignUp(true);
+      }
     } catch (err) {
+      console.error('❌ Google login error:', err);
       setError(getErrorMessage(err.code));
     } finally {
       setLoading(false);
@@ -563,13 +605,7 @@ function LoginPage() {
     }
   };
 
-  const handleSubmit = () => {
-    if (isSignUp) {
-      signUp();
-    } else {
-      login();
-    }
-  };
+  // Removed - not needed anymore
 
   return (
     <div className="login-container">
@@ -579,14 +615,9 @@ function LoginPage() {
           <span className="login-logo">Haru Studio</span>
           <span className="login-icon">✈️</span>
         </div>
-        <div className="login-title">
-          {isSignUp ? 'Create Account' : 'Welcome Back'}
-        </div>
+        <div className="login-title">Welcome Back</div>
         <div className="login-subtitle">
-          {isSignUp
-            ? 'Sign up to start managing your properties'
-            : 'Sign in to access your property management dashboard'
-          }
+          Sign in to access your property management dashboard
         </div>
 
         {/* Google Login Button */}
@@ -600,6 +631,17 @@ function LoginPage() {
           Continue with Google
         </button>
 
+        {/* Phone Login Button */}
+        <button
+          className="google-login-btn"
+          onClick={() => setShowPhoneSignIn(true)}
+          disabled={loading}
+          style={{ marginTop: '12px', background: '#10B981', borderColor: '#10B981' }}
+        >
+          <span style={{ fontSize: '20px', marginRight: '8px' }}>📱</span>
+          Continue with Phone
+        </button>
+
         <div className="login-divider">
           <span>OR</span>
         </div>
@@ -610,7 +652,7 @@ function LoginPage() {
           type="email"
           value={email}
           onChange={(e) => setEmail(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
+          onKeyDown={(e) => e.key === 'Enter' && login()}
           style={{ marginBottom: '12px' }}
           disabled={loading}
         />
@@ -621,23 +663,10 @@ function LoginPage() {
           placeholder="Password"
           value={pw}
           onChange={(e) => setPw(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
-          style={{ marginBottom: isSignUp ? '12px' : '20px' }}
+          onKeyDown={(e) => e.key === 'Enter' && login()}
+          style={{ marginBottom: '20px' }}
           disabled={loading}
         />
-
-        {isSignUp && (
-          <input
-            className="form-input"
-            type="password"
-            placeholder="Confirm Password"
-            value={confirmPw}
-            onChange={(e) => setConfirmPw(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
-            style={{ marginBottom: '20px' }}
-            disabled={loading}
-          />
-        )}
 
         {error && (
           <p style={{
@@ -655,7 +684,7 @@ function LoginPage() {
 
         <button
           className="form-button"
-          onClick={handleSubmit}
+          onClick={login}
           disabled={loading}
           style={{
             background: loading
@@ -673,7 +702,7 @@ function LoginPage() {
           onMouseEnter={(e) => !loading && (e.currentTarget.style.transform = 'translateY(-2px)')}
           onMouseLeave={(e) => e.currentTarget.style.transform = 'translateY(0)'}
         >
-          {loading ? 'Please wait...' : (isSignUp ? 'Sign Up' : 'Sign In')}
+          {loading ? 'Please wait...' : 'Sign In'}
         </button>
 
         <p style={{
@@ -682,12 +711,11 @@ function LoginPage() {
           color: '#64748B',
           textAlign: 'center'
         }}>
-          {isSignUp ? 'Already have an account? ' : "Don't have an account? "}
+          Don't have an account?{' '}
           <span
             onClick={() => {
-              setIsSignUp(!isSignUp);
+              setShowSignUp(true);
               setError("");
-              setConfirmPw("");
             }}
             style={{
               color: '#667eea',
@@ -696,7 +724,7 @@ function LoginPage() {
               textDecoration: 'underline'
             }}
           >
-            {isSignUp ? 'Sign In' : 'Sign Up'}
+            Sign Up
           </span>
         </p>
 
@@ -705,7 +733,7 @@ function LoginPage() {
           fontSize: '13px',
           color: '#94A3B8'
         }}>
-          By {isSignUp ? 'signing up' : 'signing in'}, you agree to our Terms of Service
+          By signing in, you agree to our Terms of Service
         </p>
       </div>
     </div>
@@ -1285,7 +1313,7 @@ function DeprecatedGuestDetailModal({ guest, onClose }) {
 // ==============================
 // 📊 Performance Dashboard (예약 접수 실적)
 // ==============================
-function PerformanceDashboard({ targetMonth, setTargetMonth }) {
+function PerformanceDashboard({ targetMonth, setTargetMonth, companyId }) {
   const [viewMode, setViewMode] = useState("confirmed");
   const [data, setData] = useState({ total: 0, buildings: [], platforms: [], roomStats: {}, okuboTotal: 0 });
   const [modalData, setModalData] = useState(null);
@@ -1294,6 +1322,10 @@ function PerformanceDashboard({ targetMonth, setTargetMonth }) {
   const fetchData = async () => {
     console.log(`🚀 [VERSION 2026-02-02-Fix-v5] Fetching Dashboard: ${targetMonth}, ${viewMode}`);
 
+    if (!companyId) {
+      console.warn('⚠️ No companyId for PerformanceDashboard');
+      return;
+    }
 
     // Firestore 쿼리 최적화: status로 먼저 필터링
     // ★ Cancelled 모드: "cancelled"와 "blackout" 둘 다 가져오기 (블락/점검 키워드 포함)
@@ -1301,11 +1333,13 @@ function PerformanceDashboard({ targetMonth, setTargetMonth }) {
     if (viewMode === "cancelled") {
       q = query(
         collection(db, "reservations"),
+        where("companyId", "==", companyId),
         where("status", "in", ["cancelled", "blackout"])
       );
     } else {
       q = query(
         collection(db, "reservations"),
+        where("companyId", "==", companyId),
         where("status", "==", "confirmed")
       );
     }
@@ -1449,9 +1483,11 @@ function PerformanceDashboard({ targetMonth, setTargetMonth }) {
   };
 
   useEffect(() => {
-    fetchData();
+    if (companyId) {
+      fetchData();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [targetMonth, viewMode]);
+  }, [companyId, targetMonth, viewMode]);
 
   const handleNumberClick = (title, list) => {
     if (list && list.length > 0) {
@@ -2300,12 +2336,16 @@ const getRoomNameEN = (koreanRoom) => {
   return koreanRoom.replace("호", "").replace(/^(\d+)/, "Room $1");
 };
 
-function OccupancyDashboard({ targetMonth, setTargetMonth }) {
+function OccupancyDashboard({ targetMonth, setTargetMonth, companyId }) {
   const [data, setData] = useState({ total: 0, buildings: [], platforms: [], roomStats: {}, okuboTotal: 0 });
 
   const fetchData = async () => {
+    if (!companyId) {
+      console.warn('⚠️ No companyId for OccupancyDashboard');
+      return;
+    }
     // 숙박 현황은 'stayMonth' 기준
-    const q = query(collection(db, "reservations"), where("stayMonth", "==", targetMonth), where("status", "==", "confirmed"));
+    const q = query(collection(db, "reservations"), where("companyId", "==", companyId), where("stayMonth", "==", targetMonth), where("status", "==", "confirmed"));
     const snapshot = await getDocs(q);
     const reservations = snapshot.docs.map((doc) => doc.data());
 
@@ -2341,9 +2381,11 @@ function OccupancyDashboard({ targetMonth, setTargetMonth }) {
   };
 
   useEffect(() => {
-    fetchData();
+    if (companyId) {
+      fetchData();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [targetMonth]);
+  }, [companyId, targetMonth]);
 
   // 플랫폼별 총계 계산
   const airbnbTotal = Object.values(data.roomStats).reduce((sum, building) =>
@@ -3038,7 +3080,7 @@ function ScrollToTopButton() {
 // ==============================
 // AppContent - Router 내부 컴포넌트 (useLocation 사용)
 // ==============================
-function AppContent({ handleSync, syncing, globalMonth, setGlobalMonth, mobileMenuOpen, setMobileMenuOpen }) {
+function AppContent({ handleSync, syncing, globalMonth, setGlobalMonth, mobileMenuOpen, setMobileMenuOpen, companyId }) {
   const location = useLocation();
   const currentPath = location.pathname;
 
@@ -3052,12 +3094,12 @@ function AppContent({ handleSync, syncing, globalMonth, setGlobalMonth, mobileMe
       <Routes>
         <Route path="/" element={<TodaySummaryDashboard />} />
         <Route path="/ai-assistant" element={<AiChatbot />} />
-        <Route path="/performance" element={<PerformanceDashboard targetMonth={globalMonth} setTargetMonth={setGlobalMonth} />} />
+        <Route path="/performance" element={<PerformanceDashboard targetMonth={globalMonth} setTargetMonth={setGlobalMonth} companyId={companyId} />} />
         <Route path="/revenue" element={<RevenueDashboard />} />
         <Route path="/sales-log" element={<SalesLogDashboard />} />
         <Route path="/daily-log" element={<SalesLog />} />
         <Route path="/calendar" element={<BuildingCalendar />} />
-        <Route path="/occupancy" element={<OccupancyDashboard targetMonth={globalMonth} setTargetMonth={setGlobalMonth} />} />
+        <Route path="/occupancy" element={<OccupancyDashboard targetMonth={globalMonth} setTargetMonth={setGlobalMonth} companyId={companyId} />} />
         <Route path="/occupancy-rate" element={<OccupancyRateDashboard />} />
         <Route path="/room-performance" element={<RoomPerformanceDashboard />} />
         <Route path="/country" element={<CountryOccupancyDashboard />} />
@@ -3065,6 +3107,9 @@ function AppContent({ handleSync, syncing, globalMonth, setGlobalMonth, mobileMe
         <Route path="/cleaning" element={<CleaningDashboard />} />
         <Route path="/room-links" element={<RoomLinksDashboard />} />
         <Route path="/customers" element={<CustomerListDashboard />} />
+        <Route path="/messages" element={<MessagesDashboard />} />
+        <Route path="/invite-codes" element={<InviteCodeManager />} />
+        <Route path="/my-profile" element={<MyProfile />} />
         <Route path="/price-history" element={<PriceChangeHistory />} />
         <Route path="/design-preview" element={<DesignPreview />} />
       </Routes>
@@ -3101,8 +3146,7 @@ function AppContent({ handleSync, syncing, globalMonth, setGlobalMonth, mobileMe
 // 🌐 App — 루트 컴포넌트
 // ==============================
 function App() {
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const { user, userData, companyId, loading } = useUser();
   const [globalMonth, setGlobalMonth] = useState(new Date().toISOString().slice(0, 7));
   const [syncing, setSyncing] = useState(false);
   const [showInstallPrompt, setShowInstallPrompt] = useState(true);
@@ -3197,16 +3241,9 @@ function App() {
     };
   }, []);
 
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (u) => {
-      setUser(u);
-      setLoading(false);
-    });
-    return () => unsubscribe();
-  }, []);
-
   if (loading) return <div style={{ height: "100vh", display: "flex", justifyContent: "center", alignItems: "center" }}>로딩 중...</div>;
-  if (!user) return <><style>{styles}</style><LoginPage /></>;
+  // Show LoginPage if no user OR if user exists but no userData (incomplete signup)
+  if (!user || (user && !userData)) return <><style>{styles}</style><LoginPage /></>;
 
   return (
     <>
@@ -3227,10 +3264,22 @@ function App() {
           setGlobalMonth={setGlobalMonth}
           mobileMenuOpen={mobileMenuOpen}
           setMobileMenuOpen={setMobileMenuOpen}
+          companyId={companyId}
         />
       </Router>
     </>
   );
 }
 
-export default App;
+// ==============================
+// App Wrapper with UserProvider
+// ==============================
+function AppWithProvider() {
+  return (
+    <UserProvider>
+      <App />
+    </UserProvider>
+  );
+}
+
+export default AppWithProvider;

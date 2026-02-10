@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { collection, getDocs, query, where, doc, getDoc, setDoc } from "firebase/firestore";
 import { db } from '../firebase';
+import { useUser } from '../contexts/UserContext';
 
 // Building order (excluding Sano)
 const BUILDING_ORDER = [
@@ -101,6 +102,7 @@ const getOccupiedDaysSet = (reservations, monthStart, monthEnd) => {
 };
 
 const SalesLogDashboard = () => {
+  const { companyId } = useUser();
   // View mode: daily | monthly
   const [viewMode, setViewMode] = useState("monthly");
 
@@ -118,14 +120,24 @@ const SalesLogDashboard = () => {
 
   // Load all data from 2023
   useEffect(() => {
-    fetchAllData();
-  }, []);
+    if (companyId) {
+      fetchAllData();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companyId]);
 
   const fetchAllData = async () => {
+    if (!companyId) {
+      console.warn('⚠️ No companyId for SalesLogDashboard');
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     try {
       const q = query(
         collection(db, "reservations"),
+        where("companyId", "==", companyId),
         where("status", "==", "confirmed")
       );
 

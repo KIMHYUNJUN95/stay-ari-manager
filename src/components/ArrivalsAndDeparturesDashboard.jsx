@@ -5,6 +5,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { useLocation } from 'react-router-dom';
 import { collection, query, where, getDocs } from "firebase/firestore";
 import { db } from '../firebase';
+import { useUser } from '../contexts/UserContext';
 
 // Country code to flag emoji mapping
 const COUNTRY_FLAGS = {
@@ -85,6 +86,7 @@ const getDaysInMonth = (year, month) => {
 };
 
 const ArrivalsAndDeparturesDashboard = () => {
+  const { companyId } = useUser();
   const currentDate = new Date();
   const location = useLocation();
   const [loading, setLoading] = useState(true);
@@ -128,9 +130,11 @@ const ArrivalsAndDeparturesDashboard = () => {
   }, [location.search]);
 
   useEffect(() => {
-    fetchReservations();
+    if (companyId) {
+      fetchReservations();
+    }
     // eslint-disable-next-line
-  }, [selectedDate, searchQuery]);
+  }, [selectedDate, searchQuery, companyId]);
 
   const fetchReservations = async () => {
     setLoading(true);
@@ -138,10 +142,17 @@ const ArrivalsAndDeparturesDashboard = () => {
       let arrivalsData = [];
       let departuresData = [];
 
+      if (!companyId) {
+        console.warn('⚠️ No companyId available, skipping fetch');
+        setLoading(false);
+        return;
+      }
+
       if (searchQuery.trim()) {
         // If there's a search query, fetch all confirmed reservations (no date filter)
         const allQuery = query(
           collection(db, "reservations"),
+          where("companyId", "==", companyId),
           where("status", "==", "confirmed")
         );
         const allSnapshot = await getDocs(allQuery);
@@ -151,17 +162,19 @@ const ArrivalsAndDeparturesDashboard = () => {
         arrivalsData = allReservations;
         departuresData = allReservations;
 
-        console.log(`✈️ Search mode: Loaded ${allReservations.length} total reservations`);
+        console.log(`✈️ Search mode: Loaded ${allReservations.length} total reservations for company ${companyId}`);
       } else {
         // Normal mode: filter by selected date
         const arrivalsQuery = query(
           collection(db, "reservations"),
+          where("companyId", "==", companyId),
           where("status", "==", "confirmed"),
           where("arrival", "==", selectedDate)
         );
 
         const departuresQuery = query(
           collection(db, "reservations"),
+          where("companyId", "==", companyId),
           where("status", "==", "confirmed"),
           where("departure", "==", selectedDate)
         );
@@ -174,7 +187,7 @@ const ArrivalsAndDeparturesDashboard = () => {
         arrivalsData = arrivalsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         departuresData = departuresSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
-        console.log(`✈️ Date mode: Loaded ${arrivalsData.length} arrivals, ${departuresData.length} departures for ${selectedDate}`);
+        console.log(`✈️ Date mode: Loaded ${arrivalsData.length} arrivals, ${departuresData.length} departures for ${selectedDate} (company: ${companyId})`);
       }
 
       // Deduplicate by bookId

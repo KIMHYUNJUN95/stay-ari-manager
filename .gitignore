@@ -28,3 +28,6 @@ nul
 **/nul
 build/
 all_keys_found.txt
+
+# Firebase Service Account Key (NEVER COMMIT!)
+serviceAccountKey.json

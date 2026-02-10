@@ -2,6 +2,7 @@
 import { initializeApp } from "firebase/app";
 import { getFirestore } from "firebase/firestore";
 import { getAuth } from "firebase/auth";
+import { getStorage } from "firebase/storage";
 
 // 사장님의 프로젝트 설정
 const firebaseConfig = {
@@ -17,5 +18,5 @@ const firebaseConfig = {
 // 여기서 딱 한 번 초기화하고 내보냅니다.
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app);
-
 export const auth = getAuth(app);
+export const storage = getStorage(app);

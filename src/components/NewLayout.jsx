@@ -5,6 +5,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { signOut } from "firebase/auth";
 import { auth } from '../firebase';
+import { useUser } from '../contexts/UserContext';
 import NotificationBell from './NotificationBell';
 
 // 메뉴 데이터 (App.jsx와 동일하게 유지)
@@ -23,6 +24,9 @@ const MENU_ITEMS = [
   { path: "/cleaning", label: "Cleaning Schedule", icon: "sparkle" },
   { path: "/room-links", label: "Room Links", icon: "link" },
   { path: "/customers", label: "Customer List", icon: "users" },
+  { path: "/messages", label: "Guest Messages", icon: "message" },
+  { path: "/invite-codes", label: "Team Invites", icon: "ticket" },
+  { path: "/my-profile", label: "My Profile", icon: "user" },
   { path: "/ai-assistant", label: "AI Briefing", icon: "cpu" },
 ];
 
@@ -111,12 +115,29 @@ const MenuIcon = ({ name, active }) => {
         <path d="M22 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" />
       </svg>
     ),
+    ticket: (
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
+        <path d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z" />
+        <path d="M13 5v2" /><path d="M13 17v2" /><path d="M13 11v2" />
+      </svg>
+    ),
+    user: (
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
+        <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" />
+        <circle cx="12" cy="7" r="4" />
+      </svg>
+    ),
     cpu: (
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
         <rect x="4" y="4" width="16" height="16" rx="2" />
         <rect x="9" y="9" width="6" height="6" />
         <path d="M9 1v3" /><path d="M15 1v3" /><path d="M9 20v3" /><path d="M15 20v3" />
         <path d="M20 9h3" /><path d="M20 14h3" /><path d="M1 9h3" /><path d="M1 14h3" />
+      </svg>
+    ),
+    message: (
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
       </svg>
     ),
     help: (
@@ -139,6 +160,7 @@ const NewLayout = ({ children, onSync, syncing }) => {
   const navigate = useNavigate();
   const location = useLocation();
   const currentPath = location.pathname;
+  const { userData } = useUser();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
   const mainRef = React.useRef(null);
@@ -451,20 +473,36 @@ const NewLayout = ({ children, onSync, syncing }) => {
         {!isMobile && (
           <header style={styles.header}>
             <div style={styles.headerLeft}>
-              <input type="text" placeholder="Search..." style={styles.headerSearch} />
+              <input type="text" placeholder="Search..." style={styles.headerSearch} autoComplete="off" />
               <svg style={styles.headerSearchIcon} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#9CA3AF" strokeWidth="2">
                 <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
               </svg>
             </div>
             <div style={styles.headerRight}>
               <NotificationBell />
-              <div style={styles.userSection}>
+              <div
+                style={styles.userSection}
+                onClick={() => navigate('/my-profile')}
+                title="Go to My Profile"
+              >
                 <div style={styles.userInfo}>
-                  <span style={styles.userName}>Admin</span>
-                  <span style={styles.userRole}>Manager</span>
+                  <span style={styles.userName}>
+                    {userData?.fullName || 'User'}
+                  </span>
+                  <span style={styles.userRole}>
+                    {userData?.role === 'owner' ? 'Owner' : 'Member'}
+                  </span>
                 </div>
                 <div style={styles.userAvatar}>
-                  <span style={{ fontSize: '20px' }}>👤</span>
+                  {userData?.profileImage ? (
+                    <img
+                      src={userData.profileImage}
+                      alt="Profile"
+                      style={styles.userAvatarImage}
+                    />
+                  ) : (
+                    <span style={{ fontSize: '20px' }}>👤</span>
+                  )}
                 </div>
               </div>
             </div>
@@ -816,7 +854,9 @@ const styles = {
     alignItems: 'center',
     gap: '12px',
     paddingLeft: '16px',
-    borderLeft: '1px solid #E5E7EB'
+    borderLeft: '1px solid #E5E7EB',
+    cursor: 'pointer',
+    transition: 'all 0.2s ease'
   },
   userInfo: {
     display: 'flex',
@@ -839,7 +879,13 @@ const styles = {
     backgroundColor: '#E5E7EB',
     display: 'flex',
     alignItems: 'center',
-    justifyContent: 'center'
+    justifyContent: 'center',
+    overflow: 'hidden'
+  },
+  userAvatarImage: {
+    width: '100%',
+    height: '100%',
+    objectFit: 'cover'
   },
 
   // 콘텐츠

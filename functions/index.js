@@ -524,7 +524,10 @@ async function saveBookings(list, syncRangeStart = null) {
     // 새로운/업데이트된 예약 저장 (merge: false로 완전 덮어쓰기)
     for (const item of list) {
         const docRef = db.collection("reservations").doc(item.id);
-        batch.set(docRef, item); // merge 없이 완전 덮어쓰기
+        batch.set(docRef, {
+            ...item,
+            companyId: 'dGxlQyu47LbplLVCVXiV'  // 모든 Beds24 동기화 데이터에 companyId 추가
+        }); // merge 없이 완전 덮어쓰기
 
         count++;
         if (count % batchLimit === 0) {
@@ -837,6 +840,10 @@ exports.scheduledBeds24Sync = onSchedule({
     // 2. 가격 동기화 (Firestore 캐싱)
     await syncAllPrices();
     console.log(`✅ 가격 동기화 완료 (${tokyoNow.format("YYYY-MM-DD HH:mm")})`);
+
+    // 3. 메시지 동기화 (OTA 메시지)
+    await syncBookingMessages();
+    console.log(`✅ 메시지 동기화 완료 (${tokyoNow.format("YYYY-MM-DD HH:mm")})`);
 });
 
 // 입/퇴실 조회
@@ -2504,3 +2511,307 @@ exports.deleteSalesLog = onRequest({ cors: true }, async (req, res) => {
         res.status(500).json({ success: false, error: e.message });
     }
 });
+
+// ==========================================
+// 게스트 메시지 관리 (Guest Messages - Beds24 API V2)
+// ==========================================
+
+/**
+ * 여러 예약의 메시지 조회
+ * POST /getBookingMessages
+ * Body: { bookingIds: string[] }
+ */
+exports.getBookingMessages = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, res) => {
+    try {
+        const { bookingIds } = req.body;
+
+        if (!bookingIds || !Array.isArray(bookingIds) || bookingIds.length === 0) {
+            return res.status(400).json({ success: false, error: "bookingIds 배열이 필요합니다" });
+        }
+
+        const token = await getBeds24Token();
+        const messageThreads = [];
+
+        // 각 booking ID에 대해 메시지 조회
+        for (const bookingId of bookingIds) {
+            try {
+                const response = await axios.get(
+                    `https://beds24.com/api/v2/bookings/${bookingId}/messages`,
+                    {
+                        headers: {
+                            "accept": "application/json",
+                            "token": token
+                        }
+                    }
+                );
+
+                const messages = response.data.data || [];
+
+                if (messages.length > 0) {
+                    // 메시지 포맷 변환
+                    const formattedMessages = messages.map(msg => ({
+                        text: msg.message || msg.text || '',
+                        from: msg.type === 'guest' ? 'guest' : 'host',
+                        time: msg.createdAt || msg.time || new Date().toISOString(),
+                        senderName: msg.senderName || (msg.type === 'host' ? 'Staff' : 'Guest'),
+                        messageId: msg.id || null
+                    }));
+
+                    // 시간순 정렬 (오래된 것부터)
+                    formattedMessages.sort((a, b) => new Date(a.time) - new Date(b.time));
+
+                    // 마지막 메시지
+                    const lastMessage = formattedMessages[formattedMessages.length - 1];
+
+                    // 읽지 않은 메시지 확인 (guest 메시지 중 읽지 않은 것)
+                    const hasUnread = messages.some(msg =>
+                        msg.type === 'guest' && msg.read === false
+                    );
+
+                    messageThreads.push({
+                        bookingId,
+                        messages: formattedMessages,
+                        messageCount: formattedMessages.length,
+                        lastMessage: lastMessage.text,
+                        lastMessageTime: lastMessage.time,
+                        hasUnread
+                    });
+                }
+            } catch (bookingError) {
+                // 개별 예약 조회 실패는 로그만 남기고 계속 진행
+                console.warn(`메시지 조회 실패 (bookingId: ${bookingId}):`, bookingError.message);
+            }
+        }
+
+        console.log(`✉️ 메시지 조회 완료: ${messageThreads.length}개 스레드 (총 ${bookingIds.length}개 예약)`);
+
+        res.json({
+            success: true,
+            messages: messageThreads,
+            totalThreads: messageThreads.length,
+            queriedBookings: bookingIds.length
+        });
+    } catch (e) {
+        console.error("getBookingMessages Error:", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/**
+ * 예약에 메시지 전송
+ * POST /sendBookingMessage
+ * Body: { bookingId: string, message: string, senderName?: string }
+ */
+exports.sendBookingMessage = onRequest({ cors: true, timeoutSeconds: 60 }, async (req, res) => {
+    try {
+        const { bookingId, message, senderName } = req.body;
+
+        if (!bookingId || !message) {
+            return res.status(400).json({
+                success: false,
+                error: "bookingId와 message가 필요합니다"
+            });
+        }
+
+        const token = await getBeds24Token();
+
+        // Beds24 API V2로 메시지 전송
+        const response = await axios.post(
+            `https://beds24.com/api/v2/bookings/${bookingId}/messages`,
+            {
+                message: message.trim(),
+                type: 'host',
+                senderName: senderName || 'Staff'
+            },
+            {
+                headers: {
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "token": token
+                }
+            }
+        );
+
+        console.log(`📤 메시지 전송 완료: bookingId=${bookingId}`);
+
+        res.json({
+            success: true,
+            messageId: response.data.id || null,
+            sentAt: new Date().toISOString()
+        });
+    } catch (e) {
+        console.error("sendBookingMessage Error:", e.message);
+
+        // Beds24 API 에러 상세 정보 추출
+        let errorDetail = e.message;
+        if (e.response?.data) {
+            errorDetail = JSON.stringify(e.response.data);
+        }
+
+        res.status(500).json({
+            success: false,
+            error: errorDetail
+        });
+    }
+});
+
+/**
+ * 수동 메시지 동기화 트리거 (사용자 요청)
+ * POST /triggerMessageSync
+ * Body: { companyId?: string } - 특정 회사만 동기화, 없으면 전체
+ */
+exports.triggerMessageSync = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, res) => {
+    try {
+        const { companyId } = req.body;
+
+        console.log(`🔄 수동 메시지 동기화 시작 (companyId: ${companyId || 'ALL'})`);
+
+        const result = await syncBookingMessages(companyId);
+
+        res.json({
+            success: true,
+            ...result,
+            message: `메시지 동기화 완료: ${result.syncedCount}건`
+        });
+    } catch (e) {
+        console.error("triggerMessageSync Error:", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/**
+ * 모든 예약의 메시지를 Beds24에서 동기화하여 Firestore에 저장
+ * 15분 자동 동기화에서 호출됨
+ * @param {string} targetCompanyId - 특정 회사만 동기화 (선택)
+ */
+async function syncBookingMessages(targetCompanyId = null) {
+    try {
+        console.log('📬 메시지 동기화 시작...');
+
+        // 1. Firestore에서 confirmed 상태의 모든 예약 조회
+        const reservationsSnap = await db.collection("reservations")
+            .where("status", "==", "confirmed")
+            .get();
+
+        const bookingIds = new Set();
+        const reservationMap = new Map();
+
+        reservationsSnap.forEach(doc => {
+            const data = doc.data();
+            // 특정 회사만 필터링 (옵션)
+            if (targetCompanyId && data.companyId !== targetCompanyId) {
+                return;
+            }
+            // OTA 예약만 (bookId가 있고 platform이 Manual이 아닌 것)
+            if (data.bookId && data.platform && data.platform !== 'Manual') {
+                bookingIds.add(data.bookId);
+                reservationMap.set(data.bookId, {
+                    companyId: data.companyId,
+                    guestName: data.guestName,
+                    guestCountry: data.guestCountry || data.guestCountry2 || '',
+                    building: data.building,
+                    room: data.room,
+                    arrival: data.arrival,
+                    departure: data.departure,
+                    platform: data.platform
+                });
+            }
+        });
+
+        if (bookingIds.size === 0) {
+            console.log('⚠️ 메시지 동기화할 OTA 예약 없음');
+            return { success: true, syncedCount: 0 };
+        }
+
+        const token = await getBeds24Token();
+        let syncedCount = 0;
+        let errorCount = 0;
+
+        // 2. 각 예약의 메시지 조회 및 Firestore 저장
+        for (const bookingId of bookingIds) {
+            try {
+                const response = await axios.get(
+                    `https://beds24.com/api/v2/bookings/${bookingId}/messages`,
+                    {
+                        headers: {
+                            "accept": "application/json",
+                            "token": token
+                        }
+                    }
+                );
+
+                const messages = response.data.data || [];
+                const reservation = reservationMap.get(bookingId);
+
+                if (!reservation || !reservation.companyId) {
+                    console.warn(`⚠️ companyId 없음: bookingId=${bookingId}`);
+                    continue;
+                }
+
+                // 메시지 포맷 변환
+                const formattedMessages = messages.map(msg => ({
+                    text: msg.message || msg.text || '',
+                    from: msg.type === 'guest' ? 'guest' : 'host',
+                    time: msg.createdAt || msg.time || new Date().toISOString(),
+                    senderName: msg.senderName || (msg.type === 'host' ? 'Staff' : 'Guest'),
+                    messageId: msg.id || null,
+                    read: msg.read !== false // 기본값 true
+                }));
+
+                // 시간순 정렬
+                formattedMessages.sort((a, b) => new Date(a.time) - new Date(b.time));
+
+                // 마지막 메시지 및 읽지 않은 메시지 확인
+                const lastMessage = formattedMessages.length > 0
+                    ? formattedMessages[formattedMessages.length - 1]
+                    : null;
+
+                const hasUnread = messages.some(msg =>
+                    msg.type === 'guest' && msg.read === false
+                );
+
+                // Firestore에 저장 (문서 ID: companyId_bookingId)
+                const docId = `${reservation.companyId}_${bookingId}`;
+                await db.collection("booking_messages").doc(docId).set({
+                    companyId: reservation.companyId,
+                    bookingId: bookingId,
+                    guestName: reservation.guestName,
+                    guestCountry: reservation.guestCountry,
+                    building: reservation.building,
+                    room: reservation.room,
+                    arrival: reservation.arrival,
+                    departure: reservation.departure,
+                    platform: reservation.platform,
+                    messages: formattedMessages,
+                    messageCount: formattedMessages.length,
+                    lastMessage: lastMessage ? lastMessage.text : '',
+                    lastMessageTime: lastMessage ? lastMessage.time : null,
+                    lastMessageFrom: lastMessage ? lastMessage.from : null,
+                    hasUnread: hasUnread,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                syncedCount++;
+            } catch (bookingError) {
+                // 개별 예약 실패는 로그만 남기고 계속 진행
+                console.warn(`⚠️ 메시지 동기화 실패 (bookingId: ${bookingId}):`, bookingError.message);
+                errorCount++;
+            }
+        }
+
+        console.log(`✅ 메시지 동기화 완료: ${syncedCount}건 성공, ${errorCount}건 실패 (총 ${bookingIds.size}건)`);
+
+        return {
+            success: true,
+            syncedCount,
+            errorCount,
+            totalBookings: bookingIds.size
+        };
+    } catch (e) {
+        console.error("syncBookingMessages Error:", e.message);
+        return {
+            success: false,
+            error: e.message
+        };
+    }
+}

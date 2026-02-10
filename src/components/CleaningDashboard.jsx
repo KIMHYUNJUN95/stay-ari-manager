@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { collection, getDocs, query, where, orderBy, limit } from "firebase/firestore";
 import { db } from '../firebase';
+import { useUser } from '../contexts/UserContext';
 
 // -----------------------------------------------------------------------------
 // [CONSTANTS] Configuration & Data
@@ -61,6 +62,7 @@ const sortByBuildingOrder = (list) => {
 // -----------------------------------------------------------------------------
 
 const CleaningDashboard = () => {
+  const { companyId } = useUser();
   const currentDate = new Date();
   const [selectedDate, setSelectedDate] = useState(getLocalDate());
   const [selectedYear, setSelectedYear] = useState(currentDate.getFullYear());
@@ -80,9 +82,16 @@ const CleaningDashboard = () => {
   const fetchData = async () => {
     setLoading(true);
     try {
+      if (!companyId) {
+        console.warn('⚠️ No companyId for CleaningDashboard');
+        setLoading(false);
+        return;
+      }
+
       const departuresSnap = await getDocs(
         query(
           collection(db, "reservations"),
+          where("companyId", "==", companyId),
           where("status", "==", "confirmed"),
           where("departure", "==", selectedDate)
         )
@@ -92,6 +101,7 @@ const CleaningDashboard = () => {
       const arrivalsSnap = await getDocs(
         query(
           collection(db, "reservations"),
+          where("companyId", "==", companyId),
           where("status", "==", "confirmed"),
           where("arrival", "==", selectedDate)
         )
@@ -146,6 +156,7 @@ const CleaningDashboard = () => {
           const nextCheckinSnap = await getDocs(
             query(
               collection(db, "reservations"),
+              where("companyId", "==", companyId),
               where("status", "==", "confirmed"),
               where("building", "==", task.building),
               where("room", "==", task.room),
@@ -180,8 +191,11 @@ const CleaningDashboard = () => {
   };
 
   useEffect(() => {
-    fetchData();
-  }, [selectedDate]);
+    if (companyId) {
+      fetchData();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDate, companyId]);
 
   // ---------------------------------------------------------------------------
   // [STYLES] Haru Studio Enterprise Theme (Inline for specific component)

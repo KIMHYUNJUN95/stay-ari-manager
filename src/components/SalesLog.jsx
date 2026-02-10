@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { collection, getDocs, query, where, doc, getDoc, setDoc, deleteDoc } from "firebase/firestore";
 import { db } from '../firebase';
+import { useUser } from '../contexts/UserContext';
 
 // ==========================================
 // Design System (Apple Style / Premium)
@@ -307,6 +308,7 @@ const styles = {
 };
 
 export default function SalesLog() {
+    const { companyId } = useUser();
     const currentDate = new Date();
     const [selectedYear, setSelectedYear] = useState(currentDate.getFullYear());
     const [selectedMonth, setSelectedMonth] = useState(currentDate.getMonth() + 1);
@@ -339,6 +341,15 @@ export default function SalesLog() {
     // 1. Data Fetching
     // ==========================================
     const fetchLogs = async () => {
+        console.log('🔍 SalesLog - fetchLogs called, companyId:', companyId);
+
+        if (!companyId) {
+            console.warn('⚠️ No companyId - skipping sales logs fetch');
+            setLoading(false);
+            setLogs([]);
+            return;
+        }
+
         setLoading(true);
         setLogs([]);
         try {
@@ -347,8 +358,11 @@ export default function SalesLog() {
             const lastDay = new Date(year, month, 0).getDate();
             const endDate = `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
 
+            console.log('📊 Querying sales_logs with companyId:', companyId, 'from', startDate, 'to', endDate);
+
             const q = query(
                 collection(db, "sales_logs"),
+                where("companyId", "==", companyId),
                 where("__name__", ">=", startDate),
                 where("__name__", "<=", endDate)
             );
@@ -358,6 +372,8 @@ export default function SalesLog() {
                 id: doc.id,
                 ...doc.data()
             }));
+
+            console.log('✅ Fetched sales_logs:', fetchedLogs.length, 'documents');
 
             fetchedLogs.sort((a, b) => a.id.localeCompare(b.id));
             setLogs(fetchedLogs);
@@ -370,6 +386,11 @@ export default function SalesLog() {
 
     // Fetch memos for the selected month
     const fetchMemos = async () => {
+        if (!companyId) {
+            console.warn('⚠️ No companyId - skipping memos fetch');
+            return;
+        }
+
         try {
             const [year, month] = selectedMonthStr.split('-').map(Number);
             const startDate = `${year}-${String(month).padStart(2, '0')}-01`;
@@ -378,6 +399,7 @@ export default function SalesLog() {
 
             const q = query(
                 collection(db, "salesLogMemos"),
+                where("companyId", "==", companyId),
                 where("__name__", ">=", startDate),
                 where("__name__", "<=", endDate)
             );
@@ -396,9 +418,11 @@ export default function SalesLog() {
     };
 
     useEffect(() => {
-        fetchLogs();
-        fetchMemos();
-    }, [selectedMonthStr]);
+        if (companyId) {
+            fetchLogs();
+            fetchMemos();
+        }
+    }, [selectedMonthStr, companyId]);
 
     // ==========================================
     // 2. Identify Target Months (Columns)
@@ -455,13 +479,14 @@ export default function SalesLog() {
     };
 
     const handleSaveMemo = async () => {
-        if (!selectedDate) return;
+        if (!selectedDate || !companyId) return;
 
         setSavingMemo(true);
         try {
             if (memoText.trim()) {
                 await setDoc(doc(db, "salesLogMemos", selectedDate), {
                     memo: memoText.trim(),
+                    companyId: companyId,
                     updatedAt: new Date().toISOString()
                 });
                 setMemos(prev => ({ ...prev, [selectedDate]: memoText.trim() }));
