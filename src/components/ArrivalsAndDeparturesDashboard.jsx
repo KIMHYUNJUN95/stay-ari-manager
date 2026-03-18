@@ -6,6 +6,7 @@ import { useLocation } from 'react-router-dom';
 import { collection, query, where, getDocs } from "firebase/firestore";
 import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
+import { BUILDING_NAMES_EN } from '../constants/buildingData';
 
 // Country code to flag emoji mapping
 const COUNTRY_FLAGS = {
@@ -25,19 +26,6 @@ const getCountryFlag = (countryCode) => {
   if (!countryCode) return '🌐';
   const code = String(countryCode).toUpperCase().trim();
   return COUNTRY_FLAGS[code] || '🌐';
-};
-
-// Building name English mapping
-const BUILDING_NAMES_EN = {
-  "아라키초A": "Arakicho A",
-  "아라키초B": "Arakicho B",
-  "다이쿄초": "Daikyocho",
-  "가부키초": "Kabukicho",
-  "다카다노바바": "Takadanobaba",
-  "오쿠보A동": "Okubo A",
-  "오쿠보B동": "Okubo B",
-  "오쿠보C동": "Okubo C",
-  "사노시": "Sano"
 };
 
 const getBuildingEN = (name) => BUILDING_NAMES_EN[name] || name;

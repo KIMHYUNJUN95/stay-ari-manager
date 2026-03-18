@@ -1,53 +1,8 @@
 import React, { useState } from 'react';
-// 파이어베이스 및 데이터 관련 기능을 파일 내부에서 직접 정의하여 경로 오류 해결
-import { initializeApp, getApps, getApp } from "firebase/app";
-import { getFirestore, collection, getDocs, query, where } from "firebase/firestore";
+import { collection, getDocs, query, where } from "firebase/firestore";
+import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
-
-// --- 1. 파이어베이스 설정 (경로 오류 방지를 위한 인라인 포함) ---
-const firebaseConfig = {
-  apiKey: "AIzaSyBHI6d4mDDBEIB77GVQj5Rz1EbMyPaCjgA",
-  authDomain: "my-booking-app-3f0e7.firebaseapp.com",
-  projectId: "my-booking-app-3f0e7",
-  storageBucket: "my-booking-app-3f0e7.firebasestorage.app",
-  messagingSenderId: "1008418095386",
-  appId: "1:1008418095386:web:99eddb1ec872d0b1906ca3",
-  measurementId: "G-KKNJ5P1KFD"
-};
-
-// 앱이 이미 초기화되었는지 확인 후 초기화 (중복 방지)
-const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
-const db = getFirestore(app);
-
-// --- 2. 건물 데이터 (경로 오류 방지를 위한 인라인 포함) ---
-const BUILDING_DATA = {
-  "아라키초A": [
-    "201호", "202호", "301호", "302호", "401호", "402호",
-    "501호", "502호", "602호", "701호", "702호"
-  ],
-  "아라키초B": [
-    "101호", "102호", "201호", "202호", "301호", "302호", "401호", "402호"
-  ],
-  "다이쿄초": [
-    "B01호", "B02호", "101호", "102호", "201호", "202호", "302호"
-  ],
-  "가부키초": [
-    "202호", "203호", "302호", "303호", "402호", "403호",
-    "502호", "603호", "802호", "803호"
-  ],
-  "다카다노바바": [
-    "2층", "3층", "4층", "5층", "6층", "7층", "8층", "9층"
-  ],
-  "오쿠보": [
-    "A동", "B동", "C동"
-  ],
-  "사노시": [
-    "독채"
-  ]
-};
-
-// ★ 다이쿄초 매각일 (2025-01-25 마지막 운영일)
-const DAIKYO_SOLD_DATE = "2026-01-26";
+import { BUILDING_DATA, EXCLUDED_BUILDING_UI } from '../constants/buildingData';
 
 function StatsAnalysis() {
   const { companyId } = useUser();
@@ -107,9 +62,7 @@ function StatsAnalysis() {
       reservations.forEach(r => {
         const { building, room, status, arrival } = r;
 
-        // 다이쿄초: bookDate가 1/26 이후인 예약만 제외 (1/25 이전 예약은 모두 포함)
-        const bookDate = r.bookDate || arrival;
-        if (building === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE) return;
+        if (building === EXCLUDED_BUILDING_UI) return;
 
         // 데이터 무결성 체크 (혹시 삭제된 객실 데이터가 있을 경우 무시)
         if (report[building] && report[building].rooms[room]) {
@@ -207,7 +160,7 @@ function StatsAnalysis() {
         <div style={{ fontSize: "16px", fontWeight: "600", color: "#475569" }}>Analyzing data...</div>
       </div>}
 
-      {!loading && stats && Object.keys(stats).map(building => {
+      {!loading && stats && Object.keys(stats).filter(building => building !== EXCLUDED_BUILDING_UI).map(building => {
         const getBuildingNameEN = (koreanName) => {
           const nameMap = {
             "아라키초A": "Arakicho A",

@@ -5,31 +5,12 @@ import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 
-// 건물 정렬 순서
-const BUILDING_ORDER = [
-  "아라키초A", "아라키초B", "다이쿄초", "가부키초",
-  "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동", "사노시"
-];
+import { BUILDING_ORDER, BUILDING_NAMES_EN, EXCLUDED_BUILDING_UI, ACTIVE_BUILDING_ORDER } from '../constants/buildingData';
 
-// 건물명 영문 매핑
-const getBuildingNameEN = (koreanName) => {
-  const nameMap = {
-    "아라키초A": "Arakicho A",
-    "아라키초B": "Arakicho B",
-    "다이쿄초": "Daikyocho",
-    "가부키초": "Kabukicho",
-    "다카다노바바": "Takadanobaba",
-    "오쿠보A동": "Okubo A",
-    "오쿠보B동": "Okubo B",
-    "오쿠보C동": "Okubo C",
-    "사노시": "Sanoshi"
-  };
-  return nameMap[koreanName] || koreanName;
-};
+const getBuildingNameEN = (koreanName) => BUILDING_NAMES_EN[koreanName] || koreanName;
 
 // 객실명 영문 변환
 const getRoomNameEN = (koreanRoom) => {
-  // "201호" -> "Room 201", "오쿠보A" -> "Okubo A", "사노" -> "Sano"
   if (koreanRoom === "오쿠보A") return "Okubo A";
   if (koreanRoom === "오쿠보B") return "Okubo B";
   if (koreanRoom === "오쿠보C") return "Okubo C";
@@ -37,16 +18,8 @@ const getRoomNameEN = (koreanRoom) => {
   return koreanRoom.replace("호", "").replace(/^(\d+)/, "Room $1");
 };
 
-// ★ 다이쿄초 매각일 (2025-01-25 마지막 운영일)
-const DAIKYO_SOLD_DATE = "2026-01-26";
-
-// 현재 운영 중인 건물 목록 (날짜 기준)
-const getActiveBuildingOrder = (dateStr) => {
-  if (dateStr >= DAIKYO_SOLD_DATE) {
-    return BUILDING_ORDER.filter(b => b !== "다이쿄초");
-  }
-  return BUILDING_ORDER;
-};
+const getActiveBuildingOrder = () => ACTIVE_BUILDING_ORDER;
+const ACTIVE_BUILDINGS = ACTIVE_BUILDING_ORDER;
 
 // 각 건물의 객실 수 (객실 리스트의 길이)
 const BUILDING_ROOMS = {
@@ -189,20 +162,16 @@ const OccupancyRateDashboard = () => {
         let totalAvailableDays = 0;
 
         Object.keys(BUILDING_ROOMS).forEach(building => {
-          // ★ 사노시는 전체 가동률 계산에서 제외 (독채 + 다른 업체 운영)
-          if (building === "사노시") return;
+          if (building === "사노시" || building === EXCLUDED_BUILDING_UI) return;
 
           const rooms = BUILDING_ROOMS[building];
           rooms.forEach(room => {
-            // ★ 다이쿄초: bookDate가 1/26 이후인 예약만 제외 (1/25 이전 예약은 모두 포함)
-            const roomReservations = allReservations.filter(r => {
-              const bookDate = r.bookDate || r.arrival;
-              return r.building === building &&
-                r.room === room &&
-                r.arrival <= m.end &&
-                r.departure >= m.start &&
-                !(building === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE);
-            });
+            const roomReservations = allReservations.filter(r =>
+              r.building === building &&
+              r.room === room &&
+              r.arrival <= m.end &&
+              r.departure >= m.start
+            );
 
             // 겹침을 제거한 실제 예약된 일수 계산
             const occupiedDays = getOccupiedDaysSet(roomReservations, m.start, m.end);
@@ -228,10 +197,11 @@ const OccupancyRateDashboard = () => {
       setLowSeasonMonths(lowSeasons);
 
       // ===== 선택한 월의 건물별/객실별 가동률 계산 =====
-      const buildingRates = [];
+      let buildingRates = [];
       const roomDetails = {};
 
       Object.keys(BUILDING_ROOMS).forEach(building => {
+        if (building === EXCLUDED_BUILDING_UI) return;
         const rooms = BUILDING_ROOMS[building];
         let buildingOccupiedDays = 0;
         let buildingAvailableDays = 0;
@@ -239,15 +209,12 @@ const OccupancyRateDashboard = () => {
         roomDetails[building] = {};
 
         rooms.forEach(room => {
-          // ★ 다이쿄초: bookDate가 1/26 이후인 예약만 제외 (1/25 이전 예약은 모두 포함)
-          const roomReservations = allReservations.filter(r => {
-            const bookDate = r.bookDate || r.arrival;
-            return r.building === building &&
-              r.room === room &&
-              r.arrival <= monthEnd &&
-              r.departure >= monthStart &&
-              !(building === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE);
-          });
+          const roomReservations = allReservations.filter(r =>
+            r.building === building &&
+            r.room === room &&
+            r.arrival <= monthEnd &&
+            r.departure >= monthStart
+          );
 
           // 겹침을 제거한 실제 예약된 일수 계산
           const occupiedDays = getOccupiedDaysSet(roomReservations, monthStart, monthEnd);
@@ -280,22 +247,22 @@ const OccupancyRateDashboard = () => {
         });
       });
 
-      // 건물 정렬
+      buildingRates = buildingRates.filter(b => b.name !== EXCLUDED_BUILDING_UI);
       buildingRates.sort((a, b) => {
-        const indexA = BUILDING_ORDER.indexOf(a.name);
-        const indexB = BUILDING_ORDER.indexOf(b.name);
+        const indexA = ACTIVE_BUILDINGS.indexOf(a.name);
+        const indexB = ACTIVE_BUILDINGS.indexOf(b.name);
         return (indexA === -1 ? 999 : indexA) - (indexB === -1 ? 999 : indexB);
       });
 
       setBuildingData(buildingRates);
       setRoomData(roomDetails);
 
-      // 전체 평균 가동률 (사노시 제외)
+      // 전체 평균 가동률 (사노시, 다이쿄초 제외)
       const totalOccupied = buildingRates
-        .filter(b => b.name !== "사노시")
+        .filter(b => b.name !== "사노시" && b.name !== EXCLUDED_BUILDING_UI)
         .reduce((sum, b) => sum + b.occupiedDays, 0);
       const totalAvailable = buildingRates
-        .filter(b => b.name !== "사노시")
+        .filter(b => b.name !== "사노시" && b.name !== EXCLUDED_BUILDING_UI)
         .reduce((sum, b) => sum + b.availableDays, 0);
       const overall = totalAvailable > 0 ? (totalOccupied / totalAvailable * 100) : 0;
       setOverallRate(parseFloat(overall.toFixed(1)));
@@ -390,7 +357,7 @@ const OccupancyRateDashboard = () => {
               <div style={{ position: "relative", zIndex: 1 }}>
                 <div style={{ fontSize: "13px", fontWeight: "600", opacity: 0.9, marginBottom: "12px", letterSpacing: "0.5px", textTransform: "uppercase" }}>Overall Rate</div>
                 <div style={{ fontSize: "42px", fontWeight: "700", marginBottom: "8px", lineHeight: 1 }}>{overallRate}%</div>
-                <div style={{ fontSize: "13px", opacity: 0.8 }}>Excluding Sanoshi</div>
+                <div style={{ fontSize: "13px", opacity: 0.8 }}>Excluding Sanoshi & Daikyocho</div>
               </div>
             </div>
             {buildingData.find(b => b.name === "사노시") && (
@@ -452,7 +419,7 @@ const OccupancyRateDashboard = () => {
           </div>
 
           {/* 건물별 상세 가동률 (객실별) */}
-          {BUILDING_ORDER.filter(bName => roomData[bName]).map(bName => {
+          {ACTIVE_BUILDINGS.filter(bName => roomData[bName]).map(bName => {
             const building = buildingData.find(b => b.name === bName);
             if (!building) return null;
 

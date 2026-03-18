@@ -31,3 +31,12 @@ all_keys_found.txt
 
 # Firebase Service Account Key (NEVER COMMIT!)
 serviceAccountKey.json
+
+# Env / secrets (NEVER COMMIT!)
+.env
+.env.*
+!.env.example
+
+# Firebase Functions params (웹훅 URL 등)
+functions/.env
+functions/.env.*

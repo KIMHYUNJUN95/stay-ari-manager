@@ -1,38 +1,27 @@
 import React, { useState, useEffect } from 'react';
-import { collection, query, orderBy, limit, getDocs } from "firebase/firestore";
+import { collection, query, where, orderBy, limit, getDocs } from "firebase/firestore";
 import { db } from '../firebase';
+import { useUser } from '../contexts/UserContext';
 
-// -----------------------------------------------------------------------------
-// [CONSTANTS] Building Name Mapping
-// -----------------------------------------------------------------------------
-const BUILDING_NAMES_EN = {
-    "아라키초A": "Arakicho A",
-    "아라키초B": "Arakicho B",
-    "다이쿄초": "Daikyocho",
-    "가부키초": "Kabukicho",
-    "다카다노바바": "Takadanobaba",
-    "오쿠보A동": "Okubo A",
-    "오쿠보B동": "Okubo B",
-    "오쿠보C동": "Okubo C",
-    "사노": "Sano",
-    "사노시": "Sano",
-    "사노시 사노": "Sano"
-};
+import { BUILDING_NAMES_EN } from '../constants/buildingData';
 
 // -----------------------------------------------------------------------------
 // [COMPONENT] PriceChangeHistory (Haru Studio Theme)
 // -----------------------------------------------------------------------------
 
 function PriceChangeHistory() {
+    const { companyId } = useUser();
     const [logs, setLogs] = useState([]);
     const [loading, setLoading] = useState(true);
     const [expandedId, setExpandedId] = useState(null);
 
     useEffect(() => {
+        if (!companyId) return;
         const fetchLogs = async () => {
             try {
                 const q = query(
                     collection(db, "price_change_logs"),
+                    where("companyId", "==", companyId),
                     orderBy("timestamp", "desc"),
                     limit(500)
                 );
@@ -50,7 +39,7 @@ function PriceChangeHistory() {
         };
 
         fetchLogs();
-    }, []);
+    }, [companyId]);
 
     const formatTimestamp = (ts) => {
         if (!ts) return "-";

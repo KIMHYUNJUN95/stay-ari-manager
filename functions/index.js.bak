@@ -1,0 +1,1573 @@
+const { onRequest } = require("firebase-functions/v2/https");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+const axios = require("axios");
+const admin = require("firebase-admin");
+const dayjs = require("dayjs");
+const utc = require("dayjs/plugin/utc");
+const timezone = require("dayjs/plugin/timezone");
+const { google } = require('googleapis');
+const serviceAccount = require('./serviceAccountKey.json');
+dayjs.extend(utc);
+dayjs.extend(timezone);
+const cors = require("cors")({ origin: true });
+
+admin.initializeApp();
+const db = admin.firestore();
+
+// ==========================================
+// 1) CONSTANTS & MAPPING (사용자 정보 포함)
+// ==========================================
+// const BEDS24_API_KEY = "REMOVED_FOR_V2"; // V2로 완전 전환되어 사용하지 않음
+
+// ==========================================
+// Beds24 API V2 설정 (Firestore 토큰 캐싱)
+// ==========================================
+const BEDS24_REFRESH_TOKEN = "f9dBEWviugAGMcPCPMoRIOG7OpguLo187eDqsuhzaFKNrPdkISHOBZtZaYHGHc2Kc5uEaVljPfPq/xVbzPn0bkXrj2gf6Ly96bpHrsm9X9XwC4U/CAA/QPK9EgbVbQOEAj5iYME1EobhelKpStKYg1OK7zruxGOehEykt7yT5Mw=";
+
+// 기본 Company ID (환경 변수 또는 하드코딩된 기본값)
+// 향후 멀티 테넌트 확장 시 각 회사별 Beds24 토큰 관리 필요
+const DEFAULT_COMPANY_ID = process.env.DEFAULT_COMPANY_ID || 'dGxlQyu47LbplLVCVXiV';
+
+// 메모리 캐시 (같은 인스턴스 내에서 Firestore 읽기 최소화)
+let beds24AccessToken = null;
+let beds24TokenExpiry = 0;
+
+// Firestore 토큰 문서 경로
+const TOKEN_DOC_PATH = "beds24_config/token";
+
+// API V2 Access Token 발급/갱신 함수 (Firestore 캐싱)
+async function getBeds24Token() {
+    const now = Date.now();
+
+    // 1단계: 메모리 캐시 확인 (만료 5분 전까지 사용)
+    if (beds24AccessToken && beds24TokenExpiry > now + 300000) {
+        return beds24AccessToken;
+    }
+
+    // 2단계: Firestore에서 토큰 가져오기
+    try {
+        const tokenDoc = await db.doc(TOKEN_DOC_PATH).get();
+        if (tokenDoc.exists) {
+            const data = tokenDoc.data();
+            // Firestore 토큰이 유효하면 사용 (만료 5분 전까지)
+            if (data.accessToken && data.expiresAt > now + 300000) {
+                beds24AccessToken = data.accessToken;
+                beds24TokenExpiry = data.expiresAt;
+                console.log("Beds24 토큰 Firestore에서 로드 (만료:", new Date(beds24TokenExpiry).toISOString(), ")");
+                return beds24AccessToken;
+            }
+        }
+    } catch (firestoreErr) {
+        console.warn("Firestore 토큰 조회 실패:", firestoreErr.message);
+        // Firestore 실패해도 계속 진행 (토큰 갱신 시도)
+    }
+
+    // 3단계: 토큰 갱신 (Beds24 API 호출)
+    try {
+        console.log("Beds24 토큰 갱신 요청...");
+        const response = await axios.get("https://beds24.com/api/v2/authentication/token", {
+            headers: {
+                "accept": "application/json",
+                "refreshToken": BEDS24_REFRESH_TOKEN
+            }
+        });
+
+        const newToken = response.data.token;
+        const newExpiry = now + (response.data.expiresIn * 1000);
+
+        // 메모리 캐시 업데이트
+        beds24AccessToken = newToken;
+        beds24TokenExpiry = newExpiry;
+
+        // Firestore에 저장 (다른 인스턴스와 공유)
+        try {
+            await db.doc(TOKEN_DOC_PATH).set({
+                accessToken: newToken,
+                expiresAt: newExpiry,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            console.log("Beds24 토큰 갱신 완료 & Firestore 저장 (만료:", new Date(newExpiry).toISOString(), ")");
+        } catch (saveErr) {
+            console.warn("Firestore 토큰 저장 실패:", saveErr.message);
+            // 저장 실패해도 메모리에는 있으므로 계속 진행
+        }
+
+        return beds24AccessToken;
+    } catch (err) {
+        console.error("Beds24 토큰 갱신 실패:", err.message);
+        throw new Error("Beds24 인증 실패: " + err.message);
+    }
+}
+
+
+const PROPERTIES = [
+    { name: "아라키초A", id: "NSoH37aJMipHA4K4MPVyp2pnq", v2Id: 176430, companyId: DEFAULT_COMPANY_ID },
+    { name: "아라키초B", id: "AV3yKzD2gFz4OmNdlv4qANoQc", v2Id: 280663, companyId: DEFAULT_COMPANY_ID },
+    { name: "다이쿄초", id: "CXNtlpJnRuKJDPrTpqOaa3yws", v2Id: 206509, disabled: true, companyId: DEFAULT_COMPANY_ID }, // ★ 매각 완료 (2026-01-25) - API 동기화 중단, 과거 데이터 보존
+    { name: "가부키초", id: "3ldwEucRNOIyhAdAhFWbBhw3e", v2Id: 176431, companyId: DEFAULT_COMPANY_ID },
+    { name: "다카다노바바", id: "8Nx8VcOYwSYVAwG01xkokmsX7", v2Id: 243936, companyId: DEFAULT_COMPANY_ID },
+    { name: "오쿠보A동", id: "dJQloWov7XuXMUmSXyVsLP8LR", v2Id: 205165, companyId: DEFAULT_COMPANY_ID },
+    { name: "오쿠보B동", id: "WbtREQENBg6aIR0pgEIympSAv", v2Id: 294552, companyId: DEFAULT_COMPANY_ID },
+    { name: "오쿠보C동", id: "MXP5jJXp2mPxVhjdTAF0KnHTP", v2Id: 211056, companyId: DEFAULT_COMPANY_ID },
+    { name: "사노시", id: "gDzuVIkyvm5fqtuifdveeIKZO", v2Id: 226546, companyId: DEFAULT_COMPANY_ID }
+];
+
+function getStandardRoomName(roomId, rawName) {
+    const ROOM_MAPPING = {
+        "383971": "201호", "601545": "201호", "403542": "202호", "601546": "202호",
+        "383972": "301호", "601547": "301호", "383978": "302호", "601548": "302호",
+        "440617": "401호", "515300": "401호", "383974": "402호", "601549": "402호",
+        "502229": "501호", "383975": "501호", "383976": "502호", "601550": "502호",
+        "537451": "602호", "601551": "602호", "383973": "701호", "601552": "701호",
+        "383977": "702호", "601553": "702호",
+        "585734": "101호", "585738": "102호", "585735": "201호", "585739": "202호",
+        "585736": "301호", "585740": "302호", "585737": "401호", "585741": "402호",
+        "440619": "B01호", "440620": "B02호", "440621": "101호", "440622": "102호",
+        "440623": "201호", "440624": "202호", "440625": "302호",
+        "383979": "202호", "451220": "202호", "383980": "203호", "452061": "203호",
+        "383981": "302호", "452062": "302호", "383982": "303호", "451223": "303호",
+        "383983": "402호", "451224": "402호", "383984": "403호", "452063": "403호",
+        "543189": "502호", "601560": "502호", "383985": "603호", "452064": "603호",
+        "441885": "802호", "452065": "802호", "624198": "803호", "648398": "803호",
+        "437952": "오쿠보A", "615969": "오쿠보B", "450096": "오쿠보C", "496532": "오쿠보C", "648399": "오쿠보C",
+        "481152": "사노",
+        "513698": "201호", "513699": "301호", "513700": "401호", "556719": "401호",
+        "513701": "501호", "513702": "601호", "513703": "701호", "513704": "801호", "513705": "901호"
+    };
+    return ROOM_MAPPING[roomId] || rawName || `Room(${roomId})`;
+}
+const cleanPrice = (val) => {
+    if (!val) return 0;
+    const num = parseFloat(String(val).replace(/[^0-9.-]+/g, ""));
+    return isNaN(num) ? 0 : num;
+};
+const determineStatus = (b) => {
+    const s = String(b.status).toLowerCase();
+    const guestName = `${b.firstName || b.guestFirstName || ""} ${b.lastName || b.guestName || ""}`.toLowerCase();
+
+    // 블락/점검 키워드 체크
+    if (guestName.includes("블락") || guestName.includes("점검") || guestName.includes("blackout") || guestName.includes("block")) {
+        return "blackout";
+    }
+
+    // V1: 0 = Cancelled, 1/2 = Confirmed
+    // V2: "cancelled"/"canceled" = Cancelled, "new"/"confirmed" = Confirmed
+    // Inquiry/Request: "enquiry"/"request"
+    if (s === "0" || s === "cancelled" || s === "canceled") {
+        return "cancelled";
+    }
+    if (s === "enquiry" || s === "request") {
+        return "inquiry";
+    }
+    if (s === "1" || s === "2" || s === "new" || s === "confirmed") {
+        return "confirmed";
+    }
+
+    return "cancelled";
+};
+
+// ==========================================
+// 2) HELPER: DATE LOGIC (bookingTime 우선순위 적용)
+// ==========================================
+// UTC → 일본시간(UTC+9) 변환 헬퍼
+const toJapanDate = (dateTimeStr) => {
+    if (!dateTimeStr || dateTimeStr.length < 10) return null;
+    // 이미 날짜만 있으면 (YYYY-MM-DD) 그대로 반환
+    if (dateTimeStr.length === 10) return dateTimeStr;
+    // 시간 정보가 있으면 일본 시간대(UTC+9)로 변환
+    try {
+        // Beds24 시간이 UTC라면 +9시간 해서 일본 시간으로 변환
+        const japanDate = dayjs(dateTimeStr).add(9, 'hour');
+        return japanDate.format('YYYY-MM-DD');
+    } catch {
+        return dateTimeStr.slice(0, 10);
+    }
+};
+
+const determineDate = (b) => {
+    // 1순위: [최종 발견 필드] bookingTime 사용 (가장 정확한 예약 접수일)
+    if (b.bookingTime && b.bookingTime.length >= 10) return toJapanDate(b.bookingTime);
+
+    // 2순위: bookTime
+    if (b.bookTime && b.bookTime.length >= 10) return toJapanDate(b.bookTime);
+
+    // 3순위: entryTime
+    if (b.entryTime && b.entryTime.length >= 10) return toJapanDate(b.entryTime);
+
+    // 4순위: invoiceDate (결제일)
+    if (b.invoiceItems && Array.isArray(b.invoiceItems) && b.invoiceItems.length > 0) {
+        const validDates = b.invoiceItems
+            .map(item => item.invoiceDate)
+            .filter(d => d && d.length >= 10)
+            .sort();
+        if (validDates.length > 0) return toJapanDate(validDates[0]);
+    }
+
+    // ★ 입실일(firstNight)은 사용하지 않음 (뻥튀기 영구 방지)
+    return null;
+};
+
+// ==========================================
+// 3) NORMALIZE & FETCH (Normal Sync)
+// ==========================================
+function normalize(b, propKey, building, companyId) {
+    const status = determineStatus(b);
+    const bookDateStr = determineDate(b);
+
+    // V1 vs V2 Mapping
+    // firstNight -> arrival
+    // lastNight -> departure (V2 departure is checkout date, V1 lastNight was last stay night)
+    const arrival = b.arrival ? b.arrival : (b.firstNight ? b.firstNight.slice(0, 10) : null);
+
+    // V2 departure(체크아웃) vs V1 lastNight(마지막박)
+    // V2: b.departure
+    // V1: b.lastNight + 1 day
+    let departure = null;
+    if (b.departure) {
+        departure = b.departure;
+    } else if (b.lastNight) {
+        departure = dayjs(b.lastNight).add(1, 'day').format('YYYY-MM-DD');
+    }
+
+    const stayMonth = arrival ? arrival.slice(0, 7) : null;
+
+    const date = bookDateStr; // 대시보드 쿼리 필드 (정확한 예약 접수일)
+
+    // Source fields
+    const allSources = [b.referer, b.referrer, b.apiSource, b.subSource, b.source, b.channel].join(" ").toLowerCase();
+    let platform = "Airbnb"; // 기본값
+    if (allSources.includes("direct") || allSources.includes("manual") || allSources.includes("phone") || allSources.includes("walk")) {
+        platform = "Direct"; // 수기 예약
+    } else if (allSources.includes("booking")) {
+        platform = "Booking";
+    } else if (allSources.includes("expedia")) {
+        platform = "Expedia";
+    } else if (allSources.includes("agoda")) {
+        platform = "Agoda";
+    }
+
+    let totalPrice = 0;
+    if (Array.isArray(b.invoiceItems) && b.invoiceItems.length > 0) {
+        totalPrice = b.invoiceItems.reduce((s, x) => s + cleanPrice(x.amount || 0), 0);
+    } else if (b.price) {
+        totalPrice = cleanPrice(b.price);
+    } else if (b.amount) {
+        totalPrice = cleanPrice(b.amount);
+    }
+    const nights = (arrival && departure) ? dayjs(departure).diff(dayjs(arrival), "day") : 0;
+
+    const commission = cleanPrice(b.commission) || 0;
+    const netRevenue = totalPrice - commission;
+
+    // V2 Field Mapping for Guest Info
+    const guestFirstName = b.firstName || b.guestFirstName || "";
+    const guestLastName = b.lastName || b.guestName || "";
+    const guestName = `${guestFirstName} ${guestLastName}`.trim();
+
+    // V1 fields
+    const bookId = b.id ? String(b.id) : String(b.bookId);
+    const roomId = String(b.roomId);
+
+    return {
+        id: bookId, bookId: bookId, propKey, roomId: roomId, room: getStandardRoomName(roomId, b.roomName),
+        building, guestName: guestName,
+        status, rawStatus: String(b.status), platform,
+        date, price: totalPrice, nights,
+        bookDate: bookDateStr, arrival, departure, stayMonth, totalPrice,
+        numAdult: parseInt(b.numAdult) || 0,
+        numChild: parseInt(b.numChild) || 0,
+        // ★ 고객 상세 정보 (V2 || V1)
+        guestEmail: b.email || b.guestEmail || "",
+        guestPhone: b.phone || b.guestPhone || b.mobile || b.guestMobile || "",
+        guestCountry: b.country || b.guestCountry || "",
+        guestCountry2: b.country2 || b.guestCountry2 || "",
+        guestAddress: b.address || b.guestAddress || "",
+        guestCity: b.city || b.guestCity || "",
+        guestPostcode: b.postcode || b.guestPostcode || "",
+        guestComments: b.comments || b.guestComments || b.notes || "",
+        guestTitle: b.title || b.guestTitle || "",
+        arrivalTime: b.arrivalTime || b.guestArrivalTime || "",
+        lang: b.lang || "",
+        // ★ 금액/정산 관련
+        commission: commission,
+        netRevenue: netRevenue,
+        currency: b.currency || "JPY",
+        deposit: cleanPrice(b.deposit) || 0,
+        tax: cleanPrice(b.tax) || 0,
+        rateDescription: b.rateDescription || "",
+        // ★ 채널/예약 관련
+        apiReference: b.apiReference || "",
+        referer: b.referer || "",
+        // ★ 시간/이력 관련 (V2 modifiedTime)
+        // ★ 취소된 예약인데 cancelTime이 없으면 modifiedTime을 cancelTime으로 사용
+        cancelTime: b.cancelTime || (status === "cancelled" ? (b.modifiedTime || b.modified || "") : ""),
+        modified: b.modifiedTime || b.modified || "",
+        // ★ 플래그/표시
+        flagColor: b.flagColor || "",
+        flagText: b.flagText || "",
+
+        // ★ 메시지 (Beds24 -> Firebase)
+        guestMessages: Array.isArray(b.messages) ? b.messages.map(m => ({
+            id: m.id || "",
+            title: m.subject || "",
+            message: m.message || "",
+            type: m.type || "unknown",
+            time: m.time || "",
+            from: m.from || "unknown"
+        })) : [],
+
+        updatedAt: new Date(),
+        companyId: companyId,
+    };
+}
+
+// ★ Beds24 API V2 호출 (페이지네이션 + 순차 호출)
+// Beds24 제한: 1회 최대 100건, 동시 1개 호출만 허용
+// V2 Endpoint: GET /bookings
+async function fetchAllBookingsFromProperty(prop, dateParams) {
+    const allBookings = [];
+
+    // V1 날짜 포맷(YYYYMMDD)이 들어오면 V2 포맷(YYYY-MM-DD)으로 변환
+    const toV2Date = (d) => {
+        if (!d || d.length !== 8) return d;
+        return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
+    };
+
+    // 파라미터 준비
+    const finalParams = { ...dateParams };
+    if (finalParams.arrivalFrom) finalParams.arrivalFrom = toV2Date(finalParams.arrivalFrom);
+    if (finalParams.arrivalTo) finalParams.arrivalTo = toV2Date(finalParams.arrivalTo);
+
+    // ★ 세 번 조회: 1) 일반 예약, 2) 취소된 예약, 3) 문의
+    // Beds24 V2 API 지원 status: confirmed, request, new, cancelled, black, inquiry
+    // "enquiry" X → "inquiry" O
+    const statusesToFetch = [null, "cancelled", "inquiry", "request"];  // null = 기본(new/confirmed)
+
+    for (const statusFilter of statusesToFetch) {
+        let page = 1;
+        const statusLabel = statusFilter || "active";
+
+        while (true) {
+            try {
+                // API 파라미터 구성
+                const params = {
+                    propertyId: prop.v2Id,
+                    page: page,
+                    limit: 100
+                };
+
+                // 상태 필터 추가
+                if (statusFilter) {
+                    params.status = statusFilter;
+                }
+
+                // 날짜 파라미터 추가
+                if (finalParams.arrivalFrom) params.arrivalFrom = finalParams.arrivalFrom;
+                if (finalParams.arrivalTo) params.arrivalTo = finalParams.arrivalTo;
+
+                // ★ V2 API 호출
+                const token = await getBeds24Token();
+                const res = await axios.get("https://beds24.com/api/v2/bookings", {
+                    headers: { "token": token },
+                    params: params
+                });
+
+                // ★ 에러 응답 명시적 체크 (V2 success flag)
+                if (res.data && res.data.success === false) {
+                    throw new Error(`Beds24 API V2 Error: ${res.data.error}`);
+                }
+
+                const arr = (res.data && Array.isArray(res.data.data)) ? res.data.data : [];
+
+                console.log(`  📦 ${prop.name} [${statusLabel}]: page=${page}, ${arr.length}건`);
+
+                if (arr.length === 0) break;
+
+                allBookings.push(...arr.map((b) => normalize(b, prop.id, prop.name, prop.companyId)));
+
+                // 다음 페이지 존재 여부 확인
+                const pagesInfo = res.data.pages;
+                if (pagesInfo && pagesInfo.nextPageExists) {
+                    page++;
+                    // 페이지네이션 사이 딜레이
+                    await new Promise(resolve => setTimeout(resolve, 1500));
+                } else {
+                    break;
+                }
+
+            } catch (err) {
+                console.error(`❌ Fetch Error (${prop.name} [${statusLabel}], page=${page}):`, err.message);
+                // 400 Bad Request: 해당 status를 API가 지원 안 함 → 스킵하고 다음 status로 진행
+                if (err.response && err.response.status === 400) {
+                    console.warn(`  ⚠️ status="${statusFilter}" 400 오류 → 스킵`);
+                    break;
+                }
+                throw err;
+            }
+        }
+
+        // 상태 변경 사이 딜레이
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+
+    // 취소 예약 카운트 로그
+    const cancelledCount = allBookings.filter(b => b.status === "cancelled").length;
+    console.log(`  ✅ ${prop.name} 총합: ${allBookings.length}건 (취소: ${cancelledCount}건)`);
+
+    return allBookings;
+}
+
+
+// 빠른 동기화: 도쿄 시간 기준 6개월 전 ~ 향후 18개월 (서버/로컬 시간차 보정)
+// ★ 서버가 2025년일 경우, 2026년 2월 데이터를 잡기 위해 +1년 이상의 버퍼 필요
+async function fetchFromBeds24Quick() {
+    const tokyoNow = dayjs().utcOffset(9);
+    // ★ 원복: 체크인 날짜(Arrival) 기준 6개월 (동기화는 넓게 가져오고, 필터는 프론트에서)
+    const arrivalFrom = tokyoNow.subtract(6, "month").format("YYYYMMDD");
+    const arrivalTo = tokyoNow.add(6, "month").format("YYYYMMDD");
+
+    console.log(`[Quick Sync] Tokyo: ${tokyoNow.format("YYYY-MM-DD HH:mm")} | Arrival Range: ${arrivalFrom} ~ ${arrivalTo}`);
+
+    const allBookings = [];
+
+    // ★ 순차 호출 (Beds24 제한: 동시 1개만)
+    for (const prop of PROPERTIES) {
+        if (prop.disabled) {
+            console.log(` skip: skipping (disabled): ${prop.name}`);
+            continue;
+        }
+        console.log(`🔄 Fetching: ${prop.name}...`);
+        // ★ 변경: 다시 Arrival 기준 (사용자 요청: 동기화는 건드리지 마라)
+        const bookings = await fetchAllBookingsFromProperty(prop, {
+            arrivalFrom: arrivalFrom,
+            arrivalTo: arrivalTo
+        });
+        allBookings.push(...bookings);
+
+        // API 호출 사이 딜레이 (2초로 증가 - Rate Limit 방지)
+        await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+
+    console.log(`✅ Quick Sync 완료: 총 ${allBookings.length}건`);
+    return allBookings;
+}
+
+// 전체 동기화: 2023년 1월부터 향후 2년 (표준)
+async function fetchFromBeds24Full() {
+    const arrivalFrom = "2023-01-01"; // 다시 2023년부터 조회
+    const arrivalTo = dayjs().add(24, "month").format("YYYY-MM-DD"); // V2 형식 유지
+
+    console.log(`[Full Sync] ${arrivalFrom} ~ ${arrivalTo}`);
+
+    const allBookings = [];
+
+    // ★ 순차 호출 (Beds24 제한: 동시 1개만)
+    for (const prop of PROPERTIES) {
+        if (prop.disabled) {
+            console.log(` skip: skipping (disabled): ${prop.name}`);
+            continue;
+        }
+        console.log(`🔄 Fetching: ${prop.name}...`);
+        // ★ 변경: 객체 형태로 전달 (Arrival 기준)
+        const bookings = await fetchAllBookingsFromProperty(prop, {
+            arrivalFrom: arrivalFrom,
+            arrivalTo: arrivalTo
+        });
+        allBookings.push(...bookings);
+
+        // API 호출 사이 딜레이 (2초로 증가 - Rate Limit 방지)
+        await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+
+    console.log(`✅ Full Sync 완료: 총 ${allBookings.length}건`);
+    return allBookings;
+}
+
+// saveBookings: syncRangeStart를 전달받아 해당 범위 내의 예약만 취소 처리
+// companyId 매개변수 추가 (멀티 테넌트 지원)
+async function saveBookings(list, syncRangeStart = null, companyId = DEFAULT_COMPANY_ID) {
+    const batchLimit = 400;
+    let batch = db.batch();
+    let count = 0;
+
+    // Beds24에서 가져온 예약 ID 목록
+    const beds24BookIds = new Set(list.map(item => item.id));
+
+    // 건물별로 기존 예약 확인 및 삭제/취소 처리
+    const buildingsInList = [...new Set(list.map(item => item.building))];
+
+    // ★ 동기화 범위 시작일 (Quick Sync: 오늘, Full Sync: 2023-01-01)
+    const rangeStartDate = syncRangeStart ? new Date(syncRangeStart) : null;
+
+    for (const building of buildingsInList) {
+        const existingSnap = await db.collection("reservations")
+            .where("building", "==", building)
+            .get();
+
+        for (const doc of existingSnap.docs) {
+            const docId = doc.id;
+            // Beds24에 없는 예약은 cancelled로 표시
+            if (!beds24BookIds.has(docId)) {
+                const existingData = doc.data();
+                // 이미 cancelled가 아니고, 활성 상태인 경우 (confirmed, blackout, maintenance 포함)
+                const activeStatuses = ["confirmed", "blackout", "maintenance"];
+                if (activeStatuses.includes(existingData.status) && existingData.arrival) {
+                    const arrivalDate = new Date(existingData.arrival);
+
+                    // ★ 핵심 수정: 동기화 범위 내의 예약만 취소 처리
+                    // Quick Sync는 오늘 이후 예약만 가져오므로, 과거 예약은 건드리지 않음
+                    if (rangeStartDate && arrivalDate < rangeStartDate) {
+                        // 동기화 범위 이전의 예약은 건드리지 않음 (과거 예약 보존)
+                        continue; // for...of 에서는 continue 사용
+                    }
+
+                    const sixMonthsAgo = new Date();
+                    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+                    if (arrivalDate > sixMonthsAgo) {
+                        console.log(`Marking as cancelled (not in Beds24): ${docId} - ${existingData.guestName}`);
+                        batch.update(doc.ref, {
+                            status: "cancelled",
+                            updatedAt: new Date(),
+                            syncNote: "Beds24에서 삭제됨"
+                        });
+                        count++;
+
+                        if (count % batchLimit === 0) {
+                            await batch.commit(); // ★ 이제 정상적으로 작동
+                            batch = db.batch();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 새로운/업데이트된 예약 저장 (merge: false로 완전 덮어쓰기)
+    for (const item of list) {
+        const docRef = db.collection("reservations").doc(item.id);
+        batch.set(docRef, {
+            ...item,
+            companyId: companyId  // 동적 companyId 사용 (멀티 테넌트 지원)
+        }); // merge 없이 완전 덮어쓰기
+
+        count++;
+        if (count % batchLimit === 0) {
+            await batch.commit();
+            batch = db.batch();
+        }
+    }
+    if (count % batchLimit !== 0) { await batch.commit(); }
+    return count;
+}
+
+
+// ==========================================
+// 4) EXPORTS
+// ==========================================
+
+// 빠른 동기화 (기본) - 6개월 전 ~ 향후 6개월 (과거 예약 변경도 자동 반영)
+// ★ 순차 호출로 변경되어 타임아웃 증가
+exports.syncBeds24 = onRequest({ cors: true, timeoutSeconds: 540, memory: '512MiB' }, async (req, res) => {
+    try {
+        const companyId = req.body?.companyId || DEFAULT_COMPANY_ID;
+        const tokyoNow = dayjs().utcOffset(9);
+        const syncRangeStart = tokyoNow.subtract(6, "month").format("YYYY-MM-DD"); // 6개월 전부터
+        const list = await fetchFromBeds24Quick();
+        const count = await saveBookings(list, syncRangeStart, companyId);
+        res.json({ success: true, message: `빠른 동기화 완료! ${count}건 저장됨 (6개월 전~6개월 후)`, count, companyId });
+    } catch (e) {
+        console.error("Quick Sync Failed:", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 전체 동기화 (관리자용) - 2023년 1월부터 전체
+// ★ 순차 호출 + 페이지네이션으로 모든 데이터 가져오기 (최대 10분)
+exports.syncBeds24Full = onRequest({ cors: true, timeoutSeconds: 900, memory: '1GiB' }, async (req, res) => {
+    try {
+        const companyId = req.body?.companyId || DEFAULT_COMPANY_ID;
+        const syncRangeStart = "2023-01-01"; // 다시 2023년부터
+        const list = await fetchFromBeds24Full();
+        const count = await saveBookings(list, syncRangeStart, companyId);
+        res.json({ success: true, message: `전체 동기화 완료! ${count}건 저장됨 (2023년~향후 24개월)`, count, companyId });
+    } catch (e) {
+        console.error("Full Sync Failed:", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// ==========================================
+// 가격 데이터 동기화 서포트 함수 (Lock & Retry)
+// ==========================================
+
+// 동기화 잠금 관리
+async function useSyncLock(action = 'check') {
+    const lockRef = db.collection("sync_status").doc("price_sync_lock");
+    const now = new Date();
+
+    if (action === 'acquire') {
+        const snap = await lockRef.get();
+        if (snap.exists) {
+            const data = snap.data();
+            const lockTime = data.lockedAt?.toDate() || new Date(0);
+            const diffMinutes = (now - lockTime) / (1000 * 60);
+
+            // 15분이 지났으면 고착된 락으로 간주하고 강제 점유
+            if (diffMinutes < 15) {
+                console.log(`[Sync Lock] 이미 실행 중입니다 (시작: ${Math.round(diffMinutes)}분 전)`);
+                return false;
+            }
+        }
+        await lockRef.set({ lockedAt: admin.firestore.FieldValue.serverTimestamp(), status: 'running' });
+        return true;
+    } else if (action === 'release') {
+        await lockRef.delete();
+        return true;
+    }
+    return false;
+}
+
+// Beds24 API V2 GET 전용 Retry + Backoff 래퍼
+async function beds24GetV2WithRetry(endpoint, params, attempts = 5) {
+    for (let i = 0; i < attempts; i++) {
+        try {
+            const token = await getBeds24Token();
+            const response = await axios.get(`https://beds24.com/api/v2${endpoint}`, {
+                headers: { "token": token },
+                params: params
+            });
+
+            // V2 에러 체크
+            if (response.data && response.data.success === false) {
+                const errorStr = String(response.data.error || "").toLowerCase();
+                if (errorStr.includes("limit exceeded") || errorStr.includes("too many requests")) {
+                    throw { isRateLimit: true, message: response.data.error };
+                }
+                return response;
+            }
+            return response;
+        } catch (err) {
+            const isLastAttempt = i === attempts - 1;
+            const isRateLimit = err.isRateLimit || err.response?.status === 429;
+
+            if (isRateLimit && !isLastAttempt) {
+                const waitSec = (i + 1) * 10; // V2 Rate Limit 대기시간 증가 (10s, 20s..)
+                console.warn(`[V2 Retry] Rate Limit 감지. ${waitSec}초 후 재시도 (${i + 1}/${attempts})`);
+                await new Promise(r => setTimeout(r, waitSec * 1000));
+                continue;
+            }
+
+            if (isLastAttempt) throw err;
+
+            // 일반 네트워크 에러 재시도
+            const waitSec = 2;
+            console.warn(`[V2 Retry] 네트워크 오류: ${err.message}. ${waitSec}초 후 재시도`);
+            await new Promise(r => setTimeout(r, waitSec * 1000));
+        }
+    }
+}
+
+// Beds24 API V2 POST 전용 Retry + Backoff 래퍼
+async function beds24PostV2WithRetry(endpoint, data, attempts = 3) {
+    for (let i = 0; i < attempts; i++) {
+        try {
+            const token = await getBeds24Token();
+            const response = await axios.post(`https://beds24.com/api/v2${endpoint}`, data, {
+                headers: { "token": token }
+            });
+
+            // V2 에러 체크
+            if (response.data && response.data.success === false) {
+                const errorStr = String(response.data.error || "").toLowerCase();
+                if (errorStr.includes("limit exceeded") || errorStr.includes("too many requests")) {
+                    throw { isRateLimit: true, message: response.data.error };
+                }
+                // success === false인 경우 에러로 처리
+                throw new Error(response.data.error || "Beds24 API 호출 실패");
+            }
+            return response;
+        } catch (err) {
+            const isLastAttempt = i === attempts - 1;
+            const isRateLimit = err.isRateLimit || err.response?.status === 429;
+
+            if (isRateLimit && !isLastAttempt) {
+                const waitSec = (i + 1) * 10; // V2 Rate Limit 대기시간 증가
+                console.warn(`[V2 POST Retry] Rate Limit 감지. ${waitSec}초 후 재시도 (${i + 1}/${attempts})`);
+                await new Promise(r => setTimeout(r, waitSec * 1000));
+                continue;
+            }
+
+            if (isLastAttempt) throw err;
+
+            // 일반 네트워크 에러 재시도
+            const waitSec = 2;
+            console.warn(`[V2 POST Retry] 네트워크 오류: ${err.message}. ${waitSec}초 후 재시도`);
+            await new Promise(r => setTimeout(r, waitSec * 1000));
+        }
+    }
+}
+
+// 가격 데이터 동기화 함수 (Firestore 캐싱)
+// ==========================================
+async function syncAllPrices() {
+    const isLocked = await useSyncLock('acquire');
+    if (!isLocked) return { error: "Sync already in progress" };
+
+    try {
+        const tokyoNow = dayjs().utcOffset(9);
+        const fromDate = tokyoNow.format("YYYY-MM-DD"); // V2용 (YYYY-MM-DD)
+        const toDate = tokyoNow.add(6, "month").format("YYYY-MM-DD");
+
+        // firestore 저장용 키 생성 (YYYYMMDD) 헬퍼
+        const toKey = (d) => d.replace(/-/g, '');
+
+        console.log(`[V2 Bulletproof Sync] 시작: ${fromDate} ~ ${toDate} (Pace: 0.5s)`);
+        const syncResults = {};
+
+        for (const prop of PROPERTIES) {
+            if (prop.disabled) {
+                console.log(` skip: [Price Sync Skip] ${prop.name}: disabled`);
+                continue;
+            }
+            const buildingName = prop.name;
+            const roomsToFetch = BUILDING_ROOMS[buildingName] || [];
+            if (roomsToFetch.length === 0) continue;
+
+            console.log(`[V2 Sync] 건물 시작: ${buildingName} (${roomsToFetch.length}개 객실)`);
+            let successInBuilding = 0;
+
+            for (const room of roomsToFetch) {
+                const rid = String(room.roomId);
+                try {
+                    // [Cache Protection] 최근 15분 내 수동 수정된 방 스킵
+                    const roomDocRef = db.collection("price_sync").doc(buildingName).collection("rooms").doc(rid);
+                    const existingSnap = await roomDocRef.get();
+                    if (existingSnap.exists) {
+                        const roomCache = existingSnap.data();
+                        const lastUserUpdate = roomCache?.lastManualUpdate?.toDate() || null;
+                        if (lastUserUpdate && dayjs().diff(dayjs(lastUserUpdate), 'minute') < 15) {
+                            console.log(`[Price Sync Skip] ${buildingName} - ${room.name}(${rid}): 최근 수동 수정됨`);
+                            successInBuilding++;
+                            continue;
+                        }
+                    }
+
+                    // ★ V2 API 호출 (GET /inventory/rooms/calendar)
+                    // includePrices 필수! 없으면 가격 데이터가 반환되지 않음
+                    const response = await beds24GetV2WithRetry("/inventory/rooms/calendar", {
+                        roomId: rid,
+                        startDate: fromDate,
+                        endDate: toDate,
+                        includePrices: true,
+                        includeLinkedPrices: true,
+                        includeMinStay: true,
+                        includeMaxStay: true
+                    });
+
+                    // V2 응답 파싱
+                    // 실제 구조: { data: [{ roomId, calendar: [{ from, to, price1, minStay, ... }] }] }
+                    const roomData = response.data?.data?.[0];
+                    if (roomData && Array.isArray(roomData.calendar)) {
+                        const datesObj = {};
+
+                        roomData.calendar.forEach(entry => {
+                            // from/to 범위를 개별 날짜로 확장
+                            const fromDate = dayjs(entry.from);
+                            const toDate = dayjs(entry.to);
+
+                            for (let d = fromDate; d.isBefore(toDate) || d.isSame(toDate, 'day'); d = d.add(1, 'day')) {
+                                const dateKey = d.format('YYYYMMDD');
+                                datesObj[dateKey] = {
+                                    p1: String(entry.price1 || ""),
+                                    p2: String(entry.price2 || ""),
+                                    p3: String(entry.price3 || ""),
+                                    m: String(entry.minStay || ""),
+                                    mx: String(entry.maxStay || "")
+                                };
+                            }
+                        });
+
+                        // 원자적 개별 저장 (Atomic Storage)
+                        await roomDocRef.set({
+                            roomName: room.name,
+                            roomId: rid,
+                            dates: datesObj,
+                            lastSyncRoom: admin.firestore.FieldValue.serverTimestamp()
+                        }, { merge: true });
+                        successInBuilding++;
+                    } else if (response.data?.error) {
+                        console.error(`[Price Sync Error] ${buildingName} - ${room.name}: ${response.data.error}`);
+                    }
+
+                } catch (err) {
+
+    console.error(`[Price Sync Fatal] ${buildingName} - ${room.roomId}:`, err.message);
+}
+
+// V2는 빠르므로 대기 시간 단축 (2.0s -> 0.5s)
+await new Promise(r => setTimeout(r, 500));
+            }
+
+// 건물 요약 정보 업데이트
+await db.collection("price_sync").doc(buildingName).set({
+    building: buildingName,
+    lastSync: admin.firestore.FieldValue.serverTimestamp(),
+    results: syncResults
+}, { merge: true });
+
+console.log(`✅ [Price Sync] ${buildingName} 완료`);
+// 건물 사이 대기
+await new Promise(r => setTimeout(r, 1000));
+        }
+
+return { success: true };
+    } catch (error) {
+    console.error("❌ [Price Sync] Fatal Error:", error);
+    return { success: false, error: error.message };
+}
+});
+
+// Beds24 V2 전용 POST/PUT 유틸리티 (자동 토큰 갱신)
+async function beds24PostV2WithRetry(endpoint, data, method = 'post') {
+    let retryCount = 0;
+    while (retryCount < 2) {
+        try {
+            const token = await getBeds24Token();
+            const config = {
+                headers: { "token": token, "accept": "application/json" }
+            };
+
+            let res;
+            if (method.toLowerCase() === 'post') {
+                res = await axios.post(`https://beds24.com/api/v2${endpoint}`, data, config);
+            } else {
+                res = await axios.put(`https://beds24.com/api/v2${endpoint}`, data, config);
+            }
+
+            if (res.data && res.data.success === false) {
+                // 토큰 만료 에러 (error mapping 필요)
+                if (res.data.error === "Invalid token" || res.data.errorCode === 401) {
+                    console.log("Beds24 V2 토큰 만료 감지, 재갱신 시도...");
+                    beds24AccessToken = null; // 초기화하여 다음 루프에서 갱신 유도
+                    retryCount++;
+                    continue;
+                }
+                throw new Error(res.data.error || "Unknown Beds24 error");
+            }
+            return res.data;
+        } catch (err) {
+            if (err.response && err.response.status === 401) {
+                console.log("Beds24 V2 401 Unauthorized, 재갱신 시도...");
+                beds24AccessToken = null;
+                retryCount++;
+                continue;
+            }
+            throw err;
+        }
+    }
+    throw new Error("Beds24 API retry exceeded");
+}
+
+/**
+ * [V2] minStay/Price 수동 동기화 (특정 건물/룸/날짜 범위)
+ */
+exports.manualSyncV2 = onRequest({ timeoutSeconds: 300, memory: "1GiB" }, async (req, res) => {
+    return cors(req, res, async () => {
+        const { building, roomId, dateFrom, dateTo } = req.query;
+
+        if (!building || !dateFrom || !dateTo) {
+            return res.status(400).send("building, dateFrom, dateTo parameters required");
+        }
+
+        console.log(`[Manual Sync V2] Start: ${building}, ${roomId || 'ALL'}, ${dateFrom}~${dateTo}`);
+
+        try {
+            const results = [];
+            const buildingItems = PROPERTIES.filter(p => p.name === building);
+
+            for (const prop of buildingItems) {
+                // 해당 건물의 룸 링크 가져오기
+                const roomsSnap = await db.collection("room_links").where("building", "==", building).get();
+                const roomInfos = [];
+                roomsSnap.forEach(doc => {
+                    const data = doc.data();
+                    if (!roomId || data.roomId === roomId) {
+                        roomInfos.push(data);
+                    }
+                });
+
+                for (const room of roomInfos) {
+                    console.log(`  - Processing Room: ${room.roomName} (${room.roomId})`);
+
+                    // 1. 가격 데이터 가져오기 (price_sync 컬렉션)
+                    const priceDoc = await db.collection("price_sync").doc(building).get();
+                    if (!priceDoc.exists) continue;
+
+                    const priceData = priceDoc.data().results?.[room.roomId];
+                    if (!priceData || !priceData.calendar) continue;
+
+                    // 2. 날짜 범위 필터링 및 V2 페이로드 생성
+                    const targetDates = priceData.calendar.filter(c => c.date >= dateFrom && c.date <= dateTo);
+                    if (targetDates.length === 0) continue;
+
+                    // Beds24 V2 Inventory Update Format
+                    const inventoryPayload = {
+                        roomId: parseInt(room.roomId),
+                        calendar: targetDates.map(c => ({
+                            date: c.date,
+                            price: c.price,
+                            minStay: c.minStay
+                        }))
+                    };
+
+                    await beds24PostV2WithRetry("/inventory/rooms/calendar", [inventoryPayload]);
+                    results.push({ room: room.roomName, dates: targetDates.length });
+
+                    // 속도 조절
+                    await new Promise(r => setTimeout(r, 500));
+                }
+            }
+
+            res.send({ success: true, results });
+        } catch (error) {
+            console.error("[Manual Sync V2] Error:", error);
+            res.status(500).send({ success: false, error: error.message });
+        }
+    });
+});
+
+/**
+ * [V2] 대시보드에서 minStay 즉시 변경 시 사용
+ */
+exports.setMinStay = onRequest({ memory: "256MiB" }, async (req, res) => {
+    return cors(req, res, async () => {
+        const { building, room, date, minStay } = req.body;
+        if (!building || !room || !date || minStay === undefined) {
+            return res.status(400).send("Missing parameters");
+        }
+
+        console.log(`[setMinStay] Start: ${building} ${room}, ${date}, minStay=${minStay}`);
+
+        try {
+            // 1. roomId 찾기
+            const roomSnap = await db.collection("room_links")
+                .where("building", "==", building)
+                .where("roomName", "==", room)
+                .limit(1)
+                .get();
+
+            if (roomSnap.empty) throw new Error("Room not found in room_links");
+            const targetRoomId = roomSnap.docs[0].data().roomId;
+
+            // 2. Beds24 API V2 호출
+            const payload = {
+                roomId: parseInt(targetRoomId),
+                calendar: [{
+                    date: date,
+                    minStay: parseInt(minStay)
+                }]
+            };
+
+            // 만약 minStay가 1이면, 해당 날짜의 기존 minStay를 '제거'하거나 기본값으로 돌리는 의미일 수 있음
+            // Beds24 V2에서는 값을 명시적으로 보내면 업데이트됨.
+            // 1이 아닌 다른 값으로 바꿀 때는 단일 호출
+            console.log(`[setMinStay] API 호출: roomId=${targetRoomId}, dates=${payload.calendar.length}개`);
+            await beds24PostV2WithRetry("/inventory/rooms/calendar", [payload]);
+            console.log(`[setMinStay] Beds24 API 호출 완료: roomId=${targetRoomId}`);
+        }
+
+        // 3. 원자적 캐시 패칭 (price_sync Atomic)
+        try {
+            const buildingRef = db.collection("price_sync").doc(building);
+            const doc = await buildingRef.get();
+            if (doc.exists) {
+                const results = doc.data().results || {};
+                if (results[targetRoomId]) {
+                    results[targetRoomId].calendar.forEach(c => {
+                        if (c.date === date) {
+                            c.minStay = parseInt(minStay);
+                        }
+                    });
+                    await buildingRef.update({ results });
+                    console.log(`[setMinStay] Firestore price_sync 캐시 업데이트 완료 (minStay=${minStay})`);
+                }
+            }
+        } catch (cacheErr) {
+            console.warn(`[setMinStay] Firestore 캐시 업데이트 실패 (무시 가능):`, cacheErr.message);
+        }
+
+        res.send({ success: true, roomId: targetRoomId });
+    } catch (error) {
+        console.error("[setMinStay] Error:", error);
+        res.status(500).send({ success: false, error: error.message });
+    }
+});
+
+/**
+ * [V2] 대시보드에서 price 즉시 변경 시 사용
+ */
+exports.setPriceV2 = onRequest({ memory: "256MiB" }, async (req, res) => {
+    return cors(req, res, async () => {
+        const { building, room, date, price } = req.body;
+        if (!building || !room || !date || price === undefined) {
+            return res.status(400).send("Missing parameters");
+        }
+
+        console.log(`[setPriceV2] Start: ${building} ${room}, ${date}, price=${price}`);
+
+        try {
+            // 1. roomId 찾기
+            const roomSnap = await db.collection("room_links")
+                .where("building", "==", building)
+                .where("roomName", "==", room)
+                .limit(1)
+                .get();
+
+            if (roomSnap.empty) throw new Error("Room not found in room_links");
+            const targetRoomId = roomSnap.docs[0].data().roomId;
+
+            // 2. Beds24 API V2 호출
+            const payload = {
+                roomId: parseInt(targetRoomId),
+                calendar: [{
+                    date: date,
+                    price: parseFloat(price)
+                }]
+            };
+
+            console.log(`[setPriceV2] API 호출: roomId=${targetRoomId}, date=${date}, price=${price}`);
+            await beds24PostV2WithRetry("/inventory/rooms/calendar", [payload]);
+            console.log(`[setPriceV2] Beds24 API 호출 완료`);
+
+            // 3. Firestore 캐시 업데이트
+            try {
+                const buildingRef = db.collection("price_sync").doc(building);
+                const doc = await buildingRef.get();
+                if (doc.exists) {
+                    const results = doc.data().results || {};
+                    if (results[targetRoomId]) {
+                        results[targetRoomId].calendar.forEach(c => {
+                            if (c.date === date) {
+                                c.price = parseFloat(price);
+                            }
+                        });
+                        await buildingRef.update({ results });
+                        console.log(`[setPriceV2] Firestore price_sync 캐시 업데이트 완료`);
+                    }
+                }
+            } catch (cacheErr) {
+                console.warn(`[setPriceV2] Firestore 캐시 업데이트 실패:`, cacheErr.message);
+            }
+
+            res.send({ success: true, roomId: targetRoomId });
+        } catch (error) {
+            console.error("[setPriceV2] Error:", error);
+            res.status(500).send({ success: false, error: error.message });
+        }
+    });
+});
+
+/**
+ * [V2] 메시지 전송 (Beds24 V2 API)
+ */
+exports.sendMessageV2 = onRequest({ memory: "256MiB" }, async (req, res) => {
+    return cors(req, res, async () => {
+        const { bookingId, message, senderName, companyId } = req.body;
+        if (!bookingId || !message) {
+            return res.status(400).send("bookingId, message variables required");
+        }
+
+        try {
+            const token = await getBeds24Token();
+
+            // Beds24 V2 Message API Endpoint (추정 또는 실제 확인 필요)
+            // v2: POST /bookings/{id}/messages
+            const endpoint = `https://beds24.com/api/v2/bookings/${bookingId}/messages`;
+
+            const response = await axios.post(endpoint, {
+                message: message.trim()
+            }, {
+                headers: { "token": token, "accept": "application/json" }
+            });
+
+            if (response.data && response.data.success === false) {
+                throw new Error(response.data.error || "Beds24 Error");
+            }
+
+            // [추가] 보낸 메시지 Firestore에 즉시 기록 (UI 반영용)
+            if (companyId) {
+                const docId = `${companyId}_${bookingId}`;
+                const sentAt = new Date().toISOString();
+                const newMessage = {
+                    text: message.trim(),
+                    from: 'host',
+                    time: sentAt,
+                    senderName: senderName || 'Staff',
+                    messageId: response.data.id || null,
+                    read: true
+                };
+
+                try {
+                    await db.collection("messages").doc(docId).set({
+                        messages: admin.firestore.FieldValue.arrayUnion(newMessage),
+                        lastMessage: message.trim().substring(0, 100),
+                        lastMessageTime: sentAt,
+                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+                    console.log(`[sendMessageV2] Firestore 이력 기록 완료: ${docId}`);
+                } catch (dbErr) {
+                    console.error("[sendMessageV2] Firestore 기록 실패:", dbErr.message);
+                }
+            }
+
+            res.send({ success: true, data: response.data });
+        } catch (error) {
+            console.error("[sendMessageV2] Error:", error.message);
+            res.status(500).send({ success: false, error: error.message });
+        }
+    });
+});
+
+if (companyId) {
+    const docId = `${companyId}_${bookingId}`;
+    const sentAt = new Date().toISOString();
+    const newMessage = {
+        text: message.trim(),
+        from: 'host',
+        time: sentAt,
+        senderName: senderName || 'Staff',
+        messageId: response.data.id || null,
+        read: true
+    };
+
+    try {
+        const messageRef = db.collection("messages").doc(docId);
+        const messageDoc = await messageRef.get();
+        if (messageDoc.exists) {
+            await messageRef.update({
+                messages: admin.firestore.FieldValue.arrayUnion(newMessage),
+                lastMessage: message.trim().substring(0, 100),
+                lastMessageTime: sentAt,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+        } else {
+            await messageRef.set({
+                bookingId: String(bookingId),
+                messages: [newMessage],
+                lastMessage: message.trim().substring(0, 100),
+                lastMessageTime: sentAt,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                companyId: companyId
+            });
+        }
+        console.log(`[sendMessageV2] Firestore 이력 기록 완료: ${docId}`);
+    } catch (dbErr) {
+        console.error("[sendMessageV2] Firestore 기록 실패:", dbErr.message);
+    }
+}
+
+res.send({ success: true, data: response.data });
+    } catch (error) {
+    console.error("[sendMessageV2] Error:", error.message);
+    res.status(500).send({ success: false, error: error.message });
+}
+});
+
+/**
+ * [V2] 스케줄된 데일리 리포트 (MTD 집계 + 구글 시트)
+ * 매일 오전 08:30 (일본 시간) 실행
+ */
+exports.scheduledDailyReport = onSchedule("0 23 * * *", async (event) => {
+    // UTC 23:30 (JST 08:30) - 어제의 정산 및 오늘의 현황 분석
+    console.log("🚀 [Scheduled Report] 실행 중...");
+    const JST = "Asia/Tokyo";
+    const now = dayjs().tz(JST);
+    const yesterdayStr = now.subtract(1, "day").format("YYYY-MM-DD");
+    const year = now.year();
+    const month = now.month() + 1; // JS month is 0-indexed
+
+    const SPREADSHEET_ID = '1A9HyeH6j4TN2c7ITfzI5s1qQgQhyrqW4e-qLCrlafv0';
+    const LOG_SHEET_TITLE = `Daily_Log_${year}_${String(month).padStart(2, '0')}`;
+    const SALES_SHEET_TITLE = `Daily_Sales_${year}_${String(month).padStart(2, '0')}`;
+
+    try {
+        // 1. 데이터 조회 (최근 5000건, 어제/오늘/MTD 포함 충분한 범위)
+        console.log("   데이터 조회 중...");
+        const snap = await db.collection("reservations")
+            .select("bookDate", "status", "price", "building", "room", "cancelTime", "arrival", "modified", "updatedAt", "referer")
+            .orderBy("updatedAt", "desc")
+            .limit(5000)
+            .get();
+
+        const allDocs = [];
+        snap.forEach(doc => allDocs.push(doc.data()));
+
+        // 2. 구글 시트 인증
+        const auth = new google.auth.GoogleAuth({
+            credentials: { client_email: serviceAccount.client_email, private_key: serviceAccount.private_key },
+            scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+        });
+        const client = await auth.getClient();
+        const sheets = google.sheets({ version: "v4", auth: client });
+
+        // 3. 일일 지표 집계 (어제 기준)
+        let mtdNew = 0;
+        let mtdCancel = 0;
+        let mtdRevenue = 0;
+        const logRows = [];
+
+        // MTD 루프 (1일 ~ 어제)
+        const loopStart = dayjs(`${year}-${month}-01`);
+        const loopEnd = now.subtract(1, "day");
+
+        for (let d = dayjs(loopStart); d.isBefore(loopEnd) || d.isSame(loopEnd, "day"); d = d.add(1, "day")) {
+            const dateStr = d.format("YYYY-MM-DD");
+            const newBookings = [];
+            const cancelledBookings = [];
+
+            allDocs.forEach(data => {
+                if (data.building === "다이쿄초") return; // 매각 건물 제외
+                if (data.referer !== "Airbnb" && data.referer !== "Booking.com") return; // 수기 제외
+
+                // 신규 예약 (어제 들어온 예약 중 금액 > 0)
+                if (data.bookDate === dateStr && (Number(data.price) || 0) > 0) {
+                    newBookings.push(data);
+                }
+
+                // 취소 예약 (취소일이 yesterdayStr)
+                const rawCancelTime = data.status === "cancelled" ? (data.cancelTime || data.modified || "") : "";
+                if (rawCancelTime) {
+                    const jstCancelDate = dayjs(rawCancelTime).tz(JST).format("YYYY-MM-DD");
+                    if (jstCancelDate === dateStr) {
+                        // 유효 취소 필터 (입실일 기준 전후 6개월만 인정)
+                        if (data.arrival) {
+                            const arrDate = dayjs(data.arrival);
+                            if (arrDate.isAfter(d.subtract(6, "month")) && arrDate.isBefore(d.add(6, "month"))) {
+                                cancelledBookings.push(data);
+                            }
+                        } else {
+                            cancelledBookings.push(data);
+                        }
+                    }
+                }
+            });
+
+            // 일일 매출 및 상세 내역
+            let dailyRevenue = 0;
+            const bMap = {};
+            const monthlyBreakdown = {};
+
+            newBookings.forEach(b => {
+                const p = Number(b.price) || 0;
+                dailyRevenue += p;
+                const building = b.building || "기타";
+                if (!bMap[building]) bMap[building] = { count: 0, revenue: 0 };
+                bMap[building].count++;
+                bMap[building].revenue += p;
+
+                if (b.arrival) {
+                    const monthKey = dayjs(b.arrival).format("M월");
+                    monthlyBreakdown[monthKey] = (monthlyBreakdown[monthKey] || 0) + 1;
+                } else {
+                    monthlyBreakdown["미정"] = (monthlyBreakdown["미정"] || 0) + 1;
+                }
+            });
+
+            let details = [];
+            if (newBookings.length > 0) {
+                details.push(`[신규] ${Object.entries(bMap).map(([bd, info]) => `${bd} ${info.count}건(${info.revenue.toLocaleString()})`).join(", ")}`);
+            }
+            if (cancelledBookings.length > 0) {
+                const cMap = {};
+                cancelledBookings.forEach(b => { cMap[b.building || "기타"] = (cMap[b.building || "기타"] || 0) + 1; });
+                details.push(`[취소] ${Object.entries(cMap).map(([bd, cnt]) => `${bd} ${cnt}건`).join(", ")}`);
+            }
+
+            const breakdownStr = Object.entries(monthlyBreakdown).sort((a, b) => (a[0] === "미정" ? 1 : (b[0] === "미정" ? -1 : parseInt(a[0]) - parseInt(b[0])))).map(([m, c]) => `${m} ${c}건`).join(", ");
+
+            logRows.push([dateStr, newBookings.length, cancelledBookings.length, dailyRevenue, breakdownStr || "-", details.join("\n") || "-"]);
+
+            mtdNew += newBookings.length;
+            mtdCancel += cancelledBookings.length;
+            mtdRevenue += dailyRevenue;
+        }
+
+        // 4. Daily_Log 시트 제어
+        let lSheetId = null;
+        const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+        const targetL = meta.data.sheets.find(s => s.properties.title === LOG_SHEET_TITLE);
+
+        if (!targetL) {
+            const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId: SPREADSHEET_ID, resource: { requests: [{ addSheet: { properties: { title: LOG_SHEET_TITLE, gridProperties: { frozenRowCount: 5 } } } }] } });
+            lSheetId = res.data.replies[0].addSheet.properties.sheetId;
+        } else {
+            lSheetId = targetL.properties.sheetId;
+            await sheets.spreadsheets.values.clear({ spreadsheetId: SPREADSHEET_ID, range: `${LOG_SHEET_TITLE}!A1:Z500` });
+        }
+
+        // 5. Daily_Log 데이터 기록
+        const cancelRate = mtdNew > 0 ? ((mtdCancel / mtdNew) * 100).toFixed(1) + "%" : "0%";
+        const dashboard = [
+            [`${year}년 ${month}월 경영 분석 리포트 (MTD)`, "", "", "", "", "작성일: " + now.format("YYYY-MM-DD HH:mm")],
+            ["누적 신규 예약", "누적 취소 건수", "누적 매출액 (JPY)", "취소율", "", "상태"],
+            [mtdNew, mtdCancel, mtdRevenue, cancelRate, "", "정상 운영"],
+            ["", "", "", "", "", ""],
+            ["날짜", "신규(건)", "취소(건)", "매출액(엔)", "입실 월별 현황", "상세 내역 (건물별)"]
+        ];
+
+        await sheets.spreadsheets.values.update({ spreadsheetId: SPREADSHEET_ID, range: `${LOG_SHEET_TITLE}!A1`, valueInputOption: "USER_ENTERED", resource: { values: [...dashboard, ...logRows] } });
+
+        // 6. Daily_Log 서식 적용 (Batch)
+        const lLastRow = dashboard.length + logRows.length;
+        await sheets.spreadsheets.batchUpdate({
+            spreadsheetId: SPREADSHEET_ID,
+            resource: {
+                requests: [
+                    { updateSheetProperties: { properties: { sheetId: lSheetId, gridProperties: { frozenRowCount: 5 } }, fields: "gridProperties.frozenRowCount" } },
+                    { updateDimensionProperties: { range: { sheetId: lSheetId, dimension: "COLUMNS", startIndex: 0, endIndex: 1 }, properties: { pixelSize: 120 }, fields: "pixelSize" } },
+                    { updateDimensionProperties: { range: { sheetId: lSheetId, dimension: "COLUMNS", startIndex: 4, endIndex: 5 }, properties: { pixelSize: 200 }, fields: "pixelSize" } },
+                    { updateDimensionProperties: { range: { sheetId: lSheetId, dimension: "COLUMNS", startIndex: 5, endIndex: 6 }, properties: { pixelSize: 600 }, fields: "pixelSize" } },
+                    { repeatCell: { range: { sheetId: lSheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 6 }, cell: { userEnteredFormat: { backgroundColor: { red: 0.0, green: 0.1, blue: 0.3 }, textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true, fontSize: 18 } } }, fields: "userEnteredFormat(backgroundColor,textFormat)" } },
+                    { mergeCells: { range: { sheetId: lSheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 6 }, mergeType: "MERGE_ALL" } },
+                    { repeatCell: { range: { sheetId: lSheetId, startRowIndex: 4, endRowIndex: 5, startColumnIndex: 0, endColumnIndex: 6 }, cell: { userEnteredFormat: { backgroundColor: { red: 0.05, green: 0.2, blue: 0.4 }, textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true } } }, fields: "userEnteredFormat(backgroundColor,textFormat)" } },
+                    { repeatCell: { range: { sheetId: lSheetId, startRowIndex: 5, endRowIndex: lLastRow, startColumnIndex: 5, endColumnIndex: 6 }, cell: { userEnteredFormat: { wrapStrategy: "WRAP", verticalAlignment: "TOP", textFormat: { fontSize: 9 } } }, fields: "userEnteredFormat(wrapStrategy,verticalAlignment,textFormat)" } }
+                ]
+            }
+        });
+
+        // 7. Daily_Sales 시트 업데이트 (기존 스크립트 기반)
+        const sSnap = await db.collection("sales_logs").where("__name__", ">=", `${year}-${String(month).padStart(2, '0')}-01`).where("__name__", "<=", now.format("YYYY-MM-DD")).get();
+        const salesData = {};
+        sSnap.forEach(doc => salesData[doc.id] = doc.data());
+
+        let sSheetId = null;
+        const targetS = meta.data.sheets.find(s => s.properties.title === SALES_SHEET_TITLE);
+        if (!targetS) {
+            const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId: SPREADSHEET_ID, resource: { requests: [{ addSheet: { properties: { title: SALES_SHEET_TITLE, gridProperties: { frozenRowCount: 3 } } } }] } });
+            sSheetId = res.data.replies[0].addSheet.properties.sheetId;
+        } else {
+            sSheetId = targetS.properties.sheetId;
+            await sheets.spreadsheets.values.clear({ spreadsheetId: SPREADSHEET_ID, range: `${SALES_SHEET_TITLE}!A1:Z500` });
+        }
+
+        // 8. Daily_Sales 데이터 구성
+        const projectionMonths = [];
+        for (let i = 0; i < 6; i++) projectionMonths.push(dayjs(`${year}-${month}-01`).add(i, "month").format("YYYY-MM"));
+
+        const sTitle = [`📅 [${year}년 ${month}월] 부킹 페이스(Booking Pace) 분석 보고서`, ...Array(12).fill("")];
+        const sMonthHeader = ["Snapshot Date", ...projectionMonths.flatMap(m => [m, ""])];
+        const sSubHeader = ["", ...projectionMonths.flatMap(() => ["매출액(Revenue)", "가동률(Occ)"])];
+
+        const sRows = [];
+        for (let d = dayjs(loopStart); d.isBefore(now) || d.isSame(now, "day"); d = d.add(1, "day")) {
+            const dStr = d.format("YYYY-MM-DD");
+            const log = salesData[dStr];
+            if (log && log.monthlyStats) {
+                const row = [dStr];
+                projectionMonths.forEach(pm => {
+                    const st = log.monthlyStats[pm] || { revenue: 0, occupancy: 0 };
+                    row.push(st.revenue || 0);
+                    row.push((st.occupancy || 0) / 100);
+                });
+                sRows.push(row);
+            }
+        }
+
+        await sheets.spreadsheets.values.update({ spreadsheetId: SPREADSHEET_ID, range: `${SALES_SHEET_TITLE}!A1`, valueInputOption: "USER_ENTERED", resource: { values: [sTitle, sMonthHeader, sSubHeader, ...sRows] } });
+
+        // 8-4. 프리미엄 서식 적용 (Heatmap 및 A4 레이아웃 포함)
+        const lRow = sRows.length + 3;
+        await sheets.spreadsheets.batchUpdate({
+            spreadsheetId: SPREADSHEET_ID,
+            resource: {
+                requests: [
+                    { updateSheetProperties: { properties: { sheetId: sSheetId, gridProperties: { frozenRowCount: 3, frozenColumnCount: 0 } }, fields: "gridProperties(frozenRowCount,frozenColumnCount)" } },
+
+                    // 1. Merge Cells
+                    { mergeCells: { range: { sheetId: sSheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 13 }, mergeType: "MERGE_ALL" } },
+                    ...projectionMonths.map((_, i) => ({
+                        mergeCells: { range: { sheetId: sSheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 1 + (i * 2), endColumnIndex: 3 + (i * 2) }, mergeType: "MERGE_ALL" }
+                    })),
+                    { mergeCells: { range: { sheetId: sSheetId, startRowIndex: 1, endRowIndex: 3, startColumnIndex: 0, endColumnIndex: 1 }, mergeType: "MERGE_ALL" } },
+
+                    // 2. Title Style
+                    { repeatCell: { range: { sheetId: sSheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 13 }, cell: { userEnteredFormat: { backgroundColor: { red: 0.0, green: 0.1, blue: 0.3 }, textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true, fontSize: 18, fontFamily: "Verdana" }, horizontalAlignment: "LEFT", verticalAlignment: "MIDDLE" } }, fields: "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)" } },
+
+                    // 3. Header Styles
+                    { repeatCell: { range: { sheetId: sSheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 1, endColumnIndex: 13 }, cell: { userEnteredFormat: { backgroundColor: { red: 0.05, green: 0.15, blue: 0.35 }, textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true, fontSize: 14 }, horizontalAlignment: "CENTER", verticalAlignment: "MIDDLE" } }, fields: "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)" } },
+                    { repeatCell: { range: { sheetId: sSheetId, startRowIndex: 1, endRowIndex: 3, startColumnIndex: 0, endColumnIndex: 1 }, cell: { userEnteredFormat: { backgroundColor: { red: 0.05, green: 0.15, blue: 0.35 }, textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true, fontSize: 14 }, horizontalAlignment: "CENTER", verticalAlignment: "MIDDLE" } }, fields: "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)" } },
+                    { repeatCell: { range: { sheetId: sSheetId, startRowIndex: 2, endRowIndex: 3, startColumnIndex: 1, endColumnIndex: 13 }, cell: { userEnteredFormat: { backgroundColor: { red: 0.9, green: 0.9, blue: 0.95 }, textFormat: { bold: true, fontSize: 12, foregroundColor: { red: 0.1, green: 0.1, blue: 0.3 } }, horizontalAlignment: "CENTER", verticalAlignment: "MIDDLE" } }, fields: "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)" } },
+
+                    // 4. Column Widths
+                    { updateDimensionProperties: { range: { sheetId: sSheetId, dimension: "COLUMNS", startIndex: 0, endIndex: 1 }, properties: { pixelSize: 150 }, fields: "pixelSize" } },
+                    { updateDimensionProperties: { range: { sheetId: sSheetId, dimension: "COLUMNS", startIndex: 1, endIndex: 13 }, properties: { pixelSize: 130 }, fields: "pixelSize" } },
+
+                    // 5. Data Style
+                    { repeatCell: { range: { sheetId: sSheetId, startRowIndex: 3, endRowIndex: lRow }, cell: { userEnteredFormat: { textFormat: { fontSize: 12, fontFamily: "Verdana" }, verticalAlignment: "MIDDLE" } }, fields: "userEnteredFormat(textFormat,verticalAlignment)" } },
+                    { repeatCell: { range: { sheetId: sSheetId, startRowIndex: 3, endRowIndex: lRow, startColumnIndex: 0, endColumnIndex: 1 }, cell: { userEnteredFormat: { horizontalAlignment: "CENTER", textFormat: { bold: true } } }, fields: "userEnteredFormat(horizontalAlignment,textFormat)" } },
+
+                    // 6. Financial Formatting
+                    ...projectionMonths.map((_, i) => ({
+                        repeatCell: {
+                            range: { sheetId: sSheetId, startRowIndex: 3, endRowIndex: lRow, startColumnIndex: 1 + (i * 2), endColumnIndex: 2 + (i * 2) },
+                            cell: { userEnteredFormat: { numberFormat: { type: "CURRENCY", pattern: "¥#,##0" }, textFormat: { foregroundColor: { red: 0.0, green: 0.5, blue: 0.2 }, bold: true }, horizontalAlignment: "RIGHT" } },
+                            fields: "userEnteredFormat(numberFormat,textFormat,horizontalAlignment)"
+                        }
+                    })),
+
+                    // 7. Occupancy Formatting
+                    ...projectionMonths.map((_, i) => ({
+                        repeatCell: {
+                            range: { sheetId: sSheetId, startRowIndex: 3, endRowIndex: lRow, startColumnIndex: 2 + (i * 2), endColumnIndex: 3 + (i * 2) },
+                            cell: { userEnteredFormat: { numberFormat: { type: "PERCENT", pattern: "0.0%" }, textFormat: { bold: true, foregroundColor: { red: 0.0, green: 0.2, blue: 0.6 } }, horizontalAlignment: "CENTER" } },
+                            fields: "userEnteredFormat(numberFormat,textFormat,horizontalAlignment)"
+                        }
+                    })),
+
+                    // 8. Borders
+                    { updateBorders: { range: { sheetId: sSheetId, startRowIndex: 0, endRowIndex: lRow, startColumnIndex: 0, endColumnIndex: 13 }, top: { style: "SOLID_MEDIUM" }, bottom: { style: "SOLID_MEDIUM" }, left: { style: "SOLID_MEDIUM" }, right: { style: "SOLID_MEDIUM" }, innerHorizontal: { style: "SOLID", color: { red: 0.7, green: 0.7, blue: 0.7 } }, innerVertical: { style: "SOLID", color: { red: 0.7, green: 0.7, blue: 0.7 } } } },
+
+                    // 9. HEATMAP
+                    ...projectionMonths.map((_, i) => ({
+                        addConditionalFormatRule: {
+                            rule: {
+                                ranges: [{ sheetId: sSheetId, startRowIndex: 3, endRowIndex: lRow, startColumnIndex: 2 + (i * 2), endColumnIndex: 3 + (i * 2) }],
+                                gradientRule: {
+                                    minpoint: { color: { red: 1, green: 1, blue: 1 }, type: "NUMBER", value: "0" },
+                                    midpoint: { color: { red: 0.85, green: 0.95, blue: 1 }, type: "NUMBER", value: "0.5" },
+                                    maxpoint: { color: { red: 0.4, green: 0.7, blue: 1 }, type: "NUMBER", value: "1" }
+                                }
+                            },
+                            index: 0
+                        }
+                    }))
+                ]
+            }
+        });
+
+        // 10. Row Heights
+        await sheets.spreadsheets.batchUpdate({
+            spreadsheetId: SPREADSHEET_ID,
+            resource: {
+                requests: [
+                    { updateDimensionProperties: { range: { sheetId: sSheetId, dimension: "ROWS", startIndex: 0, endIndex: 1 }, properties: { pixelSize: 80 }, fields: "pixelSize" } },
+                    { updateDimensionProperties: { range: { sheetId: sSheetId, dimension: "ROWS", startIndex: 1, endIndex: 2 }, properties: { pixelSize: 40 }, fields: "pixelSize" } },
+                    { updateDimensionProperties: { range: { sheetId: sSheetId, dimension: "ROWS", startIndex: 3, endIndex: lRow }, properties: { pixelSize: 35 }, fields: "pixelSize" } }
+                ]
+            }
+        });
+    }
+
+        // 9. 플랫폼 비율 분석 추가 (v2)
+        try {
+        await generatePlatformAnalysisTab(sheets, SPREADSHEET_ID, year, month, allDocs);
+    } catch (e) {
+        console.error("❌ [Platform Analysis] 실패:", e.message);
+    }
+
+    console.log(`✅ [Scheduled Report] 모든 보고서(Log, Sales, Platform)가 업데이트되었습니다.`);
+} catch (e) {
+    console.error(`❌ [Scheduled Report] 실패:`, e.stack);
+}
+});
+
+// ==========================================
+// 9) PLATFORM RATIO ANALYSIS (건물별 플랫폼 비중)
+// ==========================================
+
+async function generatePlatformAnalysisTab(sheets, SPREADSHEET_ID, year, month, allDocs) {
+    const SHEET_TITLE = `Platform_Analysis_${year}_${String(month).padStart(2, '0')}`;
+    console.log(`📊 [Platform Analysis] ${year}-${month} 분석 및 시트 생성 시작...`);
+
+    // 1. 시트 준비
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+    let targetSheet = meta.data.sheets.find(s => s.properties.title === SHEET_TITLE);
+    let sheetId = targetSheet ? targetSheet.properties.sheetId : null;
+
+    if (!targetSheet) {
+        const res = await sheets.spreadsheets.batchUpdate({
+            spreadsheetId: SPREADSHEET_ID,
+            resource: { requests: [{ addSheet: { properties: { title: SHEET_TITLE } } }] }
+        });
+        sheetId = res.data.replies[0].addSheet.properties.sheetId;
+    } else {
+        await sheets.spreadsheets.values.clear({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_TITLE}!A1:Z500` });
+    }
+
+    // 2. 데이터 집계
+    const buildings = {};
+    const startOfMonth = dayjs(`${year}-${month}-01`).format("YYYY-MM-DD");
+    const endOfMonth = dayjs(`${year}-${month}-01`).endOf('month').format("YYYY-MM-DD");
+
+    allDocs.forEach(data => {
+        if (data.building === "다이쿄초") return;
+        if (data.status !== "confirmed") return;
+
+        // 입실일 기준 분석
+        if (!data.arrival || data.arrival < startOfMonth || data.arrival > endOfMonth) return;
+
+        const bName = data.building || "기타";
+        let platform = data.platform || "Direct";
+
+        // 정규화
+        const source = (data.referer || data.referrer || data.apiSource || "").toLowerCase();
+        if (source.includes("airbnb")) platform = "Airbnb";
+        else if (source.includes("booking")) platform = "Booking.com";
+        else if (source.includes("expedia")) platform = "Expedia";
+        else if (source.includes("agoda")) platform = "Agoda";
+
+        if (!buildings[bName]) buildings[bName] = { rev: 0, count: 0, platforms: {} };
+        if (!buildings[bName].platforms[platform]) buildings[bName].platforms[platform] = { rev: 0, count: 0 };
+
+        const price = Number(data.price || 0);
+        buildings[bName].rev += price;
+        buildings[bName].count++;
+        buildings[bName].platforms[platform].rev += price;
+        buildings[bName].platforms[platform].count++;
+    });
+
+    const rows = [
+        [`${year}년 ${month}월 플랫폼별 매출 및 점유율 분석`, "", "", "", "", "최종업데이트: " + dayjs().format("YYYY-MM-DD HH:mm")],
+        ["구분", "건물명", "플랫폼", "예약 건수", "매출액 (JPY)", "비중 (%)"],
+    ];
+
+    // 3. 로우 생성
+    Object.entries(buildings).sort((a, b) => b[1].rev - a[1].rev).forEach(([bName, bStats]) => {
+        rows.push(["건물", bName, "전체", bStats.count, bStats.rev, "100.0%"]);
+        Object.entries(bStats.platforms).sort((a, b) => b[1].rev - a[1].rev).forEach(([p, pStats]) => {
+            const ratio = ((pStats.rev / bStats.rev) * 100).toFixed(1) + "%";
+            rows.push(["", "", p, pStats.count, pStats.rev, ratio]);
+        });
+        rows.push(["", "", "", "", "", ""]);
+    });
+
+    // 4. 시트 기록
+    await sheets.spreadsheets.values.update({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${SHEET_TITLE}!A1`,
+        valueInputOption: 'USER_ENTERED',
+        resource: { values: rows }
+    });
+
+    // 5. 서식 적용
+    await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: SPREADSHEET_ID,
+        resource: {
+            requests: [
+                { updateSheetProperties: { properties: { sheetId: sheetId, gridProperties: { frozenRowCount: 2 } }, fields: "gridProperties.frozenRowCount" } },
+                { updateDimensionProperties: { range: { sheetId: sheetId, dimension: "COLUMNS", startIndex: 0, endIndex: 1 }, properties: { pixelSize: 80 }, fields: "pixelSize" } },
+                { updateDimensionProperties: { range: { sheetId: sheetId, dimension: "COLUMNS", startIndex: 1, endIndex: 2 }, properties: { pixelSize: 150 }, fields: "pixelSize" } },
+                { updateDimensionProperties: { range: { sheetId: sheetId, dimension: "COLUMNS", startIndex: 2, endIndex: 3 }, properties: { pixelSize: 120 }, fields: "pixelSize" } },
+                { repeatCell: { range: { sheetId: sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 6 }, cell: { userEnteredFormat: { backgroundColor: { red: 0, green: 0.1, blue: 0.3 }, textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true, fontSize: 16 } } }, fields: "userEnteredFormat(backgroundColor,textFormat)" } },
+                { mergeCells: { range: { sheetId: sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 6 }, mergeType: "MERGE_ALL" } },
+                { repeatCell: { range: { sheetId: sheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 0, endColumnIndex: 6 }, cell: { userEnteredFormat: { backgroundColor: { red: 0.05, green: 0.2, blue: 0.4 }, textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true }, horizontalAlignment: "CENTER" } }, fields: "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)" } },
+                { repeatCell: { range: { sheetId: sheetId, startRowIndex: 2, endRowIndex: rows.length, startColumnIndex: 3, endColumnIndex: 4 }, cell: { userEnteredFormat: { horizontalAlignment: "CENTER" } }, fields: "userEnteredFormat.horizontalAlignment" } },
+                { repeatCell: { range: { sheetId: sheetId, startRowIndex: 2, endRowIndex: rows.length, startColumnIndex: 4, endColumnIndex: 5 }, cell: { userEnteredFormat: { numberFormat: { type: "CURRENCY", pattern: "¥#,##0" } } }, fields: "userEnteredFormat.numberFormat" } },
+                { repeatCell: { range: { sheetId: sheetId, startRowIndex: 2, endRowIndex: rows.length, startColumnIndex: 5, endColumnIndex: 6 }, cell: { userEnteredFormat: { horizontalAlignment: "CENTER" } }, fields: "userEnteredFormat.horizontalAlignment" } },
+            ]
+        }
+    });
+
+    console.log(`✅ [Platform Analysis] 리포트 생성 완료.`);
+}

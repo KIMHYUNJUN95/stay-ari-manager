@@ -323,7 +323,7 @@ export default function SalesLog() {
     ];
 
     // 연도 목록 (현재년도 ±5년)
-    const YEARS = Array.from({length: 11}, (_, i) => currentDate.getFullYear() - 5 + i);
+    const YEARS = Array.from({ length: 11 }, (_, i) => currentDate.getFullYear() - 5 + i);
 
     const [logs, setLogs] = useState([]);
     const [loading, setLoading] = useState(false);
@@ -360,20 +360,26 @@ export default function SalesLog() {
 
             console.log('📊 Querying sales_logs with companyId:', companyId, 'from', startDate, 'to', endDate);
 
+            // Firestore 복합 인덱스 이슈 회피: companyId 필터 제거 (단일 회사 환경)
+            // 날짜 범위만 필터링하고, 결과를 클라이언트 측에서 companyId로 필터링
             const q = query(
                 collection(db, "sales_logs"),
-                where("companyId", "==", companyId),
                 where("__name__", ">=", startDate),
                 where("__name__", "<=", endDate)
             );
 
             const snapshot = await getDocs(q);
-            const fetchedLogs = snapshot.docs.map(doc => ({
+            let fetchedLogs = snapshot.docs.map(doc => ({
                 id: doc.id,
                 ...doc.data()
             }));
 
-            console.log('✅ Fetched sales_logs:', fetchedLogs.length, 'documents');
+            console.log('📥 Raw fetched sales_logs:', fetchedLogs.length, 'documents');
+
+            // 클라이언트 측에서 companyId 필터링 (복합 인덱스 회피)
+            fetchedLogs = fetchedLogs.filter(log => log.companyId === companyId);
+
+            console.log('✅ Filtered sales_logs:', fetchedLogs.length, 'documents for companyId:', companyId);
 
             fetchedLogs.sort((a, b) => a.id.localeCompare(b.id));
             setLogs(fetchedLogs);
@@ -560,8 +566,8 @@ export default function SalesLog() {
                         style={styles.addMemoBtn}
                     >
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
                         </svg>
                         Add Memo
                     </button>
@@ -602,7 +608,7 @@ export default function SalesLog() {
                         }}
                     >
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6h14"/>
+                            <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6h14" />
                         </svg>
                         Delete Log
                     </button>
@@ -612,8 +618,10 @@ export default function SalesLog() {
                             if (!window.confirm(`Re-generate sales log for ${date}?\nThis will overwrite existing data.`)) return;
 
                             try {
-                                const response = await fetch('https://us-central1-my-booking-app-3f0e7.cloudfunctions.net/recordSalesLog?date=' + date, {
-                                    method: 'GET'
+                                const response = await fetch('https://us-central1-my-booking-app-3f0e7.cloudfunctions.net/saveSalesLogManual', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ date })
                                 });
                                 const result = await response.json();
                                 if (result.success) {
@@ -642,7 +650,7 @@ export default function SalesLog() {
                         }}
                     >
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
+                            <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2" />
                         </svg>
                         Re-generate
                     </button>
@@ -663,9 +671,9 @@ export default function SalesLog() {
                         }}
                     >
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <path d="M23 4v6h-6"/>
-                            <path d="M1 20v-6h6"/>
-                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                            <path d="M23 4v6h-6" />
+                            <path d="M1 20v-6h6" />
+                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
                         </svg>
                         Refresh
                     </button>
@@ -757,8 +765,8 @@ export default function SalesLog() {
                                                             title={memos[log.id]}
                                                         >
                                                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                                                                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                                                                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                                                                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                                                                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
                                                             </svg>
                                                         </span>
                                                     )}
@@ -816,8 +824,8 @@ export default function SalesLog() {
                         <div style={styles.modalHeader}>
                             <div style={styles.modalTitle}>
                                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#D97706" strokeWidth="2">
-                                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
                                 </svg>
                                 {memos[selectedDate] ? 'Edit Memo' : 'Add Memo'}
                             </div>

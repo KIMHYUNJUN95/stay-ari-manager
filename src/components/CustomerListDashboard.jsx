@@ -6,7 +6,7 @@ import { useUser } from '../contexts/UserContext';
 // -----------------------------------------------------------------------------
 // [CONSTANTS & LOGIC] Data Management (Preserved)
 // -----------------------------------------------------------------------------
-const DAIKYO_SOLD_DATE = "2026-01-26";
+import { BUILDING_NAMES_EN, EXCLUDED_BUILDING_UI } from '../constants/buildingData';
 
 const getTodayString = () => {
   const now = new Date();
@@ -26,21 +26,6 @@ const getCountryFlag = (country) => {
 };
 
 const formatCurrency = (val) => "¥" + Math.floor(val).toLocaleString();
-
-// Building name mapping (Haru Studio Standard)
-const BUILDING_NAMES_EN = {
-  "아라키초A": "Arakicho A",
-  "아라키초B": "Arakicho B",
-  "다이쿄초": "Daikyocho",
-  "가부키초": "Kabukicho",
-  "다카다노바바": "Takadanobaba",
-  "오쿠보A동": "Okubo A",
-  "오쿠보B동": "Okubo B",
-  "오쿠보C동": "Okubo C",
-  "사노": "Sano",
-  "사노시": "Sano",
-  "사노시 사노": "Sano"
-};
 
 const getBuildingName = (name) => BUILDING_NAMES_EN[name] || name || "Unknown";
 
@@ -98,7 +83,7 @@ const CustomerListDashboard = () => {
 
       const filteredData = data.filter(res => {
         const bookDate = res.bookDate || res.arrival;
-        return !(res.building === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE);
+        return res.building !== EXCLUDED_BUILDING_UI;
       });
       setReservations(filteredData);
     } catch (error) {

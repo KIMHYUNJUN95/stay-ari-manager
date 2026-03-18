@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useUser } from '../contexts/UserContext';
 
 // ==============================
 // 🎨 스타일 & 모바일 유틸리티
@@ -35,19 +36,7 @@ const styles = {
     label: { color: "#94A3B8", marginRight: "6px" }
 };
 
-// 건물 이름 영어 매핑
-const BUILDING_NAMES_EN = {
-    "아라키초A": "Arakicho A",
-    "아라키초B": "Arakicho B",
-    "다이쿄초": "Daikyocho",
-    "가부키초": "Kabukicho",
-    "다카다노바바": "Takadanobaba",
-    "오쿠보A동": "Okubo A",
-    "오쿠보B동": "Okubo B",
-    "오쿠보C동": "Okubo C",
-    "사노시": "Sano",
-    "사노": "Sano"
-};
+import { BUILDING_NAMES_EN, BUILDING_ORDER, EXCLUDED_BUILDING_UI } from '../constants/buildingData';
 
 const getBuildingEN = (name) => BUILDING_NAMES_EN[name] || name;
 
@@ -62,8 +51,6 @@ const formatBuildingRoom = (building, room) => {
     return `${buildingEN} · ${room}`;
 };
 
-// 건물 정렬
-const BUILDING_ORDER = ["아라키초A", "아라키초B", "다이쿄초", "가부키초", "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동"];
 const sortByBuildingOrder = (list) => {
     return [...list].sort((a, b) => {
         const indexA = BUILDING_ORDER.indexOf(a.building);
@@ -172,8 +159,14 @@ const GuestDetailModal = ({ guest, onClose }) => {
 // ==============================
 // 🧩 메인 컴포넌트
 // ==============================
+const getLocalDateStr = () => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+};
+
 const ArrivalsDashboard = () => {
-    const [selectedDate, setSelectedDate] = useState(new Date().toISOString().slice(0, 10));
+    const { companyId } = useUser();
+    const [selectedDate, setSelectedDate] = useState(getLocalDateStr());
     const [loading, setLoading] = useState(false);
     const [guestList, setGuestList] = useState([]);
     const [error, setError] = useState("");
@@ -196,11 +189,11 @@ const ArrivalsDashboard = () => {
             const response = await fetch(GET_ARRIVALS_URL, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ date: selectedDate })
+                body: JSON.stringify({ companyId, date: selectedDate })
             });
             const result = await response.json();
             if (result.success && Array.isArray(result.data)) {
-                setGuestList(result.data);
+                setGuestList((result.data || []).filter(g => g.building !== EXCLUDED_BUILDING_UI));
             } else {
                 setGuestList([]);
             }
@@ -213,8 +206,10 @@ const ArrivalsDashboard = () => {
     };
 
     useEffect(() => {
+        if (!companyId) return;
         fetchTodayArrivals();
-    }, [selectedDate]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [selectedDate, companyId]);
 
     // 필터링
     const todayArrivals = sortByBuildingOrder(guestList.filter(guest => guest.arrival === selectedDate));

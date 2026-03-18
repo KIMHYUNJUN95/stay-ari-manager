@@ -4,14 +4,12 @@
 import React, { useState, useEffect } from 'react';
 import { collection, getDocs, query, where } from "firebase/firestore";
 import { db } from '../firebase';
+import { useUser } from '../contexts/UserContext';
 
-// 건물 데이터
-const BUILDING_ORDER = [
-  "아라키초A", "아라키초B", "다이쿄초", "가부키초",
-  "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동"
-];
+import { ACTIVE_BUILDING_ORDER as BUILDING_ORDER } from '../constants/buildingData';
 
 const DesignPreview = () => {
+  const { companyId } = useUser();
   const [activeMenu, setActiveMenu] = useState('dashboard');
   const [stats, setStats] = useState({
     totalRevenue: 0,
@@ -29,10 +27,15 @@ const DesignPreview = () => {
 
   useEffect(() => {
     fetchData();
-  }, []);
+  }, [companyId]);
 
   const fetchData = async () => {
     try {
+      if (!companyId) {
+        console.warn('⚠️ No companyId for DesignPreview');
+        return;
+      }
+
       const now = new Date();
       const year = now.getFullYear();
       const month = now.getMonth();
@@ -42,6 +45,7 @@ const DesignPreview = () => {
       // 이번 달 예약
       const q1 = query(
         collection(db, "reservations"),
+        where("companyId", "==", companyId),
         where("stayMonth", "==", monthStr),
         where("status", "==", "confirmed")
       );
@@ -51,6 +55,7 @@ const DesignPreview = () => {
       // 지난 달 예약
       const q2 = query(
         collection(db, "reservations"),
+        where("companyId", "==", companyId),
         where("stayMonth", "==", lastMonthStr),
         where("status", "==", "confirmed")
       );

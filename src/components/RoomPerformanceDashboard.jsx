@@ -5,16 +5,9 @@ import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 
-// 건물 정렬 순서
-const BUILDING_ORDER = [
-  "아라키초A", "아라키초B", "다이쿄초", "가부키초",
-  "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동", "사노시"
-];
+import { BUILDING_ORDER, BUILDING_NAMES_EN, EXCLUDED_BUILDING_UI } from '../constants/buildingData';
 
-// ★ 다이쿄초 매각일 (2025-01-25 마지막 운영일)
-const DAIKYO_SOLD_DATE = "2026-01-26";
-
-// 각 건물의 객실 수
+// 각 건물의 객실 수 (매출 분석용 — BUILDING_DATA와 다른 형태)
 const BUILDING_ROOMS = {
   "아라키초A": ["201호", "202호", "301호", "302호", "401호", "402호", "501호", "502호", "602호", "701호", "702호"],
   "아라키초B": ["101호", "102호", "201호", "202호", "301호", "302호", "401호", "402호"],
@@ -25,18 +18,6 @@ const BUILDING_ROOMS = {
   "오쿠보C동": ["오쿠보C"],
   "사노시": ["사노"],
   "다카다노바바": ["201호", "301호", "401호", "501호", "601호", "701호", "801호", "901호"]
-};
-
-const BUILDING_NAMES_EN = {
-  "아라키초A": "Arakicho A",
-  "아라키초B": "Arakicho B",
-  "다이쿄초": "Daikyocho",
-  "가부키초": "Kabukicho",
-  "다카다노바바": "Takadanobaba",
-  "오쿠보A동": "Okubo A",
-  "오쿠보B동": "Okubo B",
-  "오쿠보C동": "Okubo C",
-  "사노시": "Sano"
 };
 
 const getBuildingNameEN = (name) => BUILDING_NAMES_EN[name] || name;
@@ -140,9 +121,7 @@ const calculateRevenue = (reservations, periodStart, periodEnd) => {
   reservations.forEach(doc => {
     if (!doc.arrival || !doc.departure) return;
 
-    // ★ 다이쿄초: bookDate가 1/26 이후인 예약만 제외 (1/25 이전 예약은 모두 포함)
-    const bookDate = doc.bookDate || doc.arrival;
-    if (doc.building === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE) return;
+    if (doc.building === EXCLUDED_BUILDING_UI) return;
 
     // totalPrice 사용 (Beds24 invoiceItems 합계 = 실제 예약 금액)
     const totalPrice = Number(doc.totalPrice || doc.price) || 0;
@@ -562,6 +541,7 @@ const RoomPerformanceDashboard = () => {
 
       Object.keys(BUILDING_ROOMS).forEach(building => {
         if (building === "사노시") return; // 사노시 제외 (가동률 계산용)
+        if (building === EXCLUDED_BUILDING_UI) return; // 다이쿄초: 화면에서 항상 제외
 
         const rooms = BUILDING_ROOMS[building];
         let bldgCurrentOcc = 0, bldgPrevOcc = 0;
@@ -573,9 +553,7 @@ const RoomPerformanceDashboard = () => {
         rooms.forEach(room => {
           // ★ 다이쿄초: bookDate가 1/26 이후인 예약만 제외
           const roomReservations = allReservations.filter(r => {
-            const bookDate = r.bookDate || r.arrival;
-            return r.building === building && r.room === room &&
-              !(building === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE);
+            return r.building === building && r.room === room && building !== EXCLUDED_BUILDING_UI;
           });
 
           // 현재 기간 매출 계산 (calculateRevenue 내부에서 필터링 처리)
@@ -659,9 +637,9 @@ const RoomPerformanceDashboard = () => {
       const trends = trendRanges.map(range => {
         let totalOcc = 0, totalAvail = 0;
 
-        // 가동률 계산 (사노시 제외 - 기존 로직 유지)
+        // 가동률 계산 (사노시·다이쿄초 제외)
         Object.keys(BUILDING_ROOMS).forEach(building => {
-          if (building === "사노시") return;
+          if (building === "사노시" || building === EXCLUDED_BUILDING_UI) return;
           const rooms = BUILDING_ROOMS[building];
 
           rooms.forEach(room => {
@@ -990,7 +968,7 @@ const RoomPerformanceDashboard = () => {
           )}
 
           {/* 건물별 객실 상세 */}
-          {BUILDING_ORDER.filter(b => roomData[b] && b !== "사노시").map(building => {
+          {BUILDING_ORDER.filter(b => b !== EXCLUDED_BUILDING_UI && b !== "사노시" && roomData[b]).map(building => {
             const bldg = buildingData.find(b => b.name === getBuildingNameEN(building));
             if (!bldg) return null;
 

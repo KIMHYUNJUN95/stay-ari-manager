@@ -3,20 +3,23 @@ import { HashRouter as Router, Routes, Route, useNavigate, useLocation } from 'r
 import { collection, getDocs, query, where, doc, getDoc } from "firebase/firestore";
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut } from "firebase/auth";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
+import { Haptics, ImpactStyle } from '@capacitor/haptics';
+import { StatusBar, Style } from '@capacitor/status-bar';
+import { Capacitor } from '@capacitor/core';
 
 // ★ 핵심: firebase.js 에서 db, auth 가져오기
 import { db, auth } from './firebase';
 import { UserProvider, useUser } from './contexts/UserContext';
+import { BUILDING_NAMES_EN as _BUILDING_NAMES_EN_CENTRAL, BUILDING_ORDER as _BUILDING_ORDER_CENTRAL, EXCLUDED_BUILDING_UI, ACTIVE_BUILDING_ORDER as _ACTIVE_BUILDING_ORDER } from './constants/buildingData';
 import RevenueDashboard from './RevenueDashboard.jsx';
 import CleaningDashboard from './components/CleaningDashboard.jsx';
 import OccupancyRateDashboard from './components/OccupancyRateDashboard.jsx';
 import TodaySummaryDashboard from './components/TodaySummaryDashboard.jsx';
 import CountryOccupancyDashboard from './components/CountryOccupancyDashboard.jsx';
-import AiChatbot from './components/AiChatbot';
+import SyncManager from './components/SyncManager.jsx';
 import BuildingCalendar from './components/BuildingCalendar.jsx';
 import RoomLinksDashboard from './components/RoomLinksDashboard.jsx';
 import CustomerListDashboard from './components/CustomerListDashboard.jsx';
-import MessagesDashboard from './components/MessagesDashboard.jsx';
 import RoomPerformanceDashboard from './components/RoomPerformanceDashboard.jsx';
 import PriceChangeHistory from './components/PriceChangeHistory.jsx';
 import SalesLog from './components/SalesLog.jsx';
@@ -28,7 +31,12 @@ import SignUpForm from './components/SignUpForm.jsx';
 import GoogleSignUpForm from './components/GoogleSignUpForm.jsx';
 import PhoneSignIn from './components/PhoneSignIn.jsx';
 import InviteCodeManager from './components/InviteCodeManager.jsx';
+import MemberManagement from './components/MemberManagement.jsx';
+import TeamToast from './components/TeamToast.jsx';
+import ReviewsDashboard from './components/ReviewsDashboard.jsx';
+import MaintenanceGuard from './components/MaintenanceGuard.jsx';
 import MyProfile from './components/MyProfile.jsx';
+import LoginScreen from './components/LoginScreen.jsx';
 
 // ★★★ 서버 주소 ★★★
 const GET_ARRIVALS_URL = "https://us-central1-my-booking-app-3f0e7.cloudfunctions.net/getTodayArrivals";
@@ -378,6 +386,7 @@ const styles = `
   /* -------------------------------------------------------------------------- */
   
   /* 1. Responsive Grid System */
+  /* 1. Responsive Grid System */
   .responsive-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -392,29 +401,35 @@ const styles = `
   }
 
   /* 2. Responsive Table Wrapper */
-  /* PC: Table, Mobile: Scrollable or Hidden */
   .responsive-table-container {
     width: 100%;
     overflow-x: auto;
-    -webkit-overflow-scrolling: touch; /* Smooth scroll on iOS */
+    -webkit-overflow-scrolling: touch;
   }
 
-  /* 3. Mobile Card System (Only visible on mobile) */
+  /* 3. Mobile Card System (Native Look) */
   .mobile-card-list {
-    display: none; /* Default: Hidden on PC */
+    display: none;
     flex-direction: column;
     gap: 16px;
+    padding: 4px 0;
   }
   
   .mobile-card-item {
-    background: white;
-    border: 1px solid #E2E8F0;
-    border-radius: 12px;
-    padding: 16px;
+    background: #FFFFFF;
+    border: none;
+    border-radius: 16px; /* Native roundness */
+    padding: 18px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    gap: 14px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05), 0 1px 2px rgba(0, 0, 0, 0.03);
+    transition: transform 0.2s cubic-bezier(0.18, 0.89, 0.32, 1.28);
+  }
+  
+  .mobile-card-item:active {
+    transform: scale(0.98); /* Native press effect */
+    background-color: #F8FAFC;
   }
 
   .mobile-card-row {
@@ -424,8 +439,8 @@ const styles = `
     font-size: 14px;
   }
   
-  .mobile-label { color: #64748B; font-size: 13px; }
-  .mobile-value { color: #0F172A; font-weight: 500; font-size: 14px; }
+  .mobile-label { color: #64748B; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.02em; }
+  .mobile-value { color: #1E293B; font-weight: 600; font-size: 15px; }
 
   /* 4. Common Typography Utilities */
   .text-title { font-size: 20px; font-weight: 700; color: #111827; letter-spacing: -0.5px; }
@@ -435,23 +450,31 @@ const styles = `
   @media (max-width: 768px) {
     /* Layout Adjustments */
     .dashboard-layout { flex-direction: column; }
-    .main-content { padding: 16px; width: 100vw; height: auto; overflow-x: hidden; }
+    .main-content { 
+      padding: 16px; 
+      padding-top: calc(16px + env(safe-area-inset-top, 0px));
+      padding-bottom: calc(85px + env(safe-area-inset-bottom, 0px)); /* Account for Bottom NavBar */
+      width: 100vw; 
+      height: 100vh; 
+      overflow-x: hidden; 
+      overflow-y: auto;
+    }
     
     /* Grid Transforms */
     .responsive-grid { grid-template-columns: 1fr; gap: 16px; }
     .responsive-two-column { grid-template-columns: 1fr; gap: 16px; }
     
     /* Table to Card Transformation */
-    .pc-table-view { display: none !important; } /* Hide tables */
-    .mobile-card-list { display: flex !important; } /* Show cards */
+    .pc-table-view { display: none !important; }
+    .mobile-card-list { display: flex !important; }
 
     /* Typography Adjustments */
-    .page-title { font-size: 20px; }
-    .kpi-value { font-size: 24px; }
+    .page-title { font-size: 22px; font-weight: 800; }
+    .kpi-value { font-size: 28px; }
     
     /* Input/Button Adjustments */
-    .btn-primary { width: 100%; justify-content: center; padding: 14px; }
-    .form-input, .form-select { font-size: 16px; /* Stop iOS zoom */ padding: 12px; }
+    .btn-primary { width: 100%; justify-content: center; padding: 14px; border-radius: 14px; font-weight: 700; }
+    .form-input, .form-select { font-size: 16px; padding: 14px; border-radius: 12px; }
     
     /* Hide Sidebars/Desktop Elements */
     .desktop-only { display: none !important; }
@@ -463,9 +486,15 @@ const styleSheet = document.createElement("style");
 styleSheet.innerText = styles;
 document.head.appendChild(styleSheet);
 
+// --------------------------------------------------------------------------
+// [IMPORTED COMPONENTS]
+// --------------------------------------------------------------------------
+// (Imports moved to top of file)
+
 // ==============================
-// 건물·객실 데이터
+// 건물·객실 데이터 (중앙 관리 — import는 파일 상단)
 // ==============================
+// App.jsx 전용 객실 데이터 (매출 분석용 — BUILDING_DATA와 다른 형태)
 const BUILDING_DATA = {
   "아라키초A": ["201호", "202호", "301호", "302호", "401호", "402호", "501호", "502호", "602호", "701호", "702호"],
   "아라키초B": ["101호", "102호", "201호", "202호", "301호", "302호", "401호", "402호"],
@@ -481,263 +510,12 @@ const BUILDING_DATA = {
 // ==============================
 // 로그인 컴포넌트
 // ==============================
-function LoginPage() {
-  const [showSignUp, setShowSignUp] = useState(false);
-  const [showGoogleSignUp, setShowGoogleSignUp] = useState(false);
-  const [showPhoneSignIn, setShowPhoneSignIn] = useState(false);
-  const [googleUser, setGoogleUser] = useState(null);
-  const [email, setEmail] = useState("");
-  const [pw, setPw] = useState("");
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  // Show Phone SignIn
-  if (showPhoneSignIn) {
-    return (
-      <PhoneSignIn
-        onBack={() => setShowPhoneSignIn(false)}
-      />
-    );
-  }
-
-  // Show Google SignUp Form
-  if (showGoogleSignUp && googleUser) {
-    return (
-      <GoogleSignUpForm
-        googleUser={googleUser}
-        onSuccess={() => {
-          setShowGoogleSignUp(false);
-          setGoogleUser(null);
-        }}
-        onCancel={() => {
-          setShowGoogleSignUp(false);
-          setGoogleUser(null);
-          // Sign out the Google user since they cancelled
-          signOut(auth);
-        }}
-      />
-    );
-  }
-
-  // Show Email SignUp Form
-  if (showSignUp) {
-    return (
-      <SignUpForm
-        onSuccess={() => setShowSignUp(false)}
-        onBackToLogin={() => setShowSignUp(false)}
-      />
-    );
-  }
-
-  // 이메일 로그인
-  const login = async () => {
-    if (!email || !pw) {
-      setError("Please fill in all fields");
-      return;
-    }
-
-    setLoading(true);
-    setError("");
-    try {
-      await signInWithEmailAndPassword(auth, email, pw);
-    } catch (err) {
-      setError(getErrorMessage(err.code));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Google 로그인
-  const googleLogin = async () => {
-    setLoading(true);
-    setError("");
-
-    try {
-      const provider = new GoogleAuthProvider();
-      const result = await signInWithPopup(auth, provider);
-      const user = result.user;
-
-      console.log('🔵 Google login successful:', user.email);
-
-      // Check if user document exists in Firestore
-      const userDocRef = doc(db, 'users', user.uid);
-      const userDocSnap = await getDoc(userDocRef);
-
-      if (userDocSnap.exists()) {
-        // Existing user - login complete (onAuthStateChanged will handle redirect)
-        console.log('✅ Existing Google user - logging in');
-      } else {
-        // New user - show GoogleSignUpForm to complete profile
-        console.log('🆕 New Google user - showing sign up form');
-        setGoogleUser({
-          uid: user.uid,
-          email: user.email,
-          displayName: user.displayName,
-          photoURL: user.photoURL
-        });
-        setShowGoogleSignUp(true);
-      }
-    } catch (err) {
-      console.error('❌ Google login error:', err);
-      setError(getErrorMessage(err.code));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // 에러 메시지 변환
-  const getErrorMessage = (code) => {
-    switch (code) {
-      case 'auth/email-already-in-use':
-        return 'This email is already registered';
-      case 'auth/invalid-email':
-        return 'Invalid email address';
-      case 'auth/user-not-found':
-        return 'No account found with this email';
-      case 'auth/wrong-password':
-        return 'Incorrect password';
-      case 'auth/weak-password':
-        return 'Password should be at least 6 characters';
-      case 'auth/popup-closed-by-user':
-        return 'Google sign-in cancelled';
-      default:
-        return 'Authentication failed. Please try again';
-    }
-  };
-
-  // Removed - not needed anymore
-
-  return (
-    <div className="login-container">
-      <div className="login-card">
-        <div className="login-logo-container">
-          <span className="login-icon">🌍</span>
-          <span className="login-logo">Haru Studio</span>
-          <span className="login-icon">✈️</span>
-        </div>
-        <div className="login-title">Welcome Back</div>
-        <div className="login-subtitle">
-          Sign in to access your property management dashboard
-        </div>
-
-        {/* Google Login Button */}
-        <button className="google-login-btn" onClick={googleLogin} disabled={loading}>
-          <svg className="google-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-            <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4" />
-            <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853" />
-            <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05" />
-            <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335" />
-          </svg>
-          Continue with Google
-        </button>
-
-        {/* Phone Login Button */}
-        <button
-          className="google-login-btn"
-          onClick={() => setShowPhoneSignIn(true)}
-          disabled={loading}
-          style={{ marginTop: '12px', background: '#10B981', borderColor: '#10B981' }}
-        >
-          <span style={{ fontSize: '20px', marginRight: '8px' }}>📱</span>
-          Continue with Phone
-        </button>
-
-        <div className="login-divider">
-          <span>OR</span>
-        </div>
-
-        <input
-          className="form-input"
-          placeholder="Email Address"
-          type="email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && login()}
-          style={{ marginBottom: '12px' }}
-          disabled={loading}
-        />
-
-        <input
-          className="form-input"
-          type="password"
-          placeholder="Password"
-          value={pw}
-          onChange={(e) => setPw(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && login()}
-          style={{ marginBottom: '20px' }}
-          disabled={loading}
-        />
-
-        {error && (
-          <p style={{
-            color: '#EF4444',
-            fontSize: '14px',
-            marginBottom: '16px',
-            padding: '12px',
-            background: '#FEF2F2',
-            borderRadius: '8px',
-            border: '1px solid #FECACA'
-          }}>
-            {error}
-          </p>
-        )}
-
-        <button
-          className="form-button"
-          onClick={login}
-          disabled={loading}
-          style={{
-            background: loading
-              ? '#94A3B8'
-              : 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-            border: 'none',
-            padding: '14px',
-            fontSize: '15px',
-            fontWeight: '600',
-            borderRadius: '12px',
-            boxShadow: '0 4px 12px rgba(102, 126, 234, 0.4)',
-            transition: 'all 0.2s',
-            cursor: loading ? 'not-allowed' : 'pointer'
-          }}
-          onMouseEnter={(e) => !loading && (e.currentTarget.style.transform = 'translateY(-2px)')}
-          onMouseLeave={(e) => e.currentTarget.style.transform = 'translateY(0)'}
-        >
-          {loading ? 'Please wait...' : 'Sign In'}
-        </button>
-
-        <p style={{
-          marginTop: '24px',
-          fontSize: '14px',
-          color: '#64748B',
-          textAlign: 'center'
-        }}>
-          Don't have an account?{' '}
-          <span
-            onClick={() => {
-              setShowSignUp(true);
-              setError("");
-            }}
-            style={{
-              color: '#667eea',
-              fontWeight: '600',
-              cursor: 'pointer',
-              textDecoration: 'underline'
-            }}
-          >
-            Sign Up
-          </span>
-        </p>
-
-        <p style={{
-          marginTop: '16px',
-          fontSize: '13px',
-          color: '#94A3B8'
-        }}>
-          By signing in, you agree to our Terms of Service
-        </p>
-      </div>
-    </div>
-  );
+// ==============================
+// 🔐 New Login Screen Wrapper
+// ==============================
+// This wrapper ensures we use the new Enterprise Login Screen while keeping prop compatibility
+function LoginPage({ incompleteSignup }) {
+  return <LoginScreen incompleteSignup={incompleteSignup} />;
 }
 
 // ==============================
@@ -758,7 +536,6 @@ const MENU_ITEMS = [
   { path: "/cleaning", label: "Cleaning", icon: "🧹", mobileIcon: "🧹" },
   { path: "/room-links", label: "Room Links", icon: "🔗", mobileIcon: "🔗" },
   { path: "/customers", label: "Guest List", icon: "👥", mobileIcon: "👥" },
-  { path: "/ai-assistant", label: "AI Briefing", icon: "📡", mobileIcon: "📡" },
 ];
 
 // ==============================
@@ -837,10 +614,10 @@ function MobileMenu({ isOpen, onClose, onSync, currentPath }) {
 
         <div className="mobile-menu-footer">
           <button className="mobile-sync-btn" onClick={() => { onSync(false); onClose(); }}>
-            🔄 Quick Sync
+            🔄 변경분 Sync
           </button>
           <button className="mobile-sync-btn secondary" onClick={() => { onSync(true); onClose(); }}>
-            📦 Full Sync (2023~)
+            📦 전체 재대사 (2023~)
           </button>
           <button className="mobile-logout-btn" onClick={logout}>
             🔓 Sign Out
@@ -876,10 +653,10 @@ function Sidebar({ onSync, syncing }) {
         </div>
 
         <button className="sync-btn" onClick={() => onSync(false)} disabled={syncing}>
-          {syncing ? '⏳ Syncing...' : '🔄 Quick Sync'}
+          {syncing ? '⏳ Syncing...' : '🔄 변경분 Sync'}
         </button>
         <button className="sync-btn" onClick={() => onSync(true)} disabled={syncing} style={{ marginTop: '4px', fontSize: '11px', opacity: 0.8 }}>
-          📦 Full Sync (2023~)
+          📦 전체 재대사 (2023~)
         </button>
 
         <nav className="nav-menu">
@@ -1502,20 +1279,7 @@ function PerformanceDashboard({ targetMonth, setTargetMonth, companyId }) {
     : "linear-gradient(135deg, #EF4444 0%, #DC2626 100%)";
   const PIE_COLORS = ["#FF385C", "#003580"];
 
-  // Building name mapping
-  const BUILDING_NAMES_EN = {
-    "아라키초A": "Arakicho A",
-    "아라키초B": "Arakicho B",
-    "다이쿄초": "Daikyocho",
-    "가부키초": "Kabukicho",
-    "다카다노바바": "Takadanobaba",
-    "오쿠보A동": "Okubo A",
-    "오쿠보B동": "Okubo B",
-    "오쿠보C동": "Okubo C",
-    "사노시": "Sano"
-  };
-
-  const getBuildingEN = (name) => BUILDING_NAMES_EN[name] || name;
+  const getBuildingEN = (name) => _BUILDING_NAMES_EN_CENTRAL[name] || name;
 
   // Room name mapping for special cases
   const ROOM_NAMES_EN = {
@@ -2120,7 +1884,7 @@ function PerformanceDashboard({ targetMonth, setTargetMonth, companyId }) {
       </div>
 
       {/* Room Stats Tables */}
-      {Object.keys(data.roomStats).map((building) => {
+      {Object.keys(data.roomStats).filter((building) => building !== EXCLUDED_BUILDING_UI).map((building) => {
         const buildingTotal = Object.values(data.roomStats[building]).reduce((sum, r) => sum + r.total, 0);
         if (buildingTotal === 0) return null;
         let shareDenominator = buildingTotal;
@@ -2312,20 +2076,7 @@ function PerformanceDashboard({ targetMonth, setTargetMonth, companyId }) {
 // 🛏️ Occupancy Dashboard (숙박 현황)
 // ==============================
 // 건물명 영문 매핑
-const getBuildingNameEN = (koreanName) => {
-  const nameMap = {
-    "아라키초A": "Arakicho A",
-    "아라키초B": "Arakicho B",
-    "다이쿄초": "Daikyocho",
-    "가부키초": "Kabukicho",
-    "다카다노바바": "Takadanobaba",
-    "오쿠보A동": "Okubo A",
-    "오쿠보B동": "Okubo B",
-    "오쿠보C동": "Okubo C",
-    "사노시": "Sanoshi"
-  };
-  return nameMap[koreanName] || koreanName;
-};
+const getBuildingNameEN = (koreanName) => _BUILDING_NAMES_EN_CENTRAL[koreanName] || koreanName;
 
 // 객실명 영문 변환
 const getRoomNameEN = (koreanRoom) => {
@@ -2347,13 +2098,15 @@ function OccupancyDashboard({ targetMonth, setTargetMonth, companyId }) {
     // 숙박 현황은 'stayMonth' 기준
     const q = query(collection(db, "reservations"), where("companyId", "==", companyId), where("stayMonth", "==", targetMonth), where("status", "==", "confirmed"));
     const snapshot = await getDocs(q);
-    const reservations = snapshot.docs.map((doc) => doc.data());
+    let reservations = snapshot.docs.map((doc) => doc.data());
+    reservations = reservations.filter((r) => (r.building || "") !== EXCLUDED_BUILDING_UI);
 
     let total = 0;
     const rStats = {};
     const bCount = {};
 
     Object.keys(BUILDING_DATA).forEach((b) => {
+      if (b === EXCLUDED_BUILDING_UI) return;
       rStats[b] = {};
       BUILDING_DATA[b].forEach((r) => { rStats[b][r] = { total: 0, airbnb: 0, booking: 0 }; });
     });
@@ -2463,7 +2216,7 @@ function OccupancyDashboard({ targetMonth, setTargetMonth, companyId }) {
         </div>
       </div>
 
-      {Object.keys(data.roomStats).map((building) => {
+      {Object.keys(data.roomStats).filter((building) => building !== EXCLUDED_BUILDING_UI).map((building) => {
         const buildingTotal = Object.values(data.roomStats[building]).reduce((sum, r) => sum + r.total, 0);
         if (buildingTotal === 0) return null;
         let shareDenominator = buildingTotal;
@@ -2518,17 +2271,13 @@ function OccupancyDashboard({ targetMonth, setTargetMonth, companyId }) {
 // ==============================
 // 🚪 ArrivalsDashboard (입/퇴실 대시보드)
 // ==============================
-// 건물 정렬 순서 정의
-const BUILDING_ORDER = [
-  "아라키초A", "아라키초B", "다이쿄초", "가부키초",
-  "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동"
-];
+const DISPLAY_BUILDING_ORDER = _ACTIVE_BUILDING_ORDER;
 
 // 건물 순서대로 정렬하는 함수
 const sortByBuildingOrder = (list) => {
   return [...list].sort((a, b) => {
-    const indexA = BUILDING_ORDER.indexOf(a.building);
-    const indexB = BUILDING_ORDER.indexOf(b.building);
+    const indexA = DISPLAY_BUILDING_ORDER.indexOf(a.building);
+    const indexB = DISPLAY_BUILDING_ORDER.indexOf(b.building);
     // 목록에 없는 건물은 맨 뒤로
     const orderA = indexA === -1 ? 999 : indexA;
     const orderB = indexB === -1 ? 999 : indexB;
@@ -2537,6 +2286,7 @@ const sortByBuildingOrder = (list) => {
 };
 
 function DeprecatedArrivalsDashboard() {
+  const { companyId } = useUser();
   const [selectedDate, setSelectedDate] = useState(new Date().toISOString().slice(0, 10));
   const [loading, setLoading] = useState(false);
   const [guestList, setGuestList] = useState([]);
@@ -2574,7 +2324,7 @@ function DeprecatedArrivalsDashboard() {
       console.log("Beds24 Raw Data:", result.data);
 
       if (result.success && Array.isArray(result.data)) {
-        setGuestList(result.data);
+        setGuestList((result.data || []).filter(g => g.building !== EXCLUDED_BUILDING_UI));
       } else {
         setGuestList([]);
       }
@@ -2600,9 +2350,15 @@ function DeprecatedArrivalsDashboard() {
     }
 
     try {
+      if (!companyId) {
+        console.warn('⚠️ No companyId for guest search');
+        return;
+      }
+
       // Firestore에서 모든 confirmed 예약을 가져와서 클라이언트에서 검색
       const q = query(
         collection(db, "reservations"),
+        where("companyId", "==", companyId),
         where("status", "==", "confirmed")
       );
       const snapshot = await getDocs(q);
@@ -3091,9 +2847,9 @@ function AppContent({ handleSync, syncing, globalMonth, setGlobalMonth, mobileMe
 
   return (
     <NewLayout onSync={handleSync} syncing={syncing}>
+      <TeamToast />
       <Routes>
         <Route path="/" element={<TodaySummaryDashboard />} />
-        <Route path="/ai-assistant" element={<AiChatbot />} />
         <Route path="/performance" element={<PerformanceDashboard targetMonth={globalMonth} setTargetMonth={setGlobalMonth} companyId={companyId} />} />
         <Route path="/revenue" element={<RevenueDashboard />} />
         <Route path="/sales-log" element={<SalesLogDashboard />} />
@@ -3107,10 +2863,10 @@ function AppContent({ handleSync, syncing, globalMonth, setGlobalMonth, mobileMe
         <Route path="/cleaning" element={<CleaningDashboard />} />
         <Route path="/room-links" element={<RoomLinksDashboard />} />
         <Route path="/customers" element={<CustomerListDashboard />} />
-        <Route path="/messages" element={<MessagesDashboard />} />
-        <Route path="/invite-codes" element={<InviteCodeManager />} />
+        <Route path="/team" element={<MemberManagement />} />
         <Route path="/my-profile" element={<MyProfile />} />
         <Route path="/price-history" element={<PriceChangeHistory />} />
+        <Route path="/reviews" element={<ReviewsDashboard />} />
         <Route path="/design-preview" element={<DesignPreview />} />
       </Routes>
 
@@ -3149,40 +2905,22 @@ function App() {
   const { user, userData, companyId, loading } = useUser();
   const [globalMonth, setGlobalMonth] = useState(new Date().toISOString().slice(0, 7));
   const [syncing, setSyncing] = useState(false);
+  const [syncModalOpen, setSyncModalOpen] = useState(false);
   const [showInstallPrompt, setShowInstallPrompt] = useState(true);
   const [deferredPrompt, setDeferredPrompt] = useState(null);
   const [showPWABanner, setShowPWABanner] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  const handleSync = async (fullSync = false) => {
-    const syncUrl = fullSync ? SYNC_BEDS24_FULL_URL : SYNC_BEDS24_URL;
-    const syncType = fullSync ? "전체" : "빠른";
-    const timeEstimate = fullSync ? "1~2분" : "5~10초";
-
-    if (!window.confirm(`${syncType} 동기화를 실행하시겠습니까?\n\n` +
-      (fullSync
-        ? "• 전체 동기화: 2023년 1월부터 모든 예약 (느림)\n"
-        : "• 빠른 동기화: 오늘 ~ 향후 5개월 (빠름)\n") +
-      `• 예상 소요시간: ${timeEstimate}`)) return;
-
-    setSyncing(true);
-    try {
-      const response = await fetch(syncUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" }
-      });
-      const result = await response.json();
-      if (result.success) {
-        alert(result.message || "동기화 완료!");
-        window.location.reload();
-      } else {
-        alert("연동 실패: " + result.error + "\n\n디버그 로그:\n" + (result.details || []).join("\n"));
-      }
-    } catch (error) {
-      console.error(error);
-      alert("통신 오류: 함수 URL 혹은 네트워크 연결 확인 필요");
+  // Capacitor Native Integration (Status Bar)
+  useEffect(() => {
+    if (Capacitor.isNativePlatform()) {
+      StatusBar.setStyle({ style: Style.Light });
+      StatusBar.setBackgroundColor({ color: '#4F46E5' }); // Indigo 600 theme color
     }
-    setSyncing(false);
+  }, []);
+
+  const handleSync = () => {
+    setSyncModalOpen(true);
   };
 
   // PWA 설치 핸들러
@@ -3243,7 +2981,7 @@ function App() {
 
   if (loading) return <div style={{ height: "100vh", display: "flex", justifyContent: "center", alignItems: "center" }}>로딩 중...</div>;
   // Show LoginPage if no user OR if user exists but no userData (incomplete signup)
-  if (!user || (user && !userData)) return <><style>{styles}</style><LoginPage /></>;
+  if (!user || (user && !userData)) return <><style>{styles}</style><LoginPage incompleteSignup={user && !userData} /></>;
 
   return (
     <>
@@ -3256,16 +2994,23 @@ function App() {
       {showPWABanner && (
         <PWAInstallBanner onInstall={handlePWAInstall} onDismiss={handlePWADismiss} />
       )}
+      <SyncManager
+        isOpen={syncModalOpen}
+        onClose={() => setSyncModalOpen(false)}
+        onSyncComplete={() => { setSyncModalOpen(false); window.location.reload(); }}
+      />
       <Router future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-        <AppContent
-          handleSync={handleSync}
-          syncing={syncing}
-          globalMonth={globalMonth}
-          setGlobalMonth={setGlobalMonth}
-          mobileMenuOpen={mobileMenuOpen}
-          setMobileMenuOpen={setMobileMenuOpen}
-          companyId={companyId}
-        />
+        <MaintenanceGuard>
+          <AppContent
+            handleSync={handleSync}
+            syncing={syncing}
+            globalMonth={globalMonth}
+            setGlobalMonth={setGlobalMonth}
+            mobileMenuOpen={mobileMenuOpen}
+            setMobileMenuOpen={setMobileMenuOpen}
+            companyId={companyId}
+          />
+        </MaintenanceGuard>
       </Router>
     </>
   );

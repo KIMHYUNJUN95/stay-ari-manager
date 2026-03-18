@@ -16,7 +16,7 @@ export const BUILDING_DATA = {
     "502호", "603호", "802호", "803호"
   ],
   "다카다노바바": [
-    "2층", "3층", "4층", "5층", "6층", "7층", "8층", "9층"
+    "201호", "301호", "401호", "501호", "601호", "701호", "801호", "901호"
   ],
   "오쿠보": [
     "A동", "B동", "C동"
@@ -37,5 +37,18 @@ export const BUILDING_NAMES_EN = {
   "오쿠보B동": "Okubo B",
   "오쿠보C동": "Okubo C",
   "사노시": "Sano",
-  "사노": "Sano"
+  "사노": "Sano",
+  "사노시 사노": "Sano"
 };
+
+// 건물 정렬 순서 (전체 — 다이쿄초 포함)
+export const BUILDING_ORDER = [
+  "아라키초A", "아라키초B", "다이쿄초", "가부키초",
+  "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동", "사노시"
+];
+
+// 다이쿄초: DB 보존, 화면에서는 항상 제외
+export const EXCLUDED_BUILDING_UI = "다이쿄초";
+
+// 활성 건물 목록 (다이쿄초 제외)
+export const ACTIVE_BUILDING_ORDER = BUILDING_ORDER.filter(b => b !== EXCLUDED_BUILDING_UI);

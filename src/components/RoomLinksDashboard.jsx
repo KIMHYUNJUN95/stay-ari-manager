@@ -1,26 +1,17 @@
 import React, { useState, useEffect, useMemo } from "react";
+import { doc, getDoc, setDoc } from "firebase/firestore";
+import { db } from "../firebase";
+import { useUser } from "../contexts/UserContext";
 import { ROOM_LINKS as BASE_ROOM_LINKS } from "../constants/roomLinks";
+import { BUILDING_NAMES_EN as _BUILDING_NAMES_EN } from '../constants/buildingData';
 
 // -----------------------------------------------------------------------------
 // [CONSTANTS & LOGIC] Data Management (Preserved)
 // -----------------------------------------------------------------------------
 const LS_KEY = "ROOM_LINKS_DATA_v2";
 const OLD_LS_KEY = "ROOM_LINKS_OVERRIDES_v1";
-
-// Korean to English Building Name Mapping
-const BUILDING_NAMES_EN = {
-  "아라키초A": "Arakicho A",
-  "아라키초B": "Arakicho B",
-  "다이쿄초": "Daikyocho",
-  "가부키초": "Kabukicho",
-  "가부키초K": "Kabukicho K",
-  "가부키초KK": "Kabukicho KK",
-  "다카다노바바": "Takadanobaba",
-  "오쿠보A동": "Okubo A",
-  "오쿠보B동": "Okubo B",
-  "오쿠보C동": "Okubo C",
-  "사노시": "Sano"
-};
+const FIRESTORE_COLLECTION = "roomLinks";
+const BUILDING_NAMES_EN = { ..._BUILDING_NAMES_EN, "가부키초K": "Kabukicho K", "가부키초KK": "Kabukicho KK" };
 
 function normalizeUrl(url) {
   const raw = String(url || "").trim();
@@ -67,30 +58,36 @@ function splitKabukicho(data) {
 }
 
 function loadData() {
+  let savedAirbnb = null;
+  let savedBooking = null;
+
   try {
     const raw = localStorage.getItem(LS_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (parsed.airbnb && Object.keys(parsed.airbnb).length > 0) {
-        if (parsed.airbnb["가부키초"]) {
-          parsed.airbnb = splitKabukicho(parsed.airbnb);
-          localStorage.setItem(LS_KEY, JSON.stringify(parsed));
-        }
-        return parsed;
+      if (parsed && typeof parsed === "object") {
+        savedAirbnb = parsed.airbnb && typeof parsed.airbnb === "object" ? parsed.airbnb : null;
+        savedBooking = parsed.booking && typeof parsed.booking === "object" ? parsed.booking : null;
       }
     }
-  } catch { }
+  } catch (e) {
+    console.warn("Room Links load parse error:", e);
+  }
+
+  if (savedAirbnb && Object.keys(savedAirbnb).length > 0) {
+    if (savedAirbnb["가부키초"]) {
+      savedAirbnb = splitKabukicho(savedAirbnb);
+      try {
+        localStorage.setItem(LS_KEY, JSON.stringify({ airbnb: savedAirbnb, booking: savedBooking || {} }));
+      } catch (e) {
+        console.warn("Room Links save after split failed:", e);
+      }
+    }
+    return { airbnb: savedAirbnb, booking: savedBooking || {} };
+  }
 
   try {
-    let existingBooking = {};
-    try {
-      const raw = localStorage.getItem(LS_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        existingBooking = parsed.booking || {};
-      }
-    } catch { }
-
+    let existingBooking = savedBooking || {};
     let oldOverrides = {};
     try {
       const oldRaw = localStorage.getItem(OLD_LS_KEY);
@@ -100,19 +97,42 @@ function loadData() {
     const mergedAirbnb = mergeOldData(BASE_ROOM_LINKS, oldOverrides);
     const splitAirbnb = splitKabukicho(mergedAirbnb);
     const newData = { airbnb: splitAirbnb, booking: existingBooking };
-    localStorage.setItem(LS_KEY, JSON.stringify(newData));
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify(newData));
+    } catch (e) {
+      console.warn("Room Links migration save failed:", e);
+    }
     return newData;
   } catch (e) {
-    console.error("Migration failed:", e);
+    console.error("Room Links migration failed:", e);
   }
 
   return { airbnb: splitKabukicho(BASE_ROOM_LINKS), booking: {} };
 }
 
-function saveData(data) {
+function saveDataLocal(data) {
   try {
     localStorage.setItem(LS_KEY, JSON.stringify(data));
-  } catch { }
+    return true;
+  } catch (e) {
+    console.error("Room Links localStorage save failed:", e);
+    return false;
+  }
+}
+
+async function saveDataToFirestore(companyId, data) {
+  if (!companyId) return true;
+  try {
+    await setDoc(doc(db, FIRESTORE_COLLECTION, companyId), {
+      airbnb: data.airbnb || {},
+      booking: data.booking || {},
+      updatedAt: new Date().toISOString()
+    });
+    return true;
+  } catch (e) {
+    console.error("Room Links Firestore save failed:", e);
+    return false;
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -120,10 +140,12 @@ function saveData(data) {
 // -----------------------------------------------------------------------------
 
 export default function RoomLinksDashboard() {
+  const { companyId } = useUser();
   const [data, setData] = useState(loadData);
   const [platform, setPlatform] = useState("airbnb"); // airbnb, booking
   const [selectedBuilding, setSelectedBuilding] = useState("");
   const [roomFilter, setRoomFilter] = useState("");
+  const [loadFromFirestoreDone, setLoadFromFirestoreDone] = useState(false);
 
   // Modal States
   const [showAddBuilding, setShowAddBuilding] = useState(false);
@@ -138,6 +160,39 @@ export default function RoomLinksDashboard() {
   const [editHost, setEditHost] = useState("");
   const [editGuest, setEditGuest] = useState("");
   const [savedTick, setSavedTick] = useState(0);
+
+  // 팀 공용: Firestore에서 불러오기 (companyId 기준). 없으면 로컬 데이터를 Firestore에 올려 팀과 공유
+  useEffect(() => {
+    if (!companyId) {
+      setLoadFromFirestoreDone(true);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const ref = doc(db, FIRESTORE_COLLECTION, companyId);
+        const snap = await getDoc(ref);
+        if (cancelled) return;
+        if (snap.exists() && snap.data().airbnb && typeof snap.data().airbnb === "object" && Object.keys(snap.data().airbnb).length > 0) {
+          let airbnb = snap.data().airbnb;
+          if (airbnb["가부키초"]) airbnb = splitKabukicho(airbnb);
+          setData({
+            airbnb,
+            booking: snap.data().booking && typeof snap.data().booking === "object" ? snap.data().booking : {}
+          });
+        } else {
+          const local = loadData();
+          if (local.airbnb && Object.keys(local.airbnb).length > 0) {
+            await saveDataToFirestore(companyId, local);
+          }
+        }
+      } catch (e) {
+        console.warn("Room Links Firestore load failed:", e);
+      }
+      setLoadFromFirestoreDone(true);
+    })();
+    return () => { cancelled = true; };
+  }, [companyId]);
 
   const buildings = useMemo(() => {
     return Object.keys(data[platform] || {}).sort();
@@ -168,9 +223,11 @@ export default function RoomLinksDashboard() {
     return keys.sort((a, b) => extractNumber(a) - extractNumber(b));
   }, [data, platform, selectedBuilding, roomFilter]);
 
-  const updateData = (newData) => {
+  const updateData = async (newData) => {
     setData(newData);
-    saveData(newData);
+    saveDataLocal(newData);
+    const ok = await saveDataToFirestore(companyId, newData);
+    if (!ok) alert("Team save failed. Your links are saved on this device only. Check your connection.");
     setSavedTick(Date.now());
   };
 
@@ -189,8 +246,9 @@ export default function RoomLinksDashboard() {
 
   const deleteBuilding = (buildingName) => {
     if (!window.confirm(`Delete property "${buildingName}" and all its rooms?`)) return;
-    const newData = { ...data };
-    delete newData[platform][buildingName];
+    const nextPlatform = { ...(data[platform] || {}) };
+    delete nextPlatform[buildingName];
+    const newData = { ...data, [platform]: nextPlatform };
     updateData(newData);
   };
 
@@ -217,8 +275,10 @@ export default function RoomLinksDashboard() {
 
   const deleteRoom = (roomName) => {
     if (!window.confirm(`Delete room "${roomName}"?`)) return;
-    const newData = { ...data };
-    delete newData[platform][selectedBuilding][roomName];
+    const nextBuilding = { ...(data[platform]?.[selectedBuilding] || {}) };
+    delete nextBuilding[roomName];
+    const nextPlatform = { ...(data[platform] || {}), [selectedBuilding]: nextBuilding };
+    const newData = { ...data, [platform]: nextPlatform };
     updateData(newData);
   };
 
@@ -231,11 +291,12 @@ export default function RoomLinksDashboard() {
 
   const saveEdit = () => {
     if (!editingRoom) return;
-    const newData = { ...data };
-    newData[platform][selectedBuilding][editingRoom] = {
-      host: editHost.trim(),
-      guest: editGuest.trim()
+    const nextBuilding = {
+      ...(data[platform]?.[selectedBuilding] || {}),
+      [editingRoom]: { host: editHost.trim(), guest: editGuest.trim() }
     };
+    const nextPlatform = { ...(data[platform] || {}), [selectedBuilding]: nextBuilding };
+    const newData = { ...data, [platform]: nextPlatform };
     updateData(newData);
     setEditingRoom(null);
     setEditHost("");

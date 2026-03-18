@@ -1,27 +1,16 @@
 // src/components/TodaySummaryDashboard.jsx
 // 대기업 수준 메인 대시보드 - 각 기능과 100% 데이터 일치
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { collection, query, where, onSnapshot } from "firebase/firestore";
 import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
 
-// 건물 이름 영어 매핑 (Performance Dashboard와 동일)
-const BUILDING_NAMES_EN = {
-  "아라키초A": "Arakicho A",
-  "아라키초B": "Arakicho B",
-  "다이쿄초": "Daikyocho",
-  "가부키초": "Kabukicho",
-  "다카다노바바": "Takadanobaba",
-  "오쿠보A동": "Okubo A",
-  "오쿠보B동": "Okubo B",
-  "오쿠보C동": "Okubo C",
-  "사노시": "Sano"
-};
+import { BUILDING_NAMES_EN, EXCLUDED_BUILDING_UI } from '../constants/buildingData';
 
 const getBuildingEN = (name) => BUILDING_NAMES_EN[name] || name;
 
-// 각 건물의 객실 수 (OccupancyRateDashboard와 동일)
+// 각 건물의 객실 수 (매출 분석용 — BUILDING_DATA와 다른 형태)
 const BUILDING_ROOMS = {
   "아라키초A": ["201호", "202호", "301호", "302호", "401호", "402호", "501호", "502호", "602호", "701호", "702호"],
   "아라키초B": ["101호", "102호", "201호", "202호", "301호", "302호", "401호", "402호"],
@@ -33,9 +22,6 @@ const BUILDING_ROOMS = {
   "사노시": ["사노"],
   "다카다노바바": ["201호", "301호", "401호", "501호", "601호", "701호", "801호", "901호"]
 };
-
-// ★ 다이쿄초 매각일 (2025-01-25 마지막 운영일)
-const DAIKYO_SOLD_DATE = "2026-01-26";
 
 // 예약된 날짜들을 Set으로 계산 (겹침 제거) - OccupancyRateDashboard와 동일
 // ★ 베드24 기준: arrival ~ departure 전날까지 점유됨
@@ -110,9 +96,19 @@ const TodaySummaryDashboard = () => {
     lastMonthAvg: 0
   });
 
-  // ===== Quick Calendar =====
+  // ===== Quick Calendar (다이쿄초·사노시 제외) =====
+  const calendarBuildingList = useMemo(
+    () => Object.keys(BUILDING_ROOMS).filter(b => b !== "사노시" && b !== EXCLUDED_BUILDING_UI),
+    []
+  );
   const [selectedCalendarBuilding, setSelectedCalendarBuilding] = useState("아라키초A");
   const [calendarReservations, setCalendarReservations] = useState([]);
+
+  useEffect(() => {
+    if (selectedCalendarBuilding === EXCLUDED_BUILDING_UI || !calendarBuildingList.includes(selectedCalendarBuilding)) {
+      setSelectedCalendarBuilding(calendarBuildingList[0] || "아라키초A");
+    }
+  }, [selectedCalendarBuilding, calendarBuildingList]);
 
   useEffect(() => {
     const now = new Date();
@@ -173,6 +169,7 @@ const TodaySummaryDashboard = () => {
 
       allReservations.forEach(doc => {
         if (!doc.arrival || !doc.departure) return;
+        if ((doc.building || "") === EXCLUDED_BUILDING_UI) return;
 
         const totalPrice = Number(doc.totalPrice || doc.price) || 0;
         const arrivalDate = parseLocalDate(doc.arrival);
@@ -243,11 +240,13 @@ const TodaySummaryDashboard = () => {
       // bookDate 기준, 중복 제거
       // ========================================
       const currentMonthBookings = allReservations.filter(r => {
+        if ((r.building || "") === EXCLUDED_BUILDING_UI) return false;
         const bookTime = r.bookDate || r.firstNight || '';
         return bookTime && typeof bookTime === 'string' && bookTime.startsWith(currentMonthStr);
       });
 
       const lastMonthBookings = allReservations.filter(r => {
+        if ((r.building || "") === EXCLUDED_BUILDING_UI) return false;
         const bookTime = r.bookDate || r.firstNight || '';
         return bookTime && typeof bookTime === 'string' && bookTime.startsWith(lastMonthStr);
       });
@@ -286,8 +285,12 @@ const TodaySummaryDashboard = () => {
 
       // ★ 플랫폼별 매출은 위 1️⃣에서 이미 계산됨 (calculatedPlatformRevenue)
 
-      const buildingStats = Object.entries(buildingCount)
-        .map(([name, count]) => ({ name, count }))
+      // 표시용 건물 목록 (다이쿄초·사노시 제외). 예약 0건인 건물도 막대에 표시
+      const displayBuildingList = Object.keys(BUILDING_ROOMS).filter(
+        b => b !== "사노시" && b !== EXCLUDED_BUILDING_UI
+      );
+      const buildingStats = displayBuildingList
+        .map(name => ({ name, count: buildingCount[name] || 0 }))
         .sort((a, b) => b.count - a.count);
 
       setPerformanceData({
@@ -308,8 +311,8 @@ const TodaySummaryDashboard = () => {
       let lastAvailableDays = 0;
 
       Object.keys(BUILDING_ROOMS).forEach(building => {
-        // ★ 사노시는 전체 가동률 계산에서 제외 (독채 + 다른 업체 운영)
-        if (building === "사노시") return;
+        // ★ 사노시·다이쿄초: 가동률 계산에서 제외
+        if (building === "사노시" || building === EXCLUDED_BUILDING_UI) return;
 
         const rooms = BUILDING_ROOMS[building];
         rooms.forEach(room => {
@@ -321,7 +324,7 @@ const TodaySummaryDashboard = () => {
               r.room === room &&
               r.arrival <= currentMonthEnd &&
               r.departure >= currentMonthStart &&
-              !(building === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE);
+              building !== EXCLUDED_BUILDING_UI;
           });
           currentOccupiedDays += getOccupiedDaysSet(currentRoomReservations, currentMonthStart, currentMonthEnd);
           currentAvailableDays += daysInCurrentMonth;
@@ -334,7 +337,7 @@ const TodaySummaryDashboard = () => {
               r.room === room &&
               r.arrival <= lastMonthEnd &&
               r.departure >= lastMonthStart &&
-              !(building === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE);
+              building !== EXCLUDED_BUILDING_UI;
           });
           lastOccupiedDays += getOccupiedDaysSet(lastRoomReservations, lastMonthStart, lastMonthEnd);
           lastAvailableDays += daysInLastMonth;
@@ -373,7 +376,7 @@ const TodaySummaryDashboard = () => {
         return r.arrival &&
           r.arrival.startsWith(currentMonthStr) &&
           r.building !== "사노시" &&
-          !(r.building === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE) &&
+          r.building !== EXCLUDED_BUILDING_UI &&
           Number(r.totalPrice || r.price || 0) > 0;
       });
 
@@ -383,7 +386,7 @@ const TodaySummaryDashboard = () => {
         return r.arrival &&
           r.arrival.startsWith(lastMonthStr) &&
           r.building !== "사노시" &&
-          !(r.building === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE) &&
+          r.building !== EXCLUDED_BUILDING_UI &&
           Number(r.totalPrice || r.price || 0) > 0;
       });
 
@@ -624,9 +627,9 @@ const TodaySummaryDashboard = () => {
               </span>
             </div>
             
-            {/* 건물 선택 버튼 */}
+            {/* 건물 선택 버튼 (다이쿄초·사노시 제외) */}
             <div style={styles.buildingButtons}>
-              {Object.keys(BUILDING_ROOMS).filter(b => b !== "사노시").map(building => (
+              {calendarBuildingList.map(building => (
                 <button
                   key={building}
                   onClick={() => setSelectedCalendarBuilding(building)}

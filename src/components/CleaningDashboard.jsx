@@ -7,25 +7,7 @@ import { useUser } from '../contexts/UserContext';
 // [CONSTANTS] Configuration & Data
 // -----------------------------------------------------------------------------
 
-const BUILDING_ORDER = [
-  "아라키초A", "아라키초B", "다이쿄초", "가부키초",
-  "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동", "사노시"
-];
-
-// Building name mapping (Korean -> English)
-const BUILDING_NAMES_EN = {
-  "아라키초A": "Arakicho A",
-  "아라키초B": "Arakicho B",
-  "다이쿄초": "Daikyocho",
-  "가부키초": "Kabukicho",
-  "다카다노바바": "Takadanobaba",
-  "오쿠보A동": "Okubo A",
-  "오쿠보B동": "Okubo B",
-  "오쿠보C동": "Okubo C",
-  "사노시": "Sano"
-};
-
-const DAIKYO_SOLD_DATE = "2026-01-26";
+import { BUILDING_ORDER, BUILDING_NAMES_EN, EXCLUDED_BUILDING_UI } from '../constants/buildingData';
 
 // Month names (number + English)
 const MONTHS = [
@@ -178,9 +160,7 @@ const CleaningDashboard = () => {
         return task;
       }));
 
-      const filteredTasks = selectedDate >= DAIKYO_SOLD_DATE
-        ? finalTasks.filter(t => t.building !== "다이쿄초")
-        : finalTasks;
+      const filteredTasks = finalTasks.filter(t => t.building !== EXCLUDED_BUILDING_UI);
 
       setScheduleList(sortByBuildingOrder(filteredTasks));
     } catch (error) {

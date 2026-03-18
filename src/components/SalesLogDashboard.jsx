@@ -5,45 +5,21 @@ import { collection, getDocs, query, where, doc, getDoc, setDoc } from "firebase
 import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
 
-// Building order (excluding Sano)
-const BUILDING_ORDER = [
-  "아라키초A", "아라키초B", "다이쿄초", "가부키초",
-  "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동"
-];
+import { BUILDING_ORDER as _BUILDING_ORDER, BUILDING_NAMES_EN, EXCLUDED_BUILDING_UI } from '../constants/buildingData';
 
-// ★ 다이쿄초 매각일 (2025-01-25 마지막 운영일)
-const DAIKYO_SOLD_DATE = "2026-01-26";
+// SalesLog는 다이쿄초·사노시·오쿠보A동 제외 (매출 분석 기준 통일)
+const EXCLUDED_SALES_BUILDINGS = [EXCLUDED_BUILDING_UI, "사노시", "오쿠보A동"];
+const BUILDING_ORDER = _BUILDING_ORDER.filter(b => !EXCLUDED_SALES_BUILDINGS.includes(b));
+const getActiveBuildingOrder = () => BUILDING_ORDER;
 
-// 현재 운영 중인 건물 목록 (날짜 기준)
-const getActiveBuildingOrder = (dateStr) => {
-  if (dateStr >= DAIKYO_SOLD_DATE) {
-    return BUILDING_ORDER.filter(b => b !== "다이쿄초");
-  }
-  return BUILDING_ORDER;
-};
-
-// Room count per building
+// Room count per building (매출 분석용, 다이쿄초·사노시·오쿠보A동 제외)
 const BUILDING_ROOMS = {
   "아라키초A": ["201호", "202호", "301호", "302호", "401호", "402호", "501호", "502호", "602호", "701호", "702호"],
   "아라키초B": ["101호", "102호", "201호", "202호", "301호", "302호", "401호", "402호"],
-  "다이쿄초": ["B01호", "B02호", "101호", "102호", "201호", "202호", "302호"],
   "가부키초": ["202호", "203호", "302호", "303호", "402호", "403호", "502호", "603호", "802호", "803호"],
-  "오쿠보A동": ["오쿠보A"],
   "오쿠보B동": ["오쿠보B"],
   "오쿠보C동": ["오쿠보C"],
   "다카다노바바": ["201호", "301호", "401호", "501호", "601호", "701호", "801호", "901호"]
-};
-
-// Building names in English
-const BUILDING_NAMES_EN = {
-  "아라키초A": "Arakicho A",
-  "아라키초B": "Arakicho B",
-  "다이쿄초": "Daikyocho",
-  "가부키초": "Kabukicho",
-  "다카다노바바": "Takadanobaba",
-  "오쿠보A동": "Okubo A",
-  "오쿠보B동": "Okubo B",
-  "오쿠보C동": "Okubo C"
 };
 
 // Month names
@@ -142,9 +118,11 @@ const SalesLogDashboard = () => {
       );
 
       const snapshot = await getDocs(q);
-      const reservations = snapshot.docs.map(d => d.data());
+      let reservations = snapshot.docs.map(d => d.data());
+      // ★ 캘린더·Total Revenue 동일 기준: 화면용 집계에서 다이쿄초·사노시·오쿠보A동 제외 (DB는 유지)
+      reservations = reservations.filter(d => !EXCLUDED_SALES_BUILDINGS.includes(d.building || ""));
 
-      console.log(`📊 Revenue Analytics: ${reservations.length} confirmed reservations loaded`);
+      console.log(`📊 Revenue Analytics: ${reservations.length} confirmed reservations loaded (다이쿄초·사노시·오쿠보A동 제외)`);
       setAllReservations(reservations);
     } catch (error) {
       console.error("Failed to load data:", error);
@@ -159,10 +137,11 @@ const SalesLogDashboard = () => {
   }, [selectedYear, selectedMonth, selectedDay, viewMode]);
 
   const loadMemo = async () => {
+    if (!companyId) return;
     try {
       const memoKey = viewMode === "daily"
-        ? `${selectedYear}-${String(selectedMonth).padStart(2, '0')}-${String(selectedDay).padStart(2, '0')}`
-        : `${selectedYear}-${String(selectedMonth).padStart(2, '0')}`;
+        ? `${companyId}_${selectedYear}-${String(selectedMonth).padStart(2, '0')}-${String(selectedDay).padStart(2, '0')}`
+        : `${companyId}_${selectedYear}-${String(selectedMonth).padStart(2, '0')}`;
 
       const docRef = doc(db, "salesLogMemos", memoKey);
       const docSnap = await getDoc(docRef);
@@ -179,11 +158,12 @@ const SalesLogDashboard = () => {
 
   // Save memo
   const handleSaveMemo = async () => {
+    if (!companyId) return;
     setSavingMemo(true);
     try {
       const memoKey = viewMode === "daily"
-        ? `${selectedYear}-${String(selectedMonth).padStart(2, '0')}-${String(selectedDay).padStart(2, '0')}`
-        : `${selectedYear}-${String(selectedMonth).padStart(2, '0')}`;
+        ? `${companyId}_${selectedYear}-${String(selectedMonth).padStart(2, '0')}-${String(selectedDay).padStart(2, '0')}`
+        : `${companyId}_${selectedYear}-${String(selectedMonth).padStart(2, '0')}`;
 
       await setDoc(doc(db, "salesLogMemos", memoKey), {
         memo,
@@ -227,10 +207,7 @@ const SalesLogDashboard = () => {
 
       const bName = doc.building || "Unknown";
 
-      // ★ 다이쿄초: 예약 접수일(bookDate)이 2026-01-26 이후인 경우만 제외
-      // 1/25 이전에 예약한 건은 체크인 날짜와 관계없이 모두 포함
-      const bookDate = doc.bookDate || doc.arrival; // bookDate 없으면 arrival 사용
-      if (bName === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE) return;
+      if (EXCLUDED_SALES_BUILDINGS.includes(bName)) return;
 
       const totalPrice = Number(doc.totalPrice || doc.price) || 0;
       const arrivalDate = parseLocalDate(doc.arrival);
@@ -266,35 +243,29 @@ const SalesLogDashboard = () => {
     let totalReservationCount = 0;
 
     // ★ 건물 목록 유지 (과거 데이터는 보여야 함)
-    BUILDING_ORDER.forEach(building => {
+    getActiveBuildingOrder().forEach(building => {
       const rooms = BUILDING_ROOMS[building];
       let buildingOccupiedDays = 0;
       let buildingAvailableDays = rooms.length * daysCount;
       let buildingReservationCount = 0;
 
       rooms.forEach(room => {
-        // ★ 다이쿄초: bookDate가 1/26 이후인 예약만 제외
-        const roomReservations = allReservations.filter(r => {
-          const bookDate = r.bookDate || r.arrival;
-          return r.building === building &&
-            r.room === room &&
-            r.arrival <= endDate &&
-            r.departure > startDate &&
-            !(building === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE);
-        });
+        const roomReservations = allReservations.filter(r =>
+          r.building === building &&
+          r.room === room &&
+          r.arrival <= endDate &&
+          r.departure > startDate
+        );
 
         const occupiedDays = getOccupiedDaysSet(roomReservations, startDate, endDate);
         buildingOccupiedDays += occupiedDays;
 
-        // ★ 다이쿄초: bookDate가 1/26 이후인 예약만 제외
-        const checkinReservations = allReservations.filter(r => {
-          const bookDate = r.bookDate || r.arrival;
-          return r.building === building &&
-            r.room === room &&
-            r.arrival >= startDate &&
-            r.arrival <= endDate &&
-            !(building === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE);
-        });
+        const checkinReservations = allReservations.filter(r =>
+          r.building === building &&
+          r.room === room &&
+          r.arrival >= startDate &&
+          r.arrival <= endDate
+        );
         buildingReservationCount += checkinReservations.length;
       });
 
@@ -340,7 +311,7 @@ const SalesLogDashboard = () => {
   const occupancyRevenueStats = useMemo(() => {
     if (!allReservations.length) return null;
 
-    const CURRENT_TOTAL_ROOMS = BUILDING_ORDER.reduce((sum, b) => sum + BUILDING_ROOMS[b].length, 0);
+    const CURRENT_TOTAL_ROOMS = getActiveBuildingOrder().reduce((sum, b) => sum + BUILDING_ROOMS[b].length, 0);
 
     const monthlyStats = [];
 
@@ -393,7 +364,7 @@ const SalesLogDashboard = () => {
         let monthOccupiedDays = 0;
         let monthAvailableDays = 0;
 
-        BUILDING_ORDER.forEach(building => {
+        getActiveBuildingOrder().forEach(building => {
           const rooms = BUILDING_ROOMS[building];
           let buildingOccupiedDays = 0;
 
@@ -561,7 +532,7 @@ const SalesLogDashboard = () => {
     let occupiedRooms = 0;
     let totalRoomsActive = 0;
 
-    BUILDING_ORDER.forEach(building => {
+    getActiveBuildingOrder().forEach(building => {
       const rooms = BUILDING_ROOMS[building];
       let buildingOccupied = 0;
 
@@ -603,6 +574,7 @@ const SalesLogDashboard = () => {
     let revenue = 0;
     allReservations.forEach(doc => {
       if (!doc.arrival || !doc.departure) return;
+      if (EXCLUDED_SALES_BUILDINGS.includes(doc.building || "")) return;
 
       const totalPrice = Number(doc.totalPrice || doc.price) || 0;
       const arrivalDate = parseLocalDate(doc.arrival);
@@ -631,7 +603,7 @@ const SalesLogDashboard = () => {
     let occupiedDays = 0;
     let availableDays = 0;
 
-    BUILDING_ORDER.forEach(building => {
+    getActiveBuildingOrder().forEach(building => {
       const rooms = BUILDING_ROOMS[building];
       let buildingOccupiedDays = 0;
 
@@ -939,7 +911,7 @@ const SalesLogDashboard = () => {
                     Building Performance
                   </h3>
                   <div style={styles.buildingGrid}>
-                    {BUILDING_ORDER.map(building => {
+                    {getActiveBuildingOrder().map(building => {
                       const bData = selectedData.buildings[building];
                       if (!bData) return null;
 
@@ -1093,6 +1065,17 @@ const SalesLogDashboard = () => {
           )}
         </>
       )}
+
+      {/* Revenue criteria footnote */}
+      <p style={{
+        fontSize: '11px',
+        color: '#94A3B8',
+        textAlign: 'center',
+        padding: '16px 20px 12px',
+        margin: 0
+      }}>
+        Revenue Criteria: Airbnb & Booking.com only (excludes Expedia, Agoda, Direct bookings) | Excludes: Daikyocho (sold), Sano, Okubo A | Calculated on a per-night basis
+      </p>
     </div>
   );
 };

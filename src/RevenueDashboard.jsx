@@ -6,6 +6,7 @@ import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, R
 import DatePicker from 'react-datepicker';
 import 'react-datepicker/dist/react-datepicker.css';
 import { getMonth, getYear } from 'date-fns';
+import { BUILDING_ORDER, EXCLUDED_BUILDING_UI, ACTIVE_BUILDING_ORDER, BUILDING_NAMES_EN as _BUILDING_NAMES_EN } from './constants/buildingData';
 
 // 커스텀 DatePicker 헤더 (월: 01 Jan 형식)
 const MONTHS_EN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -84,22 +85,7 @@ const getPeriodInfo = (periodNum) => {
   return FISCAL_PERIODS.find(p => p.period === periodNum) || FISCAL_PERIODS[1]; // 기본 7기
 };
 
-// 건물 정렬 순서
-const BUILDING_ORDER = [
-  "아라키초A", "아라키초B", "다이쿄초", "가부키초",
-  "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동", "사노시"
-];
-
-// ★ 다이쿄초 매각일 (2025-01-25 마지막 운영일)
-const DAIKYO_SOLD_DATE = "2026-01-26";
-
-// 현재 운영 중인 건물 목록 (날짜 기준)
-const getActiveBuildingOrder = (dateStr) => {
-  if (dateStr >= DAIKYO_SOLD_DATE) {
-    return BUILDING_ORDER.filter(b => b !== "다이쿄초");
-  }
-  return BUILDING_ORDER;
-};
+const getActiveBuildingOrder = () => ACTIVE_BUILDING_ORDER;
 
 
 
@@ -180,19 +166,8 @@ const BUILDING_DATA = {
 
 const ALL_BUILDINGS = "전체";
 
-// Building name EN mapping
-const BUILDING_NAMES_EN = {
-  "아라키초A": "Arakicho A",
-  "아라키초B": "Arakicho B",
-  "다이쿄초": "Daikyocho",
-  "가부키초": "Kabukicho",
-  "다카다노바바": "Takadanobaba",
-  "오쿠보A동": "Okubo A",
-  "오쿠보B동": "Okubo B",
-  "오쿠보C동": "Okubo C",
-  "사노시": "Sano",
-  "전체": "All Buildings"
-};
+// Building name EN mapping (중앙 데이터 + 로컬 확장)
+const BUILDING_NAMES_EN = { ..._BUILDING_NAMES_EN, "전체": "All Buildings" };
 const getBuildingEN = (name) => BUILDING_NAMES_EN[name] || name;
 
 const ROOM_NAMES_EN = {
@@ -465,9 +440,11 @@ const RevenueDashboard = () => {
       );
 
       const snapshot = await getDocs(q);
-      const allDocs = snapshot.docs.map(d => d.data());
+      let allDocs = snapshot.docs.map(d => d.data());
+      // ★ 캘린더·Total Revenue 동일 기준: 화면용 집계에서 다이쿄초 제외 (DB는 유지)
+      allDocs = allDocs.filter(d => (d.building || "") !== EXCLUDED_BUILDING_UI);
 
-      console.log(`💰 매출 계산 시작: ${allDocs.length}건의 confirmed 예약 데이터`);
+      console.log(`💰 매출 계산 시작: ${allDocs.length}건의 confirmed 예약 데이터 (다이쿄초 제외)`);
 
       // 월별 데이터 초기화
       const monthLabels = getMonthLabels();
@@ -509,8 +486,7 @@ const RevenueDashboard = () => {
           const rName = doc.room || "Unknown";
           const bookDate = doc.bookDate || doc.arrival;
 
-          // 다이쿄초 매각일 필터
-          if (bName === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE) return;
+          if (bName === EXCLUDED_BUILDING_UI) return;
 
           const arrivalDate = parseLocalDate(doc.arrival);
           const departureDate = parseLocalDate(doc.departure);
@@ -797,8 +773,8 @@ const RevenueDashboard = () => {
       // 차트용 배열 변환
       const chartData = monthLabels.map(m => monthlyMap[m.key] || { month: m.label, current: 0, compare: 0 });
 
-      // 건물별 데이터 (정렬)
-      const buildingChartData = BUILDING_ORDER
+      // 건물별 데이터 (정렬) - 화면 표시용이므로 다이쿄초 제외
+      const buildingChartData = getActiveBuildingOrder()
         .filter(name => bMapCurrent[name] || bMapCompare[name])
         .map(name => ({
           name,
@@ -806,8 +782,9 @@ const RevenueDashboard = () => {
           compare: bMapCompare[name] || 0
         }));
 
-      // 다른 건물들 추가 (Beds24 등 기타)
+      // 다른 건물들 추가 (Beds24 등 기타) - 다이쿄초 제외
       Object.keys(bMapCurrent).forEach(name => {
+        if (name === EXCLUDED_BUILDING_UI) return;
         if (!BUILDING_ORDER.includes(name)) {
           buildingChartData.push({
             name,
@@ -818,7 +795,7 @@ const RevenueDashboard = () => {
       });
       // Compare에만 있는 건물도 추가
       Object.keys(bMapCompare).forEach(name => {
-        // 이미 추가된지 확인 (name은 unique key)
+        if (name === EXCLUDED_BUILDING_UI) return;
         const exists = buildingChartData.find(b => b.name === name);
         if (!exists && !BUILDING_ORDER.includes(name)) {
           buildingChartData.push({
@@ -871,11 +848,11 @@ const RevenueDashboard = () => {
       case DATE_MODES.YEAR:
         return `${selectedYear}`;
       case DATE_MODES.MONTH:
-        return `${MONTH_NAMES_SHORT[selectedMonth - 1]} ${selectedYear}`;
+        return `${MONTH_NAMES_SHORT[selectedMonth - 1]} ${selectedYear} (whole month)`;
       case DATE_MODES.WEEK:
         return `${range.startDate} ~ ${range.endDate}`;
       case DATE_MODES.DAY:
-        return `${MONTH_NAMES_SHORT[selectedDay.getMonth()]} ${selectedDay.getDate()}, ${selectedDay.getFullYear()}`;
+        return `${MONTH_NAMES_SHORT[selectedDay.getMonth()]} ${selectedDay.getDate()}, ${selectedDay.getFullYear()} (1 day)`;
       case DATE_MODES.CUSTOM:
         return `${customStartDate} ~ ${customEndDate}`;
       default:
@@ -3055,7 +3032,7 @@ const RevenueDashboard = () => {
           </div>
 
           {/* Room-level Revenue Breakdown */}
-          {BUILDING_ORDER.filter(bName => roomData[bName] || roomCompareData[bName]).map(bName => {
+          {getActiveBuildingOrder().filter(bName => roomData[bName] || roomCompareData[bName]).map(bName => {
             const currentTotal = buildingCompareData.find(b => b.name === bName)?.current || 0;
             const compareTotal = buildingCompareData.find(b => b.name === bName)?.compare || 0;
             const growthRate = getGrowthRate(currentTotal, compareTotal);

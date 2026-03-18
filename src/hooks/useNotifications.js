@@ -68,7 +68,7 @@ export const useNotifications = () => {
       const reservationsQuery = query(
         collection(db, 'reservations'),
         where('companyId', '==', currentCompanyId),
-        where('status', 'in', ['confirmed', 'canceled'])
+        where('status', 'in', ['confirmed', 'cancelled'])
       );
 
       const snapshot = await getDocs(reservationsQuery);
@@ -208,8 +208,8 @@ export const useNotifications = () => {
     oldData.forEach(oldRes => {
       const newRes = newMap.get(oldRes.id);
 
-      // Cancellation: status changed to canceled
-      if (newRes && oldRes.status === 'confirmed' && newRes.status === 'canceled') {
+      // Cancellation: status changed to cancelled
+      if (newRes && oldRes.status === 'confirmed' && newRes.status === 'cancelled') {
         newNotifications.push({
           id: generateUUID(),
           type: 'CANCEL',
@@ -257,6 +257,7 @@ export const useNotifications = () => {
     return reservations.map(r => ({
       id: r.id,
       status: r.status,
+      bookDate: r.bookDate,
       guestName: r.guestName,
       building: r.building,
       platform: r.platform,

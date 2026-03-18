@@ -8,8 +8,18 @@ const timezone = require("dayjs/plugin/timezone");
 dayjs.extend(utc);
 dayjs.extend(timezone);
 const cors = require("cors")({ origin: true });
+const { createSlackReportModule } = require("./modules/slackReports");
+const { createGoogleSheetReportModule } = require("./modules/googleSheetReports");
+const { createNotionReportModule } = require("./modules/notionReports");
+const { NOTION_PAGES, syncNotionSalesDashboard, syncNotionOccupancyDashboard, syncNotionPaxOccupancy, testNotionConnection } = require("./modules/notionReportSync");
+const { computeRevenueDashboardData } = require("./modules/revenueDashboardData");
+const { getMonthlyRevenueChartUrl, getBuildingRevenueChartUrl } = require("./modules/chartImage");
+const { sendSameDayBookingAlert } = require("./modules/sameDayBookingAlert");
+const { sendCancelAlert } = require("./modules/cancelAlert"); // cancelAlert.js 수정 시 Functions 재배포
 
-admin.initializeApp();
+if (!admin.apps.length) {
+    admin.initializeApp();
+}
 const db = admin.firestore();
 
 // ==========================================
@@ -20,7 +30,12 @@ const db = admin.firestore();
 // ==========================================
 // Beds24 API V2 설정 (Firestore 토큰 캐싱)
 // ==========================================
+// ★ API 크레딧: 예약/캘린더/가격/메시지 등 모든 기능이 공통으로 200 크레딧 한도 사용.
 const BEDS24_REFRESH_TOKEN = "f9dBEWviugAGMcPCPMoRIOG7OpguLo187eDqsuhzaFKNrPdkISHOBZtZaYHGHc2Kc5uEaVljPfPq/xVbzPn0bkXrj2gf6Ly96bpHrsm9X9XwC4U/CAA/QPK9EgbVbQOEAj5iYME1EobhelKpStKYg1OK7zruxGOehEykt7yT5Mw=";
+
+// 기본 Company ID (환경 변수 또는 하드코딩된 기본값)
+// 향후 멀티 테넌트 확장 시 각 회사별 Beds24 토큰 관리 필요
+const DEFAULT_COMPANY_ID = process.env.DEFAULT_COMPANY_ID || 'dGxlQyu47LbplLVCVXiV';
 
 // 메모리 캐시 (같은 인스턴스 내에서 Firestore 읽기 최소화)
 let beds24AccessToken = null;
@@ -92,17 +107,615 @@ async function getBeds24Token() {
         throw new Error("Beds24 인증 실패: " + err.message);
     }
 }
+
+
 const PROPERTIES = [
-    { name: "아라키초A", id: "NSoH37aJMipHA4K4MPVyp2pnq", v2Id: 176430 },
-    { name: "아라키초B", id: "AV3yKzD2gFz4OmNdlv4qANoQc", v2Id: 280663 },
-    { name: "다이쿄초", id: "CXNtlpJnRuKJDPrTpqOaa3yws", v2Id: 206509, disabled: true }, // ★ 매각 완료 (2026-01-25) - API 동기화 중단, 과거 데이터 보존
-    { name: "가부키초", id: "3ldwEucRNOIyhAdAhFWbBhw3e", v2Id: 176431 },
-    { name: "다카다노바바", id: "8Nx8VcOYwSYVAwG01xkokmsX7", v2Id: 243936 },
-    { name: "오쿠보A동", id: "dJQloWov7XuXMUmSXyVsLP8LR", v2Id: 205165 },
-    { name: "오쿠보B동", id: "WbtREQENBg6aIR0pgEIympSAv", v2Id: 294552 },
-    { name: "오쿠보C동", id: "MXP5jJXp2mPxVhjdTAF0KnHTP", v2Id: 211056 },
-    { name: "사노시", id: "gDzuVIkyvm5fqtuifdveeIKZO", v2Id: 226546 }
+    { name: "아라키초A", id: "NSoH37aJMipHA4K4MPVyp2pnq", v2Id: 176430, companyId: DEFAULT_COMPANY_ID },
+    { name: "아라키초B", id: "AV3yKzD2gFz4OmNdlv4qANoQc", v2Id: 280663, companyId: DEFAULT_COMPANY_ID },
+    { name: "다이쿄초", id: "CXNtlpJnRuKJDPrTpqOaa3yws", v2Id: 206509, disabled: true, companyId: DEFAULT_COMPANY_ID }, // ★ 매각 완료 (2026-01-25) - API 동기화 중단, 과거 데이터 보존
+    { name: "가부키초", id: "3ldwEucRNOIyhAdAhFWbBhw3e", v2Id: 176431, companyId: DEFAULT_COMPANY_ID },
+    { name: "다카다노바바", id: "8Nx8VcOYwSYVAwG01xkokmsX7", v2Id: 243936, companyId: DEFAULT_COMPANY_ID },
+    { name: "오쿠보A동", id: "dJQloWov7XuXMUmSXyVsLP8LR", v2Id: 205165, companyId: DEFAULT_COMPANY_ID },
+    { name: "오쿠보B동", id: "WbtREQENBg6aIR0pgEIympSAv", v2Id: 294552, companyId: DEFAULT_COMPANY_ID },
+    { name: "오쿠보C동", id: "MXP5jJXp2mPxVhjdTAF0KnHTP", v2Id: 211056, companyId: DEFAULT_COMPANY_ID },
+    { name: "사노시", id: "gDzuVIkyvm5fqtuifdveeIKZO", v2Id: 226546, companyId: DEFAULT_COMPANY_ID }
 ];
+
+const RESERVATION_SYNC_SCHEMA_VERSION = "reservation_sync_v20260310";
+const RESERVATION_REQUIRED_FIELDS = ["bookId", "status", "building", "room", "arrival", "departure", "companyId"];
+const REPORT_SYNC_MAX_AGE_MINUTES = 90;
+const REPORT_INVALID_THRESHOLD = 0;
+const RESERVATION_SYNC_STATUS_DOC_ID = "reservations";
+const PRICE_SYNC_STATUS_DOC_ID = "prices";
+const RESERVATION_FULL_RECONCILE_INTERVAL_MINUTES = 60;  // 삭제 감지 지연 최소화 (이전 1시간 주기 유지)
+const PRICE_FULL_RECONCILE_INTERVAL_MINUTES = 360;       // 가격은 웹훅+증분이 있어 full은 6시간 간격으로 완충
+
+const SYNC_STATUS_DOC_IDS = {
+    reservations: RESERVATION_SYNC_STATUS_DOC_ID,
+    prices: PRICE_SYNC_STATUS_DOC_ID
+};
+
+function getEffectiveCompanyId(data) {
+    return data?.companyId || DEFAULT_COMPANY_ID;
+}
+
+function firstNonEmptyValue(...values) {
+    for (const value of values) {
+        if (typeof value === "string" && value.trim()) return value.trim();
+        if (value !== undefined && value !== null && value !== "") return String(value);
+    }
+    return "";
+}
+
+function normalizePossibleActorId(value) {
+    if (typeof value !== "string") return "";
+    const trimmed = value.trim();
+    if (!trimmed) return "";
+    const blocked = new Set(["direct", "manual", "phone", "walk", "airbnb", "booking", "booking.com", "expedia", "agoda", "unknown"]);
+    return blocked.has(trimmed.toLowerCase()) ? "" : trimmed;
+}
+
+function extractReservationActorInfo(data = {}) {
+    const referer = firstNonEmptyValue(data.referer, data.referrer);
+    const referrer = firstNonEmptyValue(data.referrer);
+    const subSource = firstNonEmptyValue(data.subSource, data.subsource);
+    const apiSource = firstNonEmptyValue(data.apiSource);
+    const source = firstNonEmptyValue(data.source);
+    const channel = firstNonEmptyValue(data.channel);
+
+    const actorCandidates = [
+        ["subSource", normalizePossibleActorId(subSource)],
+        ["referer", normalizePossibleActorId(referer)],
+        ["referrer", normalizePossibleActorId(referrer)],
+        ["apiSource", normalizePossibleActorId(apiSource)],
+        ["source", normalizePossibleActorId(source)],
+        ["channel", normalizePossibleActorId(channel)]
+    ];
+    const actorEntry = actorCandidates.find(([, value]) => value);
+
+    return {
+        referer,
+        referrer,
+        subSource,
+        apiSource,
+        source,
+        channel,
+        actorId: actorEntry ? actorEntry[1] : "",
+        actorSource: actorEntry ? actorEntry[0] : ""
+    };
+}
+
+const RESERVATION_MUTATION_FIELDS = [
+    "guestName",
+    "arrival",
+    "departure",
+    "status",
+    "price",
+    "totalPrice",
+    "numAdult",
+    "numChild",
+    "guestPhone",
+    "guestEmail",
+    "room",
+    "referer",
+    "referrer",
+    "subSource",
+    "apiSource",
+    "source",
+    "channel",
+    "cancelTime",
+    "cancelReason"
+];
+
+function toComparableReservationValue(value) {
+    if (value === undefined || value === null) return "";
+    if (typeof value?.toDate === "function") return value.toDate().toISOString();
+    if (value instanceof Date) return value.toISOString();
+    return value;
+}
+
+function buildReservationMutationSummary(beforeData, afterData) {
+    const eventType = !beforeData
+        ? (afterData?.status === "cancelled" ? "cancelled" : "created")
+        : (beforeData.status !== "cancelled" && afterData?.status === "cancelled" ? "cancelled" : "updated");
+
+    const changes = [];
+    for (const field of RESERVATION_MUTATION_FIELDS) {
+        const beforeValue = toComparableReservationValue(beforeData?.[field]);
+        const afterValue = toComparableReservationValue(afterData?.[field]);
+        if (beforeValue !== afterValue) {
+            changes.push({ field, before: beforeValue, after: afterValue });
+        }
+    }
+
+    return {
+        eventType,
+        changedFields: changes.map((change) => change.field),
+        changes
+    };
+}
+
+function applyReservationActorMetadata(data, beforeData = null, eventType = "updated") {
+    const actorInfo = extractReservationActorInfo(data);
+    const enriched = { ...data, ...actorInfo };
+    const actorId = actorInfo.actorId || beforeData?.lastActorId || "";
+    const actorSource = actorInfo.actorSource || beforeData?.lastActorSource || "";
+
+    if (beforeData?.createdByStaffId && !enriched.createdByStaffId) enriched.createdByStaffId = beforeData.createdByStaffId;
+    if (beforeData?.createdBySource && !enriched.createdBySource) enriched.createdBySource = beforeData.createdBySource;
+    if (beforeData?.cancelledByStaffId && !enriched.cancelledByStaffId) enriched.cancelledByStaffId = beforeData.cancelledByStaffId;
+    if (beforeData?.cancelledBySource && !enriched.cancelledBySource) enriched.cancelledBySource = beforeData.cancelledBySource;
+
+    if (!beforeData && actorId) {
+        enriched.createdByStaffId = actorId;
+        enriched.createdBySource = actorSource;
+    }
+    if (actorId) {
+        enriched.lastActorId = actorId;
+        enriched.lastActorSource = actorSource;
+        enriched.lastModifiedByStaffId = actorId;
+        enriched.lastModifiedBySource = actorSource;
+    }
+    if (eventType === "cancelled" && actorId) {
+        enriched.cancelledByStaffId = actorId;
+        enriched.cancelledBySource = actorSource;
+    }
+
+    return enriched;
+}
+
+function buildReservationIntegrityInfo(data) {
+    const enriched = { ...data, companyId: getEffectiveCompanyId(data) };
+    const missingCriticalFields = RESERVATION_REQUIRED_FIELDS.filter((field) => !enriched[field]);
+    const missingReportFields = [];
+
+    if (enriched.status === "confirmed" && !enriched.bookDate) {
+        missingReportFields.push("bookDate");
+    }
+    if (enriched.status === "cancelled" && !enriched.cancelTime && !enriched.modified) {
+        missingReportFields.push("cancelTime");
+    }
+
+    return {
+        missingCriticalFields,
+        missingReportFields,
+        hasCriticalGap: missingCriticalFields.length > 0,
+        hasReportGap: missingReportFields.length > 0,
+        schemaVersion: RESERVATION_SYNC_SCHEMA_VERSION,
+        checkedAt: new Date().toISOString()
+    };
+}
+
+function buildReservationOutputImpact(data) {
+    const stayDates = [];
+    if (data.arrival && data.departure) {
+        let cursor = dayjs(data.arrival);
+        const checkout = dayjs(data.departure);
+        while (cursor.isBefore(checkout)) {
+            stayDates.push(cursor.format("YYYY-MM-DD"));
+            if (stayDates.length >= 32) break;
+            cursor = cursor.add(1, "day");
+        }
+    }
+
+    return {
+        domain: "reservations",
+        building: data.building || "",
+        room: data.room || "",
+        bookingId: String(data.bookId || data.id || ""),
+        dateKeys: Array.from(new Set([data.bookDate, data.arrival, data.departure, data.cancelTime ? String(data.cancelTime).slice(0, 10) : ""].filter(Boolean))),
+        stayDates,
+        monthKeys: Array.from(new Set([data.stayMonth, data.arrival ? String(data.arrival).slice(0, 7) : "", data.bookDate ? String(data.bookDate).slice(0, 7) : ""].filter(Boolean))),
+        reportKeys: Array.from(new Set([
+            data.building && data.arrival ? `cleaning:${data.building}:${data.arrival}` : "",
+            data.building && data.departure ? `cleaning:${data.building}:${data.departure}` : "",
+            data.stayMonth ? `occupancy:${data.stayMonth}` : "",
+            data.bookDate ? `daily_report:${String(data.bookDate).slice(0, 10)}` : "",
+            data.cancelTime ? `cancel_report:${String(data.cancelTime).slice(0, 10)}` : ""
+        ].filter(Boolean)))
+    };
+}
+
+function buildPriceOutputImpact({ building = "", roomName = "", roomId = "", fromDate = "", toDate = "" } = {}) {
+    return {
+        domain: "prices",
+        building,
+        room: roomName,
+        roomId: String(roomId || ""),
+        dateRange: [fromDate, toDate].filter(Boolean),
+        reportKeys: Array.from(new Set([
+            building ? `calendar:${building}` : "",
+            building && roomName ? `calendar:${building}:${roomName}` : ""
+        ].filter(Boolean)))
+    };
+}
+
+/**
+ * 여러 outputImpact에서 reportKeys를 수집해 청소/일일 리포트/매출일지 갱신 대상 날짜 추출
+ * @param {Array<{ reportKeys?: string[], dateKeys?: string[], monthKeys?: string[] }>} impacts
+ * @returns {{ cleaningDates: string[], dailyReportDates: string[], hasReservationImpact: boolean }}
+ */
+function collectOutputImpactDates(impacts) {
+    const cleaningDates = new Set();
+    const dailyReportDates = new Set();
+    let hasReservationImpact = false;
+    const dateLike = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s));
+
+    for (const impact of impacts || []) {
+        if (!impact) continue;
+        const keys = impact.reportKeys || [];
+        for (const key of keys) {
+            if (key.startsWith("cleaning:")) {
+                const parts = key.split(":");
+                if (parts.length >= 3 && dateLike(parts[2])) cleaningDates.add(parts[2]);
+            } else if (key.startsWith("daily_report:") && dateLike(key.slice("daily_report:".length))) {
+                dailyReportDates.add(key.slice("daily_report:".length));
+            } else if (key.startsWith("cancel_report:") && dateLike(key.slice("cancel_report:".length))) {
+                dailyReportDates.add(key.slice("cancel_report:".length));
+            }
+        }
+        for (const d of impact.dateKeys || []) {
+            if (dateLike(d)) dailyReportDates.add(d);
+        }
+        if ((impact.reportKeys || []).length > 0 || (impact.domain === "reservations")) hasReservationImpact = true;
+    }
+    return {
+        cleaningDates: Array.from(cleaningDates),
+        dailyReportDates: Array.from(dailyReportDates),
+        hasReservationImpact
+    };
+}
+
+/**
+ * 수집된 outputImpact에 따라 청소/일일 리포트/매출일지를 영향 날짜만 재계산·발송
+ * 동기화·웹훅 후 호출해 데이터 일치 유지
+ * @param {Array<{ reportKeys?: string[], dateKeys?: string[], domain?: string }>} impacts
+ * @param {{ skipSalesLog?: boolean, skipSlack?: boolean }} options
+ */
+async function scheduleOutputUpdates(impacts, options = {}) {
+    if (!impacts || impacts.length === 0) return;
+    const { skipSalesLog = false, skipSlack = false } = options;
+    const { dailyReportDates, hasReservationImpact } = collectOutputImpactDates(impacts);
+    const tokyoToday = dayjs().tz("Asia/Tokyo").format("YYYY-MM-DD");
+    const tokyoYesterday = dayjs().tz("Asia/Tokyo").subtract(1, "day").format("YYYY-MM-DD");
+
+    if (!skipSlack) {
+        // ★ 슬랙 청소 리포트는 아침 스케줄 1회만 발송. 웹훅/동기화 기반 재전송은 하지 않음.
+        // ★ 슬랙 일일 리포트는 전날(어제) 데이터가 변경되었을 때만 발송 (어제 최종 → 다음날 아침 보고서 개념)
+        const yesterdayOnlyDates = dailyReportDates.filter(d => d === tokyoYesterday);
+        for (const dateStr of yesterdayOnlyDates) {
+            try {
+                await buildAndSendSlackDailyReport(false, dateStr, true);
+            } catch (e) {
+                console.warn("[OutputUpdate] Daily report failed for", dateStr, e.message);
+            }
+        }
+    }
+
+    if (!skipSalesLog && hasReservationImpact) {
+        for (const dateStr of [tokyoToday, tokyoYesterday]) {
+            try {
+                await createDailySalesLog(dateStr, { overwrite: true });
+            } catch (e) {
+                console.warn("[OutputUpdate] Sales log failed for", dateStr, e.message);
+            }
+        }
+    }
+}
+
+function enrichReservationDocument(data, {
+    companyId = DEFAULT_COMPANY_ID,
+    syncSource = "unknown",
+    syncMode = "sync",
+    sourceEventTime = null,
+    lastSeenAt = new Date()
+} = {}) {
+    const effectiveCompanyId = companyId || getEffectiveCompanyId(data);
+    const sourceLastModified = data.sourceLastModified || data.modified || data.cancelTime || data.bookDate || "";
+    const enriched = {
+        ...data,
+        companyId: effectiveCompanyId,
+        sourceLastModified,
+        lastSeenInBeds24At: lastSeenAt,
+        syncSource,
+        syncVersion: RESERVATION_SYNC_SCHEMA_VERSION,
+        updatedAt: lastSeenAt
+    };
+
+    if (syncMode === "webhook") {
+        enriched.lastWebhookAt = lastSeenAt;
+    }
+    if (syncMode === "reconcile" || syncMode === "manual") {
+        enriched.lastReconciledAt = lastSeenAt;
+    }
+    if (sourceEventTime) {
+        enriched.sourceEventTime = sourceEventTime;
+    }
+    if (enriched.status === "cancelled" && !enriched.cancelTime && sourceLastModified) {
+        enriched.cancelTime = sourceLastModified;
+    }
+
+    enriched.outputImpact = buildReservationOutputImpact(enriched);
+    enriched.integrity = buildReservationIntegrityInfo(enriched);
+    return enriched;
+}
+
+function summarizeReservationIntegrity(list) {
+    let invalidCriticalCount = 0;
+    let invalidReportCount = 0;
+    const sampleIds = [];
+
+    list.forEach((item) => {
+        const integrity = item.integrity || buildReservationIntegrityInfo(item);
+        if (integrity.hasCriticalGap) invalidCriticalCount++;
+        if (integrity.hasReportGap) invalidReportCount++;
+        if ((integrity.hasCriticalGap || integrity.hasReportGap) && sampleIds.length < 10) {
+            sampleIds.push(String(item.bookId || item.id || "unknown"));
+        }
+    });
+
+    return { invalidCriticalCount, invalidReportCount, sampleIds };
+}
+
+async function recordSyncAudit({
+    domain = "reservations",
+    statusDocId = SYNC_STATUS_DOC_IDS.reservations,
+    syncType,
+    status = "success",
+    syncSource = "",
+    companyId = DEFAULT_COMPANY_ID,
+    rangeStart = null,
+    rangeEnd = null,
+    fetchedCount = 0,
+    upsertedCount = 0,
+    cancelledCount = 0,
+    invalidCriticalCount = 0,
+    invalidReportCount = 0,
+    sampleIds = [],
+    note = "",
+    errorMessage = "",
+    metadata = {},
+    updateStatusDoc = true,
+    statusMarkers = {}
+}) {
+    const now = new Date();
+    const payload = {
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAtIso: now.toISOString(),
+        domain,
+        syncType,
+        status,
+        syncSource: syncSource || syncType,
+        companyId,
+        rangeStart,
+        rangeEnd,
+        fetchedCount,
+        upsertedCount,
+        cancelledCount,
+        invalidCriticalCount,
+        invalidReportCount,
+        sampleIds: sampleIds.slice(0, 10),
+        note,
+        errorMessage,
+        metadata,
+        syncVersion: RESERVATION_SYNC_SCHEMA_VERSION
+    };
+
+    const auditRef = await db.collection("sync_audit").add(payload);
+    const statusPayload = {
+        lastAuditId: auditRef.id,
+        lastAuditAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastAuditStatus: status,
+        lastSyncType: syncType,
+        lastSyncSource: syncSource || syncType,
+        lastCompanyId: companyId,
+        lastRangeStart: rangeStart,
+        lastRangeEnd: rangeEnd,
+        lastFetchedCount: fetchedCount,
+        lastUpsertedCount: upsertedCount,
+        lastCancelledCount: cancelledCount,
+        lastInvalidCriticalCount: invalidCriticalCount,
+        lastInvalidReportCount: invalidReportCount,
+        lastSampleIds: sampleIds.slice(0, 10),
+        lastErrorMessage: errorMessage || "",
+        lastNote: note || "",
+        lastSyncSchemaVersion: RESERVATION_SYNC_SCHEMA_VERSION,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    if (updateStatusDoc) {
+        if (status !== "error" && status !== "skipped") {
+            statusPayload.lastSuccessAt = admin.firestore.FieldValue.serverTimestamp();
+        }
+        for (const [key, value] of Object.entries(statusMarkers || {})) {
+            statusPayload[key] = value === true
+                ? admin.firestore.FieldValue.serverTimestamp()
+                : value;
+        }
+
+        await db.collection("sync_status").doc(statusDocId).set(statusPayload, { merge: true });
+    }
+    return auditRef.id;
+}
+
+async function recordReservationSyncAudit({
+    syncVariant = null,
+    ...rest
+}) {
+    const statusMarkers = {};
+    if (syncVariant === "webhook" || rest.syncType === "webhook") {
+        statusMarkers.lastWebhookAt = true;
+    }
+    if (syncVariant === "incremental") {
+        statusMarkers.lastIncrementalAt = true;
+        statusMarkers.lastReconciledAt = true;
+    }
+    if (syncVariant === "full_reconcile" || syncVariant === "manual_quick" || syncVariant === "manual_full") {
+        statusMarkers.lastFullReconcileAt = true;
+        statusMarkers.lastReconciledAt = true;
+    }
+    if (!syncVariant && rest.syncType !== "webhook") {
+        statusMarkers.lastReconciledAt = true;
+    }
+
+    return recordSyncAudit({
+        domain: "reservations",
+        statusDocId: RESERVATION_SYNC_STATUS_DOC_ID,
+        statusMarkers,
+        ...rest
+    });
+}
+
+async function recordPriceSyncAudit({
+    syncVariant = null,
+    ...rest
+}) {
+    const statusMarkers = {};
+    if (syncVariant === "webhook") statusMarkers.lastWebhookAt = true;
+    if (syncVariant === "incremental") {
+        statusMarkers.lastIncrementalAt = true;
+        statusMarkers.lastReconciledAt = true;
+    }
+    if (syncVariant === "full_reconcile" || syncVariant === "manual_full") {
+        statusMarkers.lastFullReconcileAt = true;
+        statusMarkers.lastReconciledAt = true;
+    }
+
+    return recordSyncAudit({
+        domain: "prices",
+        statusDocId: PRICE_SYNC_STATUS_DOC_ID,
+        statusMarkers,
+        ...rest
+    });
+}
+
+function toDateOrNull(value) {
+    if (!value) return null;
+    if (typeof value?.toDate === "function") return value.toDate();
+    if (value instanceof Date) return value;
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+async function getDomainStatus(docId) {
+    const snap = await db.collection("sync_status").doc(docId).get();
+    return snap.exists ? (snap.data() || {}) : null;
+}
+
+function getMinutesSince(dateValue, now = new Date()) {
+    const date = toDateOrNull(dateValue);
+    if (!date) return Infinity;
+    return (now.getTime() - date.getTime()) / 60000;
+}
+
+function shouldRunFullAudit(statusData, {
+    intervalMinutes = 360,
+    now = new Date()
+} = {}) {
+    if (!statusData) return true;
+    if (String(statusData.lastAuditStatus || "") === "error") return true;
+    if (Number(statusData.lastInvalidCriticalCount || 0) > 0) return true;
+    if (Number(statusData.lastInvalidReportCount || 0) > 0) return true;
+    return getMinutesSince(statusData.lastFullReconcileAt, now) >= intervalMinutes;
+}
+
+async function getScheduledReservationReconcileDecision({
+    now = new Date(),
+    minIntervalMinutes = 60,
+    webhookStaleMinutes = REPORT_SYNC_MAX_AGE_MINUTES
+} = {}) {
+    const statusSnap = await db.collection("sync_status").doc(RESERVATION_SYNC_STATUS_DOC_ID).get();
+    if (!statusSnap.exists) {
+        return { shouldRun: true, reason: "missing_sync_status" };
+    }
+
+    const data = statusSnap.data() || {};
+    const lastWebhookAt = toDateOrNull(data.lastWebhookAt);
+    const lastReconciledAt = toDateOrNull(data.lastReconciledAt);
+    const lastAuditStatus = String(data.lastAuditStatus || "");
+    const invalidCriticalCount = Number(data.lastInvalidCriticalCount || 0);
+    const invalidReportCount = Number(data.lastInvalidReportCount || 0);
+
+    if (lastAuditStatus === "error") {
+        return { shouldRun: true, reason: "last_audit_error", data };
+    }
+    if (invalidCriticalCount > 0 || invalidReportCount > 0) {
+        return { shouldRun: true, reason: "integrity_gap_detected", data };
+    }
+    if (!lastReconciledAt) {
+        return { shouldRun: true, reason: "missing_last_reconciled_at", data };
+    }
+
+    const reconcileAgeMinutes = (now.getTime() - lastReconciledAt.getTime()) / 60000;
+    if (reconcileAgeMinutes >= minIntervalMinutes) {
+        return { shouldRun: true, reason: "reconcile_interval_elapsed", data, reconcileAgeMinutes };
+    }
+
+    if (!lastWebhookAt) {
+        return { shouldRun: true, reason: "missing_last_webhook_at", data, reconcileAgeMinutes };
+    }
+
+    const webhookAgeMinutes = (now.getTime() - lastWebhookAt.getTime()) / 60000;
+    if (webhookAgeMinutes >= webhookStaleMinutes) {
+        return { shouldRun: true, reason: "webhook_stale", data, reconcileAgeMinutes, webhookAgeMinutes };
+    }
+
+    return {
+        shouldRun: false,
+        reason: "recent_webhook_and_reconcile",
+        data,
+        reconcileAgeMinutes,
+        webhookAgeMinutes
+    };
+}
+
+async function assertReservationDataReady(context, {
+    companyId = DEFAULT_COMPANY_ID,
+    maxAgeMinutes = REPORT_SYNC_MAX_AGE_MINUTES,
+    invalidThreshold = REPORT_INVALID_THRESHOLD
+} = {}) {
+    const statusSnap = await db.collection("sync_status").doc(RESERVATION_SYNC_STATUS_DOC_ID).get();
+    if (!statusSnap.exists) {
+        await sendSyncAlert(`${context}: sync status missing`, [
+            `companyId=${companyId}`,
+            "sync_status/reservations 문서가 없어 리포트를 중단했습니다."
+        ]);
+        throw new Error(`[${context}] sync_status/reservations 문서가 없습니다.`);
+    }
+
+    const data = statusSnap.data();
+    const lastSuccessAt = data.lastSuccessAt?.toDate ? data.lastSuccessAt.toDate() : null;
+    const invalidCriticalCount = Number(data.lastInvalidCriticalCount || 0);
+    const errors = [];
+
+    if (!lastSuccessAt) {
+        errors.push("lastSuccessAt 없음");
+    } else {
+        const ageMinutes = (Date.now() - lastSuccessAt.getTime()) / 60000;
+        if (ageMinutes > maxAgeMinutes) {
+            errors.push(`최근 성공 동기화가 ${Math.round(ageMinutes)}분 전입니다`);
+        }
+    }
+
+    if (data.lastAuditStatus === "error") {
+        errors.push(`마지막 sync audit 상태가 error 입니다 (${data.lastErrorMessage || "원인 미상"})`);
+    }
+    if (invalidCriticalCount > invalidThreshold) {
+        errors.push(`필수 필드 누락 예약이 ${invalidCriticalCount}건 감지되었습니다`);
+    }
+
+    if (errors.length > 0) {
+        await sendSyncAlert(`${context}: reservation integrity gate blocked`, [
+            `companyId=${companyId}`,
+            ...errors
+        ]);
+        throw new Error(`[${context}] ${errors.join(" | ")}`);
+    }
+}
+
+function filterDocsToCompany(docs, companyId = DEFAULT_COMPANY_ID) {
+    return docs.filter((doc) => getEffectiveCompanyId(doc) === companyId);
+}
 
 function getStandardRoomName(roomId, rawName) {
     const ROOM_MAPPING = {
@@ -120,8 +733,8 @@ function getStandardRoomName(roomId, rawName) {
         "383981": "302호", "452062": "302호", "383982": "303호", "451223": "303호",
         "383983": "402호", "451224": "402호", "383984": "403호", "452063": "403호",
         "543189": "502호", "601560": "502호", "383985": "603호", "452064": "603호",
-        "441885": "802호", "452065": "802호", "624198": "803호",
-        "437952": "오쿠보A", "615969": "오쿠보B", "450096": "오쿠보C", "496532": "오쿠보C",
+        "441885": "802호", "452065": "802호", "624198": "803호", "648398": "803호",
+        "437952": "오쿠보A", "615969": "오쿠보B", "450096": "오쿠보C", "496532": "오쿠보C", "648399": "오쿠보C",
         "481152": "사노",
         "513698": "201호", "513699": "301호", "513700": "401호", "556719": "401호",
         "513701": "501호", "513702": "601호", "513703": "701호", "513704": "801호", "513705": "901호"
@@ -135,17 +748,20 @@ const cleanPrice = (val) => {
 };
 const determineStatus = (b) => {
     const s = String(b.status).toLowerCase();
-    const guestName = `${b.firstName || b.guestFirstName || ""} ${b.lastName || b.guestName || ""}`.toLowerCase();
 
-    // 블락/점검 키워드 체크
-    if (guestName.includes("블락") || guestName.includes("점검") || guestName.includes("blackout") || guestName.includes("block")) {
+    // ★ Beds24 네이티브 블락(status=black) → blackout
+    if (s === "black") {
         return "blackout";
     }
 
     // V1: 0 = Cancelled, 1/2 = Confirmed
     // V2: "cancelled"/"canceled" = Cancelled, "new"/"confirmed" = Confirmed
+    // Inquiry/Request: "enquiry"/"request"
     if (s === "0" || s === "cancelled" || s === "canceled") {
         return "cancelled";
+    }
+    if (s === "enquiry" || s === "request") {
+        return "inquiry";
     }
     if (s === "1" || s === "2" || s === "new" || s === "confirmed") {
         return "confirmed";
@@ -198,7 +814,7 @@ const determineDate = (b) => {
 // ==========================================
 // 3) NORMALIZE & FETCH (Normal Sync)
 // ==========================================
-function normalize(b, propKey, building) {
+function normalize(b, propKey, building, companyId) {
     const status = determineStatus(b);
     const bookDateStr = determineDate(b);
 
@@ -286,6 +902,11 @@ function normalize(b, propKey, building) {
         // ★ 채널/예약 관련
         apiReference: b.apiReference || "",
         referer: b.referer || "",
+        referrer: b.referrer || "",
+        subSource: b.subSource || b.subsource || "",
+        apiSource: b.apiSource || "",
+        source: b.source || "",
+        channel: b.channel || "",
         // ★ 시간/이력 관련 (V2 modifiedTime)
         // ★ 취소된 예약인데 cancelTime이 없으면 modifiedTime을 cancelTime으로 사용
         cancelTime: b.cancelTime || (status === "cancelled" ? (b.modifiedTime || b.modified || "") : ""),
@@ -305,13 +926,14 @@ function normalize(b, propKey, building) {
         })) : [],
 
         updatedAt: new Date(),
+        companyId: companyId,
     };
 }
 
 // ★ Beds24 API V2 호출 (페이지네이션 + 순차 호출)
 // Beds24 제한: 1회 최대 100건, 동시 1개 호출만 허용
 // V2 Endpoint: GET /bookings
-async function fetchAllBookingsFromProperty(prop, dateParams) {
+async function fetchAllBookingsFromProperty(prop, dateParams, options = {}) {
     const allBookings = [];
 
     // V1 날짜 포맷(YYYYMMDD)이 들어오면 V2 포맷(YYYY-MM-DD)으로 변환
@@ -325,11 +947,16 @@ async function fetchAllBookingsFromProperty(prop, dateParams) {
     if (finalParams.arrivalFrom) finalParams.arrivalFrom = toV2Date(finalParams.arrivalFrom);
     if (finalParams.arrivalTo) finalParams.arrivalTo = toV2Date(finalParams.arrivalTo);
 
-    // ★ 두 번 조회: 1) 일반 예약, 2) 취소된 예약
-    const statusesToFetch = [null, "cancelled"];  // null = 기본(new/confirmed), "cancelled" = 취소
+    // ★ 네 번 조회: 1) 일반 예약, 2) 취소된 예약, 3) 문의/요청, 4) 블락(black)
+    // Beds24 V2 API 지원 status: confirmed, request, new, cancelled, black, inquiry
+    // legacyMode: 6개월 이상 과거 데이터는 confirmed/cancelled만 조회 (inquiry/request/black 스킵)
+    const statusesToFetch = options.legacyMode
+        ? [null, "cancelled"]
+        : [null, "cancelled", "inquiry", "request", "black"];
 
     for (const statusFilter of statusesToFetch) {
         let page = 1;
+        let rateLimitRetry = 0;
         const statusLabel = statusFilter || "active";
 
         while (true) {
@@ -346,9 +973,13 @@ async function fetchAllBookingsFromProperty(prop, dateParams) {
                     params.status = statusFilter;
                 }
 
-                // 날짜 파라미터 추가
-                if (finalParams.arrivalFrom) params.arrivalFrom = finalParams.arrivalFrom;
-                if (finalParams.arrivalTo) params.arrivalTo = finalParams.arrivalTo;
+                // 날짜 파라미터 추가 (증분: modifiedFrom만 사용 시 arrival 생략)
+                if (finalParams.modifiedFrom) {
+                    params.modifiedFrom = finalParams.modifiedFrom; // UTC ISO: YYYY-MM-DDTHH:MM:SS
+                } else {
+                    if (finalParams.arrivalFrom) params.arrivalFrom = finalParams.arrivalFrom;
+                    if (finalParams.arrivalTo) params.arrivalTo = finalParams.arrivalTo;
+                }
 
                 // ★ V2 API 호출
                 const token = await getBeds24Token();
@@ -368,7 +999,7 @@ async function fetchAllBookingsFromProperty(prop, dateParams) {
 
                 if (arr.length === 0) break;
 
-                allBookings.push(...arr.map((b) => normalize(b, prop.id, prop.name)));
+                allBookings.push(...arr.map((b) => normalize(b, prop.id, prop.name, prop.companyId)));
 
                 // 다음 페이지 존재 여부 확인
                 const pagesInfo = res.data.pages;
@@ -382,8 +1013,22 @@ async function fetchAllBookingsFromProperty(prop, dateParams) {
 
             } catch (err) {
                 console.error(`❌ Fetch Error (${prop.name} [${statusLabel}], page=${page}):`, err.message);
+                // 400 Bad Request: 해당 status를 API가 지원 안 함 → 스킵하고 다음 status로 진행
+                if (err.response && err.response.status === 400) {
+                    console.warn(`  ⚠️ status="${statusFilter}" 400 오류 → 스킵`);
+                    break;
+                }
+                // 429 Rate Limit: beds24GetV2WithRetry와 동일한 백오프 전략 적용
+                if (err.response && err.response.status === 429 && rateLimitRetry < 5) {
+                    rateLimitRetry++;
+                    const waitSec = rateLimitRetry * 10; // 10s, 20s, 30s, 40s, 50s
+                    console.warn(`  ⚠️ Rate Limit(429). ${waitSec}초 대기 후 재시도 (${rateLimitRetry}/5)`);
+                    await new Promise(r => setTimeout(r, waitSec * 1000));
+                    continue;
+                }
                 throw err;
             }
+            rateLimitRetry = 0; // 성공 시 재시도 카운터 리셋
         }
 
         // 상태 변경 사이 딜레이
@@ -462,73 +1107,54 @@ async function fetchFromBeds24Full() {
     return allBookings;
 }
 
-// saveBookings: syncRangeStart를 전달받아 해당 범위 내의 예약만 취소 처리
-async function saveBookings(list, syncRangeStart = null) {
+// 증분 동기화: 해당 시각 이후로 수정된 예약만 조회 (Beds24 modifiedFrom 사용)
+// modifiedSince: Date 또는 ISO 문자열 (UTC). 이 시각 이후 수정된 예약만 가져옴.
+async function fetchFromBeds24Incremental(modifiedSince) {
+    const sinceDate = modifiedSince instanceof Date ? modifiedSince : new Date(modifiedSince);
+    if (Number.isNaN(sinceDate.getTime())) {
+        console.warn("[Incremental Sync] invalid modifiedSince, falling back to full range");
+        return fetchFromBeds24Quick();
+    }
+    const modifiedFrom = sinceDate.toISOString().slice(0, 19) + "Z";
+    console.log(`[Incremental Sync] modifiedFrom=${modifiedFrom} (변경분만 조회)`);
+
+    const allBookings = [];
+    for (const prop of PROPERTIES) {
+        if (prop.disabled) continue;
+        const bookings = await fetchAllBookingsFromProperty(prop, { modifiedFrom });
+        allBookings.push(...bookings);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+    }
+    console.log(`✅ Incremental Sync 완료: ${allBookings.length}건 (변경분만)`);
+    return allBookings;
+}
+
+function getBookingAmount(doc) {
+    return Number(doc.totalPrice ?? doc.price) || 0;
+}
+
+async function upsertReservations(list, {
+    companyId = DEFAULT_COMPANY_ID,
+    syncSource = "beds24_sync",
+    syncMode = "reconcile",
+    sourceEventTime = null
+} = {}) {
     const batchLimit = 400;
     let batch = db.batch();
     let count = 0;
+    const observedAt = new Date();
+    const enrichedList = list.map((item) => enrichReservationDocument(item, {
+        companyId,
+        syncSource,
+        syncMode,
+        sourceEventTime,
+        lastSeenAt: observedAt
+    }));
 
-    // Beds24에서 가져온 예약 ID 목록
-    const beds24BookIds = new Set(list.map(item => item.id));
-
-    // 건물별로 기존 예약 확인 및 삭제/취소 처리
-    const buildingsInList = [...new Set(list.map(item => item.building))];
-
-    // ★ 동기화 범위 시작일 (Quick Sync: 오늘, Full Sync: 2023-01-01)
-    const rangeStartDate = syncRangeStart ? new Date(syncRangeStart) : null;
-
-    for (const building of buildingsInList) {
-        const existingSnap = await db.collection("reservations")
-            .where("building", "==", building)
-            .get();
-
-        for (const doc of existingSnap.docs) {
-            const docId = doc.id;
-            // Beds24에 없는 예약은 cancelled로 표시
-            if (!beds24BookIds.has(docId)) {
-                const existingData = doc.data();
-                // 이미 cancelled가 아니고, 활성 상태인 경우 (confirmed, blackout, maintenance 포함)
-                const activeStatuses = ["confirmed", "blackout", "maintenance"];
-                if (activeStatuses.includes(existingData.status) && existingData.arrival) {
-                    const arrivalDate = new Date(existingData.arrival);
-
-                    // ★ 핵심 수정: 동기화 범위 내의 예약만 취소 처리
-                    // Quick Sync는 오늘 이후 예약만 가져오므로, 과거 예약은 건드리지 않음
-                    if (rangeStartDate && arrivalDate < rangeStartDate) {
-                        // 동기화 범위 이전의 예약은 건드리지 않음 (과거 예약 보존)
-                        continue; // for...of 에서는 continue 사용
-                    }
-
-                    const sixMonthsAgo = new Date();
-                    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-
-                    if (arrivalDate > sixMonthsAgo) {
-                        console.log(`Marking as cancelled (not in Beds24): ${docId} - ${existingData.guestName}`);
-                        batch.update(doc.ref, {
-                            status: "cancelled",
-                            updatedAt: new Date(),
-                            syncNote: "Beds24에서 삭제됨"
-                        });
-                        count++;
-
-                        if (count % batchLimit === 0) {
-                            await batch.commit(); // ★ 이제 정상적으로 작동
-                            batch = db.batch();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 새로운/업데이트된 예약 저장 (merge: false로 완전 덮어쓰기)
     for (const item of list) {
-        const docRef = db.collection("reservations").doc(item.id);
-        batch.set(docRef, {
-            ...item,
-            companyId: 'dGxlQyu47LbplLVCVXiV'  // 모든 Beds24 동기화 데이터에 companyId 추가
-        }); // merge 없이 완전 덮어쓰기
-
+        const enriched = enrichedList[count];
+        const docRef = db.collection("reservations").doc(String(item.id));
+        batch.set(docRef, enriched, { merge: true });
         count++;
         if (count % batchLimit === 0) {
             await batch.commit();
@@ -536,7 +1162,107 @@ async function saveBookings(list, syncRangeStart = null) {
         }
     }
     if (count % batchLimit !== 0) { await batch.commit(); }
-    return count;
+    return {
+        upsertedCount: count,
+        ...summarizeReservationIntegrity(enrichedList)
+    };
+}
+
+async function incrementalReservationSync(list, companyId = DEFAULT_COMPANY_ID, syncSource = "beds24_sync") {
+    const upsertResult = await upsertReservations(list, {
+        companyId,
+        syncSource,
+        syncMode: "incremental"
+    });
+    return { cancelledCount: 0, ...upsertResult };
+}
+
+async function fullReservationReconcile(list, syncRangeStart = null, companyId = DEFAULT_COMPANY_ID, syncSource = "beds24_sync") {
+    const observedAt = new Date();
+    const batchLimit = 400;
+    let batch = db.batch();
+    let cancelledCount = 0;
+
+    // Beds24에서 가져온 예약 ID 목록 (문자열로 통일해 비교)
+    const beds24BookIds = new Set(list.map(item => String(item.id)));
+
+    // ★ Beds24 응답에 나온 건물 + 동기화 대상 전체 건물 모두 검사 (해당 건물 예약이 0건이어도 삭제된 블락 취소 처리)
+    const buildingsInList = new Set(list.map(item => item.building));
+    const allSyncBuildings = PROPERTIES.filter(p => !p.disabled).map(p => p.name);
+    allSyncBuildings.forEach(b => buildingsInList.add(b));
+    const buildingsToProcess = [...buildingsInList];
+
+    // ★ 동기화 범위 시작일 (Quick Sync: 6개월 전, Full Sync: 2023-01-01)
+    const rangeStartDate = syncRangeStart ? new Date(syncRangeStart) : null;
+
+    for (const building of buildingsToProcess) {
+        const existingSnap = await db.collection("reservations")
+            .where("building", "==", building)
+            .get();
+
+        for (const doc of existingSnap.docs) {
+            const docId = String(doc.id);
+            const existingData = doc.data();
+
+            if (getEffectiveCompanyId(existingData) !== companyId) continue;
+
+            // ★ Beds24에 없는 예약(일반/블락 포함)은 cancelled로 표시 → 우리 시스템에서도 제거
+            if (!beds24BookIds.has(docId)) {
+                const activeStatuses = ["confirmed", "blackout"];
+                if (activeStatuses.includes(existingData.status) && existingData.arrival) {
+                    const arrivalDate = new Date(existingData.arrival);
+
+                    if (rangeStartDate && arrivalDate < rangeStartDate) {
+                        continue;
+                    }
+
+                    const cancelledDoc = enrichReservationDocument({
+                        ...existingData,
+                        status: "cancelled",
+                        cancelTime: existingData.cancelTime || observedAt.toISOString(),
+                        syncNote: "Beds24에서 삭제됨"
+                    }, {
+                        companyId,
+                        syncSource: `${syncSource}:cancelled`,
+                        syncMode: "reconcile",
+                        lastSeenAt: observedAt
+                    });
+
+                    batch.set(doc.ref, cancelledDoc, { merge: true });
+                    cancelledCount++;
+
+                    if (cancelledCount % batchLimit === 0) {
+                        await batch.commit();
+                        batch = db.batch();
+                    }
+                }
+            }
+        }
+    }
+
+    if (cancelledCount % batchLimit !== 0 && cancelledCount > 0) {
+        await batch.commit();
+    }
+
+    const upsertResult = await upsertReservations(list, {
+        companyId,
+        syncSource,
+        syncMode: "reconcile"
+    });
+
+    return {
+        cancelledCount,
+        ...upsertResult
+    };
+}
+
+// saveBookings: 하위 호환용 래퍼
+async function saveBookings(list, syncRangeStart = null, companyId = DEFAULT_COMPANY_ID, syncSource = "beds24_sync", options = {}) {
+    const { upsertOnly = false, mode = null } = options;
+    if (upsertOnly || mode === "incremental") {
+        return incrementalReservationSync(list, companyId, syncSource);
+    }
+    return fullReservationReconcile(list, syncRangeStart, companyId, syncSource);
 }
 
 
@@ -548,13 +1274,57 @@ async function saveBookings(list, syncRangeStart = null) {
 // ★ 순차 호출로 변경되어 타임아웃 증가
 exports.syncBeds24 = onRequest({ cors: true, timeoutSeconds: 540, memory: '512MiB' }, async (req, res) => {
     try {
+        const companyId = req.body?.companyId || DEFAULT_COMPANY_ID;
         const tokyoNow = dayjs().utcOffset(9);
         const syncRangeStart = tokyoNow.subtract(6, "month").format("YYYY-MM-DD"); // 6개월 전부터
-        const list = await fetchFromBeds24Quick();
-        const count = await saveBookings(list, syncRangeStart);
-        res.json({ success: true, message: `빠른 동기화 완료! ${count}건 저장됨 (6개월 전~6개월 후)`, count });
+        // 수동 Quick Sync는 사용자 기대(전체 재대사·삭제 반영)에 맞춰 항상 전체 fetch 후 재대사. 증분 미사용.
+        let list = await fetchFromBeds24Quick();
+        const result = await saveBookings(list, syncRangeStart, companyId, "beds24_manual_quick");
+        const syncVariant = "manual_quick";
+        await recordReservationSyncAudit({
+            syncType: "manual_quick",
+            syncVariant,
+            syncSource: "beds24_manual_quick",
+            companyId,
+            rangeStart: syncRangeStart,
+            rangeEnd: tokyoNow.add(6, "month").format("YYYY-MM-DD"),
+            fetchedCount: list.length,
+            upsertedCount: result.upsertedCount,
+            cancelledCount: result.cancelledCount,
+            invalidCriticalCount: result.invalidCriticalCount,
+            invalidReportCount: result.invalidReportCount,
+            sampleIds: result.sampleIds,
+            note: `mode=${syncVariant}`
+        });
+        const tokyoNowQuick = dayjs().utcOffset(9);
+        const fourteenDaysAgoQuick = tokyoNowQuick.subtract(14, "day").format("YYYY-MM-DD");
+        const fourteenDaysLaterQuick = tokyoNowQuick.add(14, "day").format("YYYY-MM-DD");
+        const recentListQuick = list.filter((r) => {
+            const d = r.arrival || r.departure || r.bookDate || "";
+            const dt = String(d).slice(0, 10);
+            return dt >= fourteenDaysAgoQuick && dt <= fourteenDaysLaterQuick;
+        });
+        try {
+            await scheduleOutputUpdates(recentListQuick.map((item) => buildReservationOutputImpact(item)));
+        } catch (e) {
+            console.warn("[Manual Quick Sync] Output update failed:", e.message);
+        }
+        res.json({
+            success: true,
+            message: `${syncVariant === "incremental" ? "변경분" : "빠른"} 동기화 완료! ${result.upsertedCount}건 저장됨`,
+            mode: syncVariant,
+            ...result,
+            companyId
+        });
     } catch (e) {
         console.error("Quick Sync Failed:", e.message);
+        await recordReservationSyncAudit({
+            syncType: "manual_quick",
+            status: "error",
+            syncSource: "beds24_manual_quick",
+            companyId: req.body?.companyId || DEFAULT_COMPANY_ID,
+            errorMessage: e.message
+        });
         res.status(500).json({ success: false, error: e.message });
     }
 });
@@ -563,12 +1333,47 @@ exports.syncBeds24 = onRequest({ cors: true, timeoutSeconds: 540, memory: '512Mi
 // ★ 순차 호출 + 페이지네이션으로 모든 데이터 가져오기 (최대 10분)
 exports.syncBeds24Full = onRequest({ cors: true, timeoutSeconds: 900, memory: '1GiB' }, async (req, res) => {
     try {
+        const companyId = req.body?.companyId || DEFAULT_COMPANY_ID;
         const syncRangeStart = "2023-01-01"; // 다시 2023년부터
         const list = await fetchFromBeds24Full();
-        const count = await saveBookings(list, syncRangeStart);
-        res.json({ success: true, message: `전체 동기화 완료! ${count}건 저장됨 (2023년~향후 24개월)`, count });
+        const result = await saveBookings(list, syncRangeStart, companyId, "beds24_manual_full");
+        await recordReservationSyncAudit({
+            syncType: "manual_full",
+            syncVariant: "manual_full",
+            syncSource: "beds24_manual_full",
+            companyId,
+            rangeStart: syncRangeStart,
+            rangeEnd: dayjs().add(24, "month").format("YYYY-MM-DD"),
+            fetchedCount: list.length,
+            upsertedCount: result.upsertedCount,
+            cancelledCount: result.cancelledCount,
+            invalidCriticalCount: result.invalidCriticalCount,
+            invalidReportCount: result.invalidReportCount,
+            sampleIds: result.sampleIds
+        });
+        const tokyoNowFull = dayjs().utcOffset(9);
+        const fourteenDaysAgoFull = tokyoNowFull.subtract(14, "day").format("YYYY-MM-DD");
+        const fourteenDaysLaterFull = tokyoNowFull.add(14, "day").format("YYYY-MM-DD");
+        const recentListFull = list.filter((r) => {
+            const d = r.arrival || r.departure || r.bookDate || "";
+            const dt = String(d).slice(0, 10);
+            return dt >= fourteenDaysAgoFull && dt <= fourteenDaysLaterFull;
+        });
+        try {
+            await scheduleOutputUpdates(recentListFull.map((item) => buildReservationOutputImpact(item)));
+        } catch (e) {
+            console.warn("[Manual Full Sync] Output update failed:", e.message);
+        }
+        res.json({ success: true, message: `전체 동기화 완료! ${result.upsertedCount}건 저장됨 (2023년~향후 24개월)`, ...result, companyId });
     } catch (e) {
         console.error("Full Sync Failed:", e.message);
+        await recordReservationSyncAudit({
+            syncType: "manual_full",
+            status: "error",
+            syncSource: "beds24_manual_full",
+            companyId: req.body?.companyId || DEFAULT_COMPANY_ID,
+            errorMessage: e.message
+        });
         res.status(500).json({ success: false, error: e.message });
     }
 });
@@ -686,7 +1491,11 @@ async function beds24PostV2WithRetry(endpoint, data, attempts = 3) {
 
 // 가격 데이터 동기화 함수 (Firestore 캐싱)
 // ==========================================
-async function syncAllPrices() {
+async function syncAllPrices({
+    forceFull = false,
+    reason = "scheduled",
+    targetBuildings = null
+} = {}) {
     const isLocked = await useSyncLock('acquire');
     if (!isLocked) return { error: "Sync already in progress" };
 
@@ -694,37 +1503,64 @@ async function syncAllPrices() {
         const tokyoNow = dayjs().utcOffset(9);
         const fromDate = tokyoNow.format("YYYY-MM-DD"); // V2용 (YYYY-MM-DD)
         const toDate = tokyoNow.add(6, "month").format("YYYY-MM-DD");
+        const priceStatus = await getDomainStatus(PRICE_SYNC_STATUS_DOC_ID);
+        const runFullSync = forceFull || shouldRunFullAudit(priceStatus, {
+            intervalMinutes: PRICE_FULL_RECONCILE_INTERVAL_MINUTES,
+            now: tokyoNow.toDate()
+        });
 
         // firestore 저장용 키 생성 (YYYYMMDD) 헬퍼
         const toKey = (d) => d.replace(/-/g, '');
 
-        console.log(`[V2 Bulletproof Sync] 시작: ${fromDate} ~ ${toDate} (Pace: 0.5s)`);
+        console.log(`[V2 Bulletproof Sync] 시작: ${fromDate} ~ ${toDate} (${runFullSync ? "full" : "incremental"})`);
         const syncResults = {};
+        let requestedRooms = 0;
+        let syncedRooms = 0;
+        let skippedRooms = 0;
+        const touchedBuildings = [];
 
         for (const prop of PROPERTIES) {
             if (prop.disabled) {
                 console.log(`⏭️  [Price Sync Skip] ${prop.name}: disabled`);
                 continue;
             }
+            if (Array.isArray(targetBuildings) && targetBuildings.length > 0 && !targetBuildings.includes(prop.name)) {
+                continue;
+            }
             const buildingName = prop.name;
-            const roomsToFetch = BUILDING_ROOMS[buildingName] || [];
-            if (roomsToFetch.length === 0) continue;
+            const allRooms = BUILDING_ROOMS[buildingName] || [];
+            if (allRooms.length === 0) continue;
+
+            const buildingRef = db.collection("price_sync").doc(buildingName);
+            const buildingSnap = await buildingRef.get();
+            const buildingCache = buildingSnap.exists ? buildingSnap.data() : {};
+            const invalidatedRoomIds = new Set((buildingCache.invalidatedRoomIds || []).map((id) => String(id)));
+            const roomsToFetch = runFullSync
+                ? allRooms
+                : allRooms.filter((room) => invalidatedRoomIds.has(String(room.roomId)));
+
+            if (!runFullSync && roomsToFetch.length === 0) {
+                continue;
+            }
 
             console.log(`[V2 Sync] 건물 시작: ${buildingName} (${roomsToFetch.length}개 객실)`);
             let successInBuilding = 0;
+            const syncedRoomIds = new Set();
+            requestedRooms += roomsToFetch.length;
+            touchedBuildings.push(buildingName);
 
             for (const room of roomsToFetch) {
                 const rid = String(room.roomId);
                 try {
                     // [Cache Protection] 최근 15분 내 수동 수정된 방 스킵
-                    const roomDocRef = db.collection("price_sync").doc(buildingName).collection("rooms").doc(rid);
+                    const roomDocRef = buildingRef.collection("rooms").doc(rid);
                     const existingSnap = await roomDocRef.get();
                     if (existingSnap.exists) {
                         const roomCache = existingSnap.data();
                         const lastUserUpdate = roomCache?.lastManualUpdate?.toDate() || null;
                         if (lastUserUpdate && dayjs().diff(dayjs(lastUserUpdate), 'minute') < 15) {
                             console.log(`[Price Sync Skip] ${buildingName} - ${room.name}(${rid}): 최근 수동 수정됨`);
-                            successInBuilding++;
+                            skippedRooms++;
                             continue;
                         }
                     }
@@ -749,10 +1585,10 @@ async function syncAllPrices() {
 
                         roomData.calendar.forEach(entry => {
                             // from/to 범위를 개별 날짜로 확장
-                            const fromDate = dayjs(entry.from);
-                            const toDate = dayjs(entry.to);
+                            const entryFromDate = dayjs(entry.from);
+                            const entryToDate = dayjs(entry.to);
 
-                            for (let d = fromDate; d.isBefore(toDate) || d.isSame(toDate, 'day'); d = d.add(1, 'day')) {
+                            for (let d = entryFromDate; d.isBefore(entryToDate) || d.isSame(entryToDate, 'day'); d = d.add(1, 'day')) {
                                 const dateKey = d.format('YYYYMMDD');
                                 datesObj[dateKey] = {
                                     p1: String(entry.price1 || ""),
@@ -769,9 +1605,18 @@ async function syncAllPrices() {
                             roomName: room.name,
                             roomId: rid,
                             dates: datesObj,
+                            outputImpact: buildPriceOutputImpact({
+                                building: buildingName,
+                                roomName: room.name,
+                                roomId: rid,
+                                fromDate,
+                                toDate
+                            }),
                             lastSyncRoom: admin.firestore.FieldValue.serverTimestamp()
                         }, { merge: true });
                         successInBuilding++;
+                        syncedRooms++;
+                        syncedRoomIds.add(rid);
                     } else if (response.data?.error) {
                         console.error(`[Price Sync Error] ${buildingName} - ${room.name}: ${response.data.error}`);
                     }
@@ -784,24 +1629,90 @@ async function syncAllPrices() {
                 await new Promise(r => setTimeout(r, 500));
             }
 
+            const remainingInvalidatedRoomIds = runFullSync
+                ? []
+                : [...invalidatedRoomIds].filter((id) => !syncedRoomIds.has(String(id)));
+
             // 건물 요약 정보 업데이트
-            await db.collection("price_sync").doc(buildingName).set({
+            await buildingRef.set({
                 building: buildingName,
                 lastSync: admin.firestore.FieldValue.serverTimestamp(),
+                lastIncrementalSync: runFullSync ? buildingCache.lastIncrementalSync || null : admin.firestore.FieldValue.serverTimestamp(),
+                lastFullSync: runFullSync ? admin.firestore.FieldValue.serverTimestamp() : (buildingCache.lastFullSync || null),
                 roomCount: successInBuilding,
                 targetRoomCount: roomsToFetch.length,
                 dateFrom: fromDate,
-                dateTo: toDate
+                dateTo: toDate,
+                outputImpact: buildPriceOutputImpact({ building: buildingName, fromDate, toDate }),
+                invalidatedRoomIds: remainingInvalidatedRoomIds,
+                pendingInvalidationCount: remainingInvalidatedRoomIds.length,
+                invalidatedAt: remainingInvalidatedRoomIds.length > 0
+                    ? (buildingCache.invalidatedAt || admin.firestore.FieldValue.serverTimestamp())
+                    : admin.firestore.FieldValue.delete(),
+                invalidatedBy: remainingInvalidatedRoomIds.length > 0
+                    ? (buildingCache.invalidatedBy || "priceWebhook")
+                    : admin.firestore.FieldValue.delete()
             }, { merge: true });
 
-            syncResults[buildingName] = { success: true, rooms: successInBuilding };
+            syncResults[buildingName] = {
+                success: true,
+                rooms: successInBuilding,
+                targetRooms: roomsToFetch.length,
+                mode: runFullSync ? "full" : "incremental"
+            };
 
             // 건물 간 대기 시간도 단축 (5s -> 1s)
             await new Promise(r => setTimeout(r, 1000));
         }
 
+        if (!runFullSync && requestedRooms === 0) {
+            await recordPriceSyncAudit({
+                syncType: reason,
+                status: "skipped",
+                syncSource: "beds24_price_incremental",
+                companyId: DEFAULT_COMPANY_ID,
+                note: "price incremental skipped: no invalidated rooms",
+                metadata: { runFullSync, touchedBuildings: [] },
+                updateStatusDoc: false
+            });
+            return { skipped: true, mode: "incremental", rooms: 0 };
+        }
+
+        await recordPriceSyncAudit({
+            syncType: reason,
+            syncVariant: runFullSync ? "full_reconcile" : "incremental",
+            syncSource: runFullSync ? "beds24_price_full_reconcile" : "beds24_price_incremental",
+            companyId: DEFAULT_COMPANY_ID,
+            fetchedCount: requestedRooms,
+            upsertedCount: syncedRooms,
+            note: `mode=${runFullSync ? "full" : "incremental"}, skipped=${skippedRooms}`,
+            metadata: {
+                touchedBuildings,
+                requestedRooms,
+                syncedRooms,
+                skippedRooms
+            }
+        });
+
         console.log(`[V2 Sync] 전체 완료:`, syncResults);
-        return syncResults;
+        return {
+            success: true,
+            mode: runFullSync ? "full" : "incremental",
+            requestedRooms,
+            syncedRooms,
+            skippedRooms,
+            buildings: syncResults
+        };
+
+    } catch (e) {
+        await recordPriceSyncAudit({
+            syncType: reason,
+            status: "error",
+            syncSource: forceFull ? "beds24_price_full_reconcile" : "beds24_price_incremental",
+            companyId: DEFAULT_COMPANY_ID,
+            errorMessage: e.message
+        });
+        throw e;
 
     } finally {
         // 성공하든 실패하든 반드시 락 해제
@@ -813,7 +1724,7 @@ async function syncAllPrices() {
 exports.triggerPriceSync = onRequest({ cors: true, timeoutSeconds: 540 }, async (req, res) => {
     try {
         console.log("[Manual Trigger] 가격 동기화 시작");
-        const result = await syncAllPrices();
+        const result = await syncAllPrices({ forceFull: true, reason: "manual" });
         res.json({ success: true, message: "가격 동기화 완료", result });
     } catch (e) {
         console.error("[Manual Trigger] 가격 동기화 실패:", e.message);
@@ -822,7 +1733,7 @@ exports.triggerPriceSync = onRequest({ cors: true, timeoutSeconds: 540 }, async 
 });
 
 // 스케줄러 (자동 동기화) - 15분마다 (비용 최적화)
-// ★ 5개월 전부터 동기화하여 과거 예약 변경/취소도 자동 반영
+// ★ 예약은 웹훅 중심, 재대사는 1시간 간격/웹훅 stale 시만 수행
 // ★ 가격 데이터도 함께 동기화 (Firestore 캐싱)
 exports.scheduledBeds24Sync = onSchedule({
     schedule: "every 15 minutes",
@@ -830,27 +1741,465 @@ exports.scheduledBeds24Sync = onSchedule({
     memory: "1GiB"
 }, async () => {
     const tokyoNow = dayjs().utcOffset(9);
-    const syncRangeStart = tokyoNow.subtract(5, "month").format("YYYY-MM-DD"); // 5개월 전부터
+    const syncRangeStart = tokyoNow.subtract(6, "month").format("YYYY-MM-DD"); // 6개월 전부터
+    const companyId = DEFAULT_COMPANY_ID; // 스케줄러는 기본 회사 ID 사용
 
-    // 1. 예약 동기화
-    const list = await fetchFromBeds24Quick();
-    await saveBookings(list, syncRangeStart);
-    console.log(`✅ 예약 동기화 완료: ${list.length}건 (${tokyoNow.format("YYYY-MM-DD HH:mm")})`);
+    try {
+        const decision = await getScheduledReservationReconcileDecision({
+            now: tokyoNow.toDate(),
+            minIntervalMinutes: 60,
+            webhookStaleMinutes: REPORT_SYNC_MAX_AGE_MINUTES
+        });
 
-    // 2. 가격 동기화 (Firestore 캐싱)
-    await syncAllPrices();
-    console.log(`✅ 가격 동기화 완료 (${tokyoNow.format("YYYY-MM-DD HH:mm")})`);
+        if (decision.shouldRun) {
+            const data = decision.data || {};
+            const lastWebhookAt = toDateOrNull(data.lastWebhookAt);
+            const lastReconciledAt = toDateOrNull(data.lastReconciledAt);
+            const baseTime = lastWebhookAt && lastReconciledAt
+                ? (lastWebhookAt.getTime() < lastReconciledAt.getTime() ? lastWebhookAt : lastReconciledAt)
+                : (lastWebhookAt || lastReconciledAt);
+            const forceFullByReason = [
+                "missing_sync_status",
+                "last_audit_error",
+                "integrity_gap_detected",
+                "missing_last_reconciled_at",
+                "missing_last_webhook_at",
+                "webhook_stale"
+            ].includes(decision.reason);
+            const fullAuditDue = shouldRunFullAudit(data, {
+                intervalMinutes: RESERVATION_FULL_RECONCILE_INTERVAL_MINUTES,
+                now: tokyoNow.toDate()
+            });
+            const useIncremental = !!baseTime && !!lastReconciledAt && !fullAuditDue && !forceFullByReason;
 
-    // 3. 메시지 동기화 (OTA 메시지)
-    await syncBookingMessages();
-    console.log(`✅ 메시지 동기화 완료 (${tokyoNow.format("YYYY-MM-DD HH:mm")})`);
+            let list;
+            let syncVariant = "full_reconcile";
+            if (useIncremental) {
+                const modifiedSince = new Date(baseTime.getTime() - 60000);
+                list = await fetchFromBeds24Incremental(modifiedSince);
+                syncVariant = "incremental";
+            } else {
+                list = await fetchFromBeds24Quick();
+            }
+            const result = await saveBookings(list, syncRangeStart, companyId, "beds24_scheduled_reconcile", {
+                mode: syncVariant === "incremental" ? "incremental" : "full_reconcile"
+            });
+            await recordReservationSyncAudit({
+                syncType: "scheduled",
+                syncVariant,
+                syncSource: "beds24_scheduled_reconcile",
+                companyId,
+                rangeStart: syncRangeStart,
+                rangeEnd: tokyoNow.add(6, "month").format("YYYY-MM-DD"),
+                fetchedCount: list.length,
+                upsertedCount: result.upsertedCount,
+                cancelledCount: result.cancelledCount,
+                invalidCriticalCount: result.invalidCriticalCount,
+                invalidReportCount: result.invalidReportCount,
+                sampleIds: result.sampleIds || [],
+                note: `reconcile reason=${decision.reason}, mode=${syncVariant}`
+            });
+            console.log(`✅ 예약 동기화 완료: ${list.length}건 (${syncVariant === "incremental" ? "증분" : "전체"}, reason=${decision.reason}, companyId: ${companyId}, ${tokyoNow.format("YYYY-MM-DD HH:mm")})`);
+            const fourteenDaysAgo = tokyoNow.subtract(14, "day").format("YYYY-MM-DD");
+            const fourteenDaysLater = tokyoNow.add(14, "day").format("YYYY-MM-DD");
+            const recentList = list.filter((r) => {
+                const d = r.arrival || r.departure || r.bookDate || "";
+                const dt = String(d).slice(0, 10);
+                return dt >= fourteenDaysAgo && dt <= fourteenDaysLater;
+            });
+            const impacts = recentList.map((item) => buildReservationOutputImpact(item));
+            try {
+                await scheduleOutputUpdates(impacts);
+            } catch (e) {
+                console.warn("[Scheduled Sync] Output update failed:", e.message);
+            }
+        } else {
+            await recordReservationSyncAudit({
+                syncType: "scheduled",
+                status: "skipped",
+                syncSource: "beds24_scheduled_reconcile",
+                companyId,
+                rangeStart: syncRangeStart,
+                rangeEnd: tokyoNow.add(6, "month").format("YYYY-MM-DD"),
+                note: `reservation reconcile skipped: ${decision.reason}`,
+                metadata: {
+                    reconcileAgeMinutes: Math.round(decision.reconcileAgeMinutes || 0),
+                    webhookAgeMinutes: Math.round(decision.webhookAgeMinutes || 0)
+                },
+                updateStatusDoc: false
+            });
+            console.log(`⏭️ 예약 재대사 스킵: reason=${decision.reason}, reconcileAge=${Math.round(decision.reconcileAgeMinutes || 0)}m, webhookAge=${Math.round(decision.webhookAgeMinutes || 0)}m`);
+        }
+
+        await syncAllPrices({ reason: "scheduled" });
+        console.log(`✅ 가격 동기화 완료 (${tokyoNow.format("YYYY-MM-DD HH:mm")})`);
+    } catch (e) {
+        await recordReservationSyncAudit({
+            syncType: "scheduled",
+            status: "error",
+            syncSource: "beds24_scheduled_reconcile",
+            companyId,
+            rangeStart: syncRangeStart,
+            rangeEnd: tokyoNow.add(6, "month").format("YYYY-MM-DD"),
+            errorMessage: e.message
+        });
+        await sendSyncAlert("scheduledBeds24Sync failed", [
+            `companyId=${companyId}`,
+            e.message
+        ]);
+        throw e;
+    }
+});
+
+// ==========================================
+// 리뷰 동기화 헬퍼 (Booking.com + Airbnb → Firestore)
+// fromDate: 조회 시작일 (기본값: 최근 30일)
+// options.insertOnly: true면 Firestore에 없는 것만 저장 (기존 덮어쓰기 안함)
+// ==========================================
+async function syncAllReviews(companyId, fromDate = null, options = {}) {
+    const { insertOnly = false, toDate = null } = options;
+    const tokyoNow = dayjs().utcOffset(9);
+    if (!fromDate) fromDate = tokyoNow.subtract(30, "day").format("YYYY-MM-DD");
+    const effectiveToDate = toDate || tokyoNow.format("YYYY-MM-DD");
+    const batch = [];
+
+    // 1. Booking.com 리뷰 (건물별)
+    for (const prop of PROPERTIES) {
+        if (prop.disabled) continue;
+        try {
+            let hasMore = true;
+            let pageFrom = fromDate;
+            let pageCount = 0;
+            while (hasMore && pageCount < 10) {
+                const res = await beds24GetV2WithRetry("/channels/booking/reviews", {
+                    propertyId: prop.v2Id,
+                    from: pageFrom,
+                    to: effectiveToDate
+                });
+                const result = res.data;
+                if (!result || !Array.isArray(result.data)) break;
+
+                for (const review of result.data) {
+                    const docId = `booking_${review.review_id}`;
+                    batch.push({
+                        id: docId,
+                        data: {
+                            reviewId: review.review_id,
+                            companyId,
+                            channel: "booking",
+                            building: prop.name,
+                            propertyId: prop.v2Id,
+                            roomId: null,
+                            roomName: null,
+                            score: review.scoring?.review_score || 0,
+                            categories: {
+                                facilities: review.scoring?.facilities ?? null,
+                                comfort: review.scoring?.comfort ?? null,
+                                staff: review.scoring?.staff ?? null,
+                                value: review.scoring?.value ?? null,
+                                clean: review.scoring?.clean ?? null,
+                                location: review.scoring?.location ?? null
+                            },
+                            content: {
+                                positive: review.content?.positive || null,
+                                negative: review.content?.negative || null,
+                                text: null
+                            },
+                            reviewerName: review.reviewer?.name || null,
+                            reviewerCountry: review.reviewer?.country_code || null,
+                            hasReply: !!review.reply,
+                            reply: review.reply || null,
+                            createdAt: review.created_timestamp || null,
+                            reservationId: String(review.reservation_id || ""),
+                            syncedAt: admin.firestore.FieldValue.serverTimestamp()
+                        }
+                    });
+                }
+                console.log(`[syncReviews] Booking.com ${prop.name}: ${result.data.length}건 (page ${pageCount + 1})`);
+
+                // 페이지네이션
+                if (result.pages?.nextPageExists && result.data.length > 0) {
+                    const lastTs = result.data[result.data.length - 1].created_timestamp;
+                    const lastDate = lastTs ? lastTs.split(" ")[0] : null;
+                    if (lastDate && lastDate !== pageFrom) {
+                        pageFrom = lastDate;
+                        pageCount++;
+                    } else { hasMore = false; }
+                } else { hasMore = false; }
+                await new Promise(r => setTimeout(r, 300));
+            }
+        } catch (err) {
+            console.warn(`[syncReviews] Booking.com ${prop.name} 실패:`, err.message);
+        }
+        await new Promise(r => setTimeout(r, 300));
+    }
+
+    // 2. Airbnb 리뷰 (객실별)
+    for (const [buildingName, rooms] of Object.entries(BUILDING_ROOMS)) {
+        const prop = PROPERTIES.find(p => p.name === buildingName);
+        if (!prop || prop.disabled) continue;
+
+        for (const room of rooms) {
+            try {
+                let hasMore = true;
+                let nextLink = null;
+                let pageCount = 0;
+                let roomTotal = 0;
+
+                while (hasMore && pageCount < 20) {
+                    let result;
+                    if (nextLink) {
+                        // nextPageLink는 전체 URL — 토큰만 헤더로 추가
+                        const token = await getBeds24Token();
+                        const pageRes = await axios.get(nextLink, { headers: { token } });
+                        result = pageRes.data;
+                    } else {
+                        const res = await beds24GetV2WithRetry("/channels/airbnb/reviews", {
+                            roomId: parseInt(room.roomId)
+                        });
+                        result = res.data;
+                    }
+
+                    if (!result || !Array.isArray(result.data)) break;
+
+                    for (const review of result.data) {
+                        const reviewDate = review.submitted_at || review.first_completed_at || null;
+                        if (reviewDate && reviewDate.substring(0, 10) < fromDate) continue;
+                        if (reviewDate && reviewDate.substring(0, 10) > effectiveToDate) continue;
+
+                        const docId = `airbnb_${review.id}`;
+                        const cats = {};
+                        if (Array.isArray(review.category_ratings)) {
+                            for (const c of review.category_ratings) {
+                                cats[c.category] = c.rating;
+                            }
+                        }
+                        batch.push({
+                            id: docId,
+                            data: {
+                                reviewId: String(review.id),
+                                companyId,
+                                channel: "airbnb",
+                                building: buildingName,
+                                propertyId: prop.v2Id,
+                                roomId: room.roomId,
+                                roomName: room.name,
+                                score: review.overall_rating ? review.overall_rating * 2 : 0,
+                                rawScore: review.overall_rating || 0,
+                                categories: cats,
+                                content: {
+                                    positive: null,
+                                    negative: null,
+                                    text: review.public_review || null
+                                },
+                                reviewerName: review.reviewer_id ? `Guest #${String(review.reviewer_id).slice(-6)}` : null,
+                                reviewerId: review.reviewer_id || null,
+                                reviewerCountry: null,
+                                hasReply: false,
+                                reply: null,
+                                createdAt: review.submitted_at || review.first_completed_at || null,
+                                reservationId: review.reservation_confirmation_code || null,
+                                listingId: review.listing_id || null,
+                                syncedAt: admin.firestore.FieldValue.serverTimestamp()
+                            }
+                        });
+                    }
+                    roomTotal += result.data.length;
+
+                    if (result.pages?.nextPageExists && result.pages?.nextPageLink) {
+                        nextLink = result.pages.nextPageLink;
+                        pageCount++;
+                        await new Promise(r => setTimeout(r, 300));
+                    } else {
+                        hasMore = false;
+                    }
+                }
+
+                if (roomTotal > 0) {
+                    console.log(`[syncReviews] Airbnb ${buildingName} ${room.name} (${room.roomId}): ${roomTotal}건`);
+                }
+            } catch (err) {
+                // Airbnb에 등록되지 않은 방은 400 에러 — 조용히 무시
+                if (err.response?.status !== 400) {
+                    console.warn(`[syncReviews] Airbnb ${buildingName} ${room.name} (${room.roomId}) 실패:`, err.message);
+                }
+            }
+            await new Promise(r => setTimeout(r, 200));
+        }
+    }
+
+    // Firestore batch write (400개씩 분할)
+    const CHUNK = 400;
+    if (insertOnly) {
+        // insertOnly: Firestore에 없는 것만 저장
+        let insertedCount = 0;
+        for (let i = 0; i < batch.length; i += CHUNK) {
+            const chunk = batch.slice(i, i + CHUNK);
+            const wb = db.batch();
+            for (const item of chunk) {
+                const ref = db.collection("reviews").doc(item.id);
+                const snap = await ref.get();
+                if (!snap.exists) {
+                    wb.set(ref, item.data);
+                    insertedCount++;
+                }
+            }
+            await wb.commit();
+        }
+        console.log(`[syncReviews] insertOnly: ${insertedCount}건 신규 저장 (총 fetch: ${batch.length}건)`);
+        return insertedCount;
+    } else {
+        // 기본: upsert (변경사항 반영)
+        for (let i = 0; i < batch.length; i += CHUNK) {
+            const chunk = batch.slice(i, i + CHUNK);
+            const wb = db.batch();
+            for (const item of chunk) {
+                const ref = db.collection("reviews").doc(item.id);
+                wb.set(ref, item.data, { merge: true });
+            }
+            await wb.commit();
+        }
+        return batch.length;
+    }
+}
+
+// 리뷰 풀 재대사: Beds24 전체 목록 vs Firestore 비교 → 삭제된 리뷰 하드 삭제
+async function reconcileReviews(companyId) {
+    const beds24ReviewIds = new Set();
+
+    // Booking.com 전체 리뷰 ID 수집
+    for (const prop of PROPERTIES) {
+        if (prop.disabled) continue;
+        try {
+            let hasMore = true;
+            let pageFrom = "2020-01-01";
+            let pageCount = 0;
+            while (hasMore && pageCount < 50) {
+                const res = await beds24GetV2WithRetry("/channels/booking/reviews", { propertyId: prop.v2Id, from: pageFrom });
+                const result = res.data;
+                if (!result || !Array.isArray(result.data) || result.data.length === 0) break;
+                result.data.forEach(r => beds24ReviewIds.add(`booking_${r.review_id}`));
+                if (result.pages?.nextPageExists) {
+                    const lastTs = result.data[result.data.length - 1].created_timestamp;
+                    const lastDate = lastTs ? lastTs.split(" ")[0] : null;
+                    if (lastDate && lastDate !== pageFrom) { pageFrom = lastDate; pageCount++; }
+                    else { hasMore = false; }
+                } else { hasMore = false; }
+                await new Promise(r => setTimeout(r, 300));
+            }
+        } catch (err) {
+            console.warn(`[reconcileReviews] Booking.com ${prop.name} 실패:`, err.message);
+        }
+        await new Promise(r => setTimeout(r, 300));
+    }
+
+    // Airbnb 전체 리뷰 ID 수집
+    for (const [, rooms] of Object.entries(BUILDING_ROOMS)) {
+        for (const room of rooms) {
+            try {
+                const res = await beds24GetV2WithRetry("/channels/airbnb/reviews", { roomId: parseInt(room.roomId) });
+                const result = res.data;
+                if (result && Array.isArray(result.data)) {
+                    result.data.forEach(r => beds24ReviewIds.add(`airbnb_${r.id}`));
+                }
+            } catch (err) {
+                if (err.response?.status !== 400) console.warn(`[reconcileReviews] Airbnb ${room.name} 실패:`, err.message);
+            }
+            await new Promise(r => setTimeout(r, 200));
+        }
+    }
+
+    // Firestore에서 삭제된 리뷰 찾아서 하드 삭제
+    const firestoreSnap = await db.collection("reviews").where("companyId", "==", companyId).get();
+    const toDelete = firestoreSnap.docs.filter(d => !beds24ReviewIds.has(d.id));
+    const CHUNK = 400;
+    for (let i = 0; i < toDelete.length; i += CHUNK) {
+        const wb = db.batch();
+        toDelete.slice(i, i + CHUNK).forEach(d => wb.delete(d.ref));
+        await wb.commit();
+    }
+    console.log(`[reconcileReviews] 완료: Beds24 ${beds24ReviewIds.size}건, Firestore ${firestoreSnap.size}건, 삭제 ${toDelete.length}건`);
+    return toDelete.length;
+}
+
+// ==========================================
+// 통합 동기화 (예약 + 리뷰, 기간 선택, 없는 데이터만 저장)
+// ==========================================
+exports.unifiedSync = onRequest({ cors: true, timeoutSeconds: 900, memory: "2GiB" }, async (req, res) => {
+    try {
+        const { companyId, fromDate, toDate } = req.body;
+        if (!companyId) return res.status(400).json({ error: "Missing companyId" });
+        if (!fromDate) return res.status(400).json({ error: "Missing fromDate" });
+
+        console.log(`🔄 [UnifiedSync] 시작: fromDate=${fromDate}, toDate=${toDate || "auto"}, companyId=${companyId}`);
+
+        // 1. 예약 동기화 — fetchFromBeds24Full 패턴 그대로, fromDate/toDate 커스텀
+        const arrivalFrom = fromDate; // YYYY-MM-DD 형식 그대로
+        const arrivalTo = toDate || dayjs().add(24, "month").format("YYYY-MM-DD");
+        // 과거 데이터(6개월 이상 이전) 동기화 시 inquiry/request/black 스킵 — 속도 최적화
+        const isLegacyRange = toDate && dayjs(toDate).isBefore(dayjs().subtract(6, "month"));
+        const allBookings = [];
+        for (const prop of PROPERTIES) {
+            if (prop.disabled) continue;
+            console.log(`[UnifiedSync] 예약 fetch: ${prop.name} (${arrivalFrom} ~ ${arrivalTo})${isLegacyRange ? " [legacy mode]" : ""}`);
+            const bookings = await fetchAllBookingsFromProperty(prop, { arrivalFrom, arrivalTo }, { legacyMode: isLegacyRange });
+            allBookings.push(...bookings);
+            await new Promise(r => setTimeout(r, 500));
+        }
+        console.log(`[UnifiedSync] 예약 fetch 완료: ${allBookings.length}건`);
+        const reservationResult = await incrementalReservationSync(allBookings, companyId, "unified_sync");
+        console.log(`✅ [UnifiedSync] 예약 완료: ${reservationResult.upsertedCount}건`);
+
+        // 2. 리뷰 동기화 — 과거 데이터 모드에서는 스킵 (Airbnb 리뷰가 roomId별 65회+ 호출로 타임아웃 유발)
+        let reviewCount = 0;
+        if (!isLegacyRange) {
+            reviewCount = await syncAllReviews(companyId, fromDate, { insertOnly: true, toDate: arrivalTo });
+            console.log(`✅ [UnifiedSync] 리뷰 완료: ${reviewCount}건 신규`);
+        } else {
+            console.log(`⏭️ [UnifiedSync] 리뷰 동기화 스킵 (과거 데이터 모드)`);
+        }
+
+        res.json({
+            success: true,
+            reservations: { upserted: reservationResult.upsertedCount },
+            reviews: { inserted: reviewCount }
+        });
+    } catch (err) {
+        console.error("[unifiedSync] 실패:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 리뷰 증분 자동 동기화 (3시간마다, 최근 30일)
+exports.scheduledReviewsSync = onSchedule({
+    schedule: "0 0,3,6,9,12,15,18,21 * * *",
+    timeoutSeconds: 540,
+    memory: "512MiB"
+}, async () => {
+    const companyId = DEFAULT_COMPANY_ID;
+    const count = await syncAllReviews(companyId);
+    console.log(`✅ 리뷰 증분 동기화 완료: ${count}건 (${dayjs().utcOffset(9).format("YYYY-MM-DD HH:mm")})`);
+});
+
+// 리뷰 풀 재대사 (매일 새벽 3시 JST — 삭제된 리뷰 정리)
+exports.scheduledReviewsReconcile = onSchedule({
+    schedule: "0 18 * * *", // 매일 18:00 UTC = JST 03:00
+    timeZone: "Asia/Tokyo",
+    timeoutSeconds: 540,
+    memory: "512MiB"
+}, async () => {
+    const companyId = DEFAULT_COMPANY_ID;
+    const deleted = await reconcileReviews(companyId);
+    console.log(`✅ 리뷰 재대사 완료: ${deleted}건 삭제 (${dayjs().utcOffset(9).format("YYYY-MM-DD HH:mm")})`);
 });
 
 // 입/퇴실 조회
 exports.getTodayArrivals = onRequest({ cors: true }, async (req, res) => {
     const date = req.body.date || dayjs().format("YYYY-MM-DD");
+    const companyId = req.body.companyId || DEFAULT_COMPANY_ID;
 
     const snap = await db.collection("reservations")
+        .where("companyId", "==", companyId)
         .where("status", "==", "confirmed")
         .get();
 
@@ -863,154 +2212,6 @@ exports.getTodayArrivals = onRequest({ cors: true }, async (req, res) => {
     res.json({ success: true, data: list });
 });
 
-// ==========================================
-// 디버깅: 건물별 가격 필드 구조 확인 (V2)
-// ==========================================
-exports.debugPriceFields = onRequest({ cors: true, timeoutSeconds: 120 }, async (req, res) => {
-    try {
-        const tokyoNow = dayjs().utcOffset(9);
-        const targetDate = tokyoNow.add(30, "day").format("YYYY-MM-DD");
-        const results = {};
-
-        for (const prop of PROPERTIES) {
-            if (prop.disabled) continue; // disabled 건물 제외
-            const rooms = BUILDING_ROOMS[prop.name];
-            if (!rooms || rooms.length === 0) continue;
-
-            const sampleRoom = rooms[0];
-
-            try {
-                // V2 GET /inventory/rooms/calendar
-                const response = await beds24GetV2WithRetry("/inventory/rooms/calendar", {
-                    propertyId: prop.v2Id,
-                    startDate: tokyoNow.format("YYYY-MM-DD"),
-                    endDate: tokyoNow.add(7, "day").format("YYYY-MM-DD"),
-                    includePrices: true,
-                    includeLinkedPrices: true,
-                    includeMinStay: true,
-                    includeMaxStay: true
-                });
-
-                results[prop.name] = {
-                    roomsFound: (response.data && response.data.data) ? response.data.data.length : 0,
-                    sampleRoom: (response.data && response.data.data) ? response.data.data[0] : null
-                };
-            } catch (err) {
-                results[prop.name] = { error: err.message };
-            }
-            await new Promise(resolve => setTimeout(resolve, 300));
-        }
-
-        res.json({
-            success: true,
-            message: "건물별 가격 필드 구조 (V2)",
-            targetDate: targetDate,
-            fullData: results
-        });
-    } catch (e) {
-        console.error("debugPriceFields Error:", e.message);
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-// ==========================================
-// 디버깅: Daily Price 채널 매핑 확인 (Legacy - 사용 중지)
-// ==========================================
-/*
-exports.debugChannelMapping = onRequest({ cors: true, timeoutSeconds: 120 }, async (req, res) => {
-    try {
-        res.json({ message: "Legacy function disabled (V2 Migration)" });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-*/
-
-exports.debugBeds24Fields = onRequest({ cors: true }, async (req, res) => {
-    try {
-        // V2 GET /bookings?limit=1
-        const response = await beds24GetV2WithRetry("/bookings", {
-            limit: 5 // 샘플 5개
-        });
-
-        const bookings = (response.data && Array.isArray(response.data.data)) ? response.data.data : [];
-
-        if (bookings.length === 0) {
-            return res.json({ message: "예약 데이터 없음", rawResponse: response.data });
-        }
-
-        // 모든 예약에서 발견된 필드들을 수집
-        const allFields = new Set();
-        const sampleValues = {};
-
-        bookings.forEach(booking => {
-            Object.keys(booking).forEach(key => {
-                allFields.add(key);
-                if (!sampleValues[key] && booking[key] !== null && booking[key] !== "" && typeof booking[key] !== 'object') {
-                    sampleValues[key] = booking[key];
-                }
-            });
-        });
-
-        res.json({
-            success: true,
-            totalBookings: bookings.length,
-            allFieldNames: Array.from(allFields).sort(),
-            fieldCount: allFields.size,
-            sampleBookingRaw: bookings[0],
-            sampleValues: sampleValues
-        });
-    } catch (e) {
-        console.error("Debug Error:", e.message);
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-// ★ minStay 실제 API 응답 확인용 디버그 함수
-exports.debugMinStayResponse = onRequest({ cors: true, timeoutSeconds: 60 }, async (req, res) => {
-    try {
-        const { roomId, date } = req.query;
-
-        if (!roomId) {
-            return res.status(400).json({ error: "roomId 필요 (예: ?roomId=585734&date=2026-03-03)" });
-        }
-
-        // 날짜 범위 설정 (지정 날짜 또는 오늘부터 7일)
-        const fromDate = date || dayjs().utcOffset(9).format('YYYY-MM-DD');
-        const toDate = date || dayjs().utcOffset(9).add(7, 'day').format('YYYY-MM-DD');
-
-        // Beds24 API 직접 호출 (RAW 응답 확인)
-        const response = await beds24GetV2WithRetry("/inventory/rooms/calendar", {
-            roomId: parseInt(roomId),
-            from: fromDate,
-            to: toDate,
-            includePrice1: true,
-            includePrice2: true,
-            includeMinStay: true,
-            includeMaxStay: true
-        });
-
-        res.json({
-            success: true,
-            roomId: roomId,
-            dateRange: { from: fromDate, to: toDate },
-            rawApiResponse: response.data,
-            // minStay 값만 추출해서 보기 쉽게
-            minStayValues: response.data?.data?.[0]?.calendar?.map(cal => ({
-                date: cal.from,
-                minStay: cal.minStay,
-                minStayType: typeof cal.minStay,
-                minStayIsNull: cal.minStay === null,
-                minStayIsUndefined: cal.minStay === undefined,
-                minStayIsZero: cal.minStay === 0,
-                minStayIsEmpty: cal.minStay === ""
-            })) || []
-        });
-    } catch (e) {
-        console.error("debugMinStayResponse Error:", e.message);
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
 
 // 건물별 roomId 매핑
 const BUILDING_ROOMS = {
@@ -1049,7 +2250,7 @@ const BUILDING_ROOMS = {
         { roomId: "543189", name: "502호" }, { roomId: "601560", name: "502호" },
         { roomId: "383985", name: "603호" }, { roomId: "452064", name: "603호" },
         { roomId: "441885", name: "802호" }, { roomId: "452065", name: "802호" },
-        { roomId: "624198", name: "803호" }
+        { roomId: "624198", name: "803호" }, { roomId: "648398", name: "803호" }
     ],
     "다카다노바바": [
         { roomId: "513698", name: "201호" }, { roomId: "513699", name: "301호" },
@@ -1060,9 +2261,60 @@ const BUILDING_ROOMS = {
     ],
     "오쿠보A동": [{ roomId: "437952", name: "오쿠보A" }],
     "오쿠보B동": [{ roomId: "615969", name: "오쿠보B" }],
-    "오쿠보C동": [{ roomId: "450096", name: "오쿠보C" }, { roomId: "496532", name: "오쿠보C" }],
+    "오쿠보C동": [{ roomId: "450096", name: "오쿠보C" }, { roomId: "496532", name: "오쿠보C" }, { roomId: "648399", name: "오쿠보C" }],
     "사노시": [{ roomId: "481152", name: "사노" }]
 };
+
+const {
+    sendSyncAlert,
+    buildAndSendSlackDailyReport,
+    buildAndSendSlackCleaningReport,
+    scheduledSlackDailyReport,
+    sendSlackDailyReportManual,
+    scheduledSlackCleaningReport,
+    sendSlackCleaningReportManual
+} = createSlackReportModule({
+    onRequest,
+    onSchedule,
+    cors,
+    db,
+    dayjs,
+    DEFAULT_COMPANY_ID,
+    filterDocsToCompany,
+    getBookingAmount,
+    assertReservationDataReady,
+    getEffectiveCompanyId
+});
+
+const {
+    runScheduledDailyReport,
+    scheduledPlatformAnalysisHourly,
+    scheduledPaxOccupancyReport,
+    scheduledMonthlyBriefingSetup
+} = createGoogleSheetReportModule({
+    onSchedule,
+    admin,
+    dayjs,
+    DEFAULT_COMPANY_ID,
+    filterDocsToCompany,
+    getBookingAmount,
+    assertReservationDataReady,
+    sendSyncAlert,
+    BUILDING_ROOMS
+});
+
+const {
+    scheduledMonthlyNotionReport,
+    sendNotionReport
+} = createNotionReportModule({
+    onSchedule,
+    onRequest,
+    cors,
+    db,
+    dayjs,
+    DEFAULT_COMPANY_ID,
+    cleanPrice
+});
 
 // ==========================================
 // 가격 조회: Legacy API (효과적인 가격 반환 - API V2는 명시적 설정값만 반환하므로 사용 불가)
@@ -1075,7 +2327,8 @@ const BUILDING_ROOMS = {
 // V2: POST /inventory/rooms/calendar
 exports.setRoomPrices = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, res) => {
     try {
-        const { roomId, roomIds, dates, building } = req.body;
+        const { companyId, roomId, roomIds, dates, building } = req.body;
+        if (!companyId) return res.status(400).json({ success: false, error: "Missing companyId" });
 
         // roomId (단수) 또는 roomIds (배열) 지원
         let inputRoomIds = roomIds || (roomId ? [roomId] : []);
@@ -1114,8 +2367,8 @@ exports.setRoomPrices = onRequest({ cors: true, timeoutSeconds: 300 }, async (re
 
             // 첫 번째가 아닌 경우 딜레이 (Rate Limit 방지)
             if (i > 0) {
-                console.log(`[setRoomPrices] Rate Limit 방지 대기 (2초)...`);
-                await new Promise(r => setTimeout(r, 2000));
+                console.log(`[setRoomPrices] Rate Limit 방지 대기 (0.5초)...`);
+                await new Promise(r => setTimeout(r, 500));
             }
 
             try {
@@ -1205,8 +2458,9 @@ exports.setRoomPrices = onRequest({ cors: true, timeoutSeconds: 300 }, async (re
 
 exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
     try {
-        const { building } = req.body;
+        const { companyId, building } = req.body;
 
+        if (!companyId) return res.status(400).json({ success: false, error: "Missing companyId" });
         if (!building) {
             return res.status(400).json({ success: false, error: "건물명이 필요합니다" });
         }
@@ -1254,8 +2508,9 @@ exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
 // ==========================================
 exports.checkAvailability = onRequest({ cors: true, timeoutSeconds: 60 }, async (req, res) => {
     try {
-        const { building, roomId, dateFrom, dateTo } = req.body;
+        const { companyId, building, roomId, dateFrom, dateTo } = req.body;
 
+        if (!companyId) return res.status(400).json({ success: false, error: "Missing companyId" });
         if (!building || !roomId || !dateFrom || !dateTo) {
             return res.status(400).json({ success: false, error: "building, roomId, dateFrom, dateTo가 필요합니다" });
         }
@@ -1315,158 +2570,14 @@ exports.checkAvailability = onRequest({ cors: true, timeoutSeconds: 60 }, async 
     }
 });
 
-// ==========================================
-// 디버깅: Firestore 키 확인
-// ==========================================
-exports.debugRoomPropMapping = onRequest({ cors: true }, async (req, res) => {
-    try {
-        const snap = await db.collection("reservations")
-            .where("departure", ">=", "2025-01-01")
-            .get();
-
-        const mapping = {};
-        snap.forEach(doc => {
-            const d = doc.data();
-            if (d.building && d.roomId) {
-                const key = `${d.building}_${d.roomId}`;
-                if (!mapping[key]) mapping[key] = new Set();
-                if (d.propKey) mapping[key].add(d.propKey);
-            }
-        });
-
-        const result = {};
-        Object.entries(mapping).forEach(([key, keys]) => {
-            result[key] = Array.from(keys);
-        });
-
-        res.json({ success: true, mapping: result });
-    } catch (e) {
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-exports.debugFindPropKeys = onRequest({ cors: true }, async (req, res) => {
-    try {
-        const snap = await db.collection("reservations")
-            .where("departure", ">=", "2025-07-01")
-            .get();
-
-        const keys = {};
-        const buildings = {};
-        const wronglyCancelled = [];
-
-        snap.forEach(doc => {
-            const d = doc.data();
-            const isConfirmed = d.status === "confirmed";
-            const isWronglyCancelled = d.status === "cancelled" && d.syncNote === "Beds24에서 삭제됨";
-
-            if (isConfirmed || isWronglyCancelled) {
-                // PropKey Stats
-                if (d.propKey) {
-                    if (!keys[d.propKey]) keys[d.propKey] = { buildings: new Set(), confirmed: 0, wronglyCancelled: 0 };
-                    keys[d.propKey].buildings.add(d.building);
-                    if (isConfirmed) keys[d.propKey].confirmed++;
-                    if (isWronglyCancelled) keys[d.propKey].wronglyCancelled++;
-                }
-
-                // Building Stats
-                if (d.building) {
-                    if (!buildings[d.building]) buildings[d.building] = { confirmedCount: 0, revenue: 0, wronglyCancelledCount: 0 };
-                    if (isConfirmed) {
-                        buildings[d.building].confirmedCount++;
-                        buildings[d.building].revenue += (Number(d.totalPrice || d.price) || 0);
-                    }
-                    if (isWronglyCancelled) {
-                        buildings[d.building].wronglyCancelledCount++;
-                        wronglyCancelled.push({
-                            id: doc.id,
-                            building: d.building,
-                            room: d.room,
-                            propKey: d.propKey,
-                            arrival: d.arrival,
-                            revenue: (Number(d.totalPrice || d.price) || 0)
-                        });
-                    }
-                }
-            }
-        });
-
-        const resultKeys = Object.entries(keys).map(([k, v]) => ({
-            propKey: k,
-            buildings: Array.from(v.buildings),
-            confirmed: v.confirmed,
-            wronglyCancelled: v.wronglyCancelled
-        }));
-
-        res.json({
-            success: true,
-            keys: resultKeys,
-            buildings,
-            wronglyCancelledSample: wronglyCancelled.slice(0, 10),
-            totalWronglyCancelled: wronglyCancelled.length,
-            lostRevenue: wronglyCancelled.reduce((s, x) => s + x.revenue, 0)
-        });
-    } catch (e) {
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-exports.debugCheckFirestore = onRequest({ cors: true }, async (req, res) => {
-    try {
-        const { building } = req.body;
-        if (building) {
-            const doc = await db.collection("price_sync").doc(building).get();
-            if (!doc.exists) return res.json({ success: false, error: "Doc not found" });
-            const data = doc.data();
-
-            // rooms 서브컬렉션에서 샘플 데이터 확인
-            const roomsSnap = await db.collection("price_sync").doc(building).collection("rooms").limit(1).get();
-            if (roomsSnap.empty) {
-                return res.json({ success: true, building, roomCount: 0, status: "No room sub-docs found" });
-            }
-
-            const sampleRoomDoc = roomsSnap.docs[0];
-            const sampleRoom = sampleRoomDoc.data();
-            const dates = Object.keys(sampleRoom?.dates || {}).sort();
-
-            return res.json({
-                success: true,
-                building,
-                summaryRoomCount: data.roomCount,
-                actualRoomCount: roomsSnap.size, // 여기서는 limit(1)이라 1이 나오겠지만, 전체 조회가 아니므로 참고용
-                dateCount: dates.length,
-                firstDate: dates[0],
-                lastDate: dates[dates.length - 1],
-                sampleRoom: sampleRoom?.roomName,
-                sampleData: sampleRoom?.dates?.[dates[0]]
-            });
-        }
-
-        const snap = await db.collection("price_sync").get();
-        const keys = [];
-        for (const doc of snap.docs) {
-            const data = doc.data();
-            // 서브컬렉션 개수 조회 (비용 발생하지만 디버깅용이므로 수행)
-            const roomsSnap = await doc.ref.collection("rooms").get();
-            keys.push({
-                id: doc.id,
-                roomCount: roomsSnap.size,
-                lastSync: data.lastSync?.toDate()?.toISOString()
-            });
-        }
-        res.json({ success: true, keys, count: keys.length });
-    } catch (e) {
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
 
 // ==========================================
 // 최소 숙박일수 설정: Beds24 API V2 (단일 API 호출)
 // ==========================================
 exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, res) => {
     try {
-        const { building, roomName, dateFrom, dateTo, minStayValue, dates } = req.body;
-        console.log("setMinStay (V2) 요청:", { building, roomName, dateFrom, dateTo, minStayValue, dates });
+        const { companyId, building, roomName, dateFrom, dateTo, minStayValue, dates } = req.body;
+        console.log("setMinStay (V2) 요청:", { companyId, building, roomName, dateFrom, dateTo, minStayValue, dates });
 
         const roomInfos = BUILDING_ROOMS[building]?.filter(r => r.name === roomName) || [];
         if (roomInfos.length === 0) {
@@ -1486,7 +2597,7 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, 
                 });
                 const roomData = response.data?.data?.[0];
                 if (roomData && Array.isArray(roomData.calendar) && roomData.calendar.length > 0) {
-                    const currentMinStay = roomData.calendar[0].minStay || 0;
+                    const currentMinStay = roomData.calendar[0].minStay ?? 999;
                     if (currentMinStay < 50) {
                         // 활성화된 roomId 발견
                         targetRoomId = info.roomId;
@@ -1499,10 +2610,13 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, 
             }
         }
 
-        // 활성화된 roomId를 찾지 못하면 첫 번째 사용 (fallback)
+        // 비활성화 ID는 수정하면 안 됨 → 활성 ID를 못 찾으면 에러 반환 (fallback 제거)
         if (!targetRoomId) {
-            targetRoomId = roomInfos[0].roomId;
-            console.warn(`[setMinStay] 활성화된 roomId를 찾지 못함, 첫 번째 사용: ${targetRoomId}`);
+            console.warn(`[setMinStay] 활성화된 roomId 없음 (모두 minStay>=50 또는 조회 실패). 수정하지 않음.`);
+            return res.status(400).json({
+                success: false,
+                error: "해당 객실의 활성화된 계정을 찾을 수 없습니다. (minStay<50인 roomId 없음) 비활성화 ID는 수정되지 않습니다."
+            });
         }
 
         // v2: 일괄 설정
@@ -1580,25 +2694,21 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, 
             console.log(`[setMinStay] Beds24 API 호출 완료: roomId=${targetRoomId}`);
         }
 
-        // 3. 원자적 캐시 패칭 (price_sync Atomic)
+        // 3. 원자적 캐시 패칭 (활성 targetRoomId만 수정 — 비활성 ID는 캐시도 건드리지 않음)
         try {
             const buildingRef = db.collection("price_sync").doc(building);
-            const batch = db.batch();
-            for (const info of roomInfos) {
-                const sRid = String(info.roomId);
-                const roomDocRef = buildingRef.collection("rooms").doc(sRid);
-                const roomSnap = await roomDocRef.get();
-                let roomData = roomSnap.exists ? roomSnap.data() : { roomId: sRid, dates: {} };
-                if (!roomData.dates) roomData.dates = {};
-                roomData.lastManualUpdate = admin.firestore.FieldValue.serverTimestamp();
-                Object.entries(datesToUpdate).forEach(([dKey, values]) => {
-                    if (!roomData.dates[dKey]) roomData.dates[dKey] = {};
-                    roomData.dates[dKey].m = String(values.m);
-                });
-                batch.set(roomDocRef, roomData, { merge: true });
-            }
-            await batch.commit();
-            console.log(`[price_sync Patched] ${building} minStay atomic updates committed.`);
+            const sRid = String(targetRoomId);
+            const roomDocRef = buildingRef.collection("rooms").doc(sRid);
+            const roomSnap = await roomDocRef.get();
+            let roomData = roomSnap.exists ? roomSnap.data() : { roomId: sRid, dates: {} };
+            if (!roomData.dates) roomData.dates = {};
+            roomData.lastManualUpdate = admin.firestore.FieldValue.serverTimestamp();
+            Object.entries(datesToUpdate).forEach(([dKey, values]) => {
+                if (!roomData.dates[dKey]) roomData.dates[dKey] = {};
+                roomData.dates[dKey].m = String(values.m);
+            });
+            await roomDocRef.set(roomData, { merge: true });
+            console.log(`[price_sync Patched] ${building} minStay 캐시 반영: roomId=${targetRoomId} 만 (비활성 ID 미수정)`);
         } catch (err) {
             console.error("price_sync Patching Error in setMinStay:", err.message);
         }
@@ -1645,7 +2755,7 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
         console.log(`Data Source: ${dataSource}`);
         console.log(`==========================`);
 
-        const data = req.body;
+        const data = method === "GET" ? req.query : req.body;
         console.log("Beds24 Webhook Received:", JSON.stringify(data));
 
         const roomId = data.roomId || data.roomid;
@@ -1674,18 +2784,195 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
                 notes: `Beds24에서 객실(${roomName})의 가격 또는 재고 변경이 감지되었습니다.`
             });
 
-            // price_sync 캐시 무효화 (lastSyncTime 초기화로 다음 syncAllPrices 시 새로 읽어옴)
+            // price_sync 캐시 무효화 (다음 syncAllPrices 시 해당 룸만 재동기화; 카운트는 sync 완료 시 정확히 덮어씀)
             const priceSyncDoc = db.collection("price_sync").doc(building);
+            const snap = await priceSyncDoc.get();
+            const existingIds = new Set((snap.data()?.invalidatedRoomIds || []).map(String));
+            existingIds.add(String(roomId));
             await priceSyncDoc.set({
-                lastSyncTime: null,
+                invalidatedRoomIds: Array.from(existingIds),
                 invalidatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                invalidatedBy: "priceWebhook (external change)"
+                invalidatedBy: "priceWebhook (external change)",
+                pendingInvalidationCount: existingIds.size,
+                outputImpact: buildPriceOutputImpact({
+                    building,
+                    roomName,
+                    roomId: String(roomId)
+                })
             }, { merge: true });
             console.log(`[Cache Invalidated] ${building} price_sync marked for refresh due to external webhook.`);
+
+            await recordPriceSyncAudit({
+                syncType: "webhook",
+                syncVariant: "webhook",
+                syncSource: "beds24_price_webhook",
+                companyId: (PROPERTIES.find((prop) => prop.name === building)?.companyId) || DEFAULT_COMPANY_ID,
+                fetchedCount: 1,
+                upsertedCount: 1,
+                note: `room invalidated: ${building} ${roomName} (${roomId})`,
+                metadata: {
+                    building,
+                    roomName,
+                    roomId: String(roomId),
+                    action: action || "UNKNOWN"
+                }
+            });
         }
         res.status(200).send("OK");
     } catch (e) {
         console.error("priceWebhook Error:", e.message);
+        await recordPriceSyncAudit({
+            syncType: "webhook",
+            status: "error",
+            syncSource: "beds24_price_webhook",
+            companyId: DEFAULT_COMPANY_ID,
+            errorMessage: e.message
+        });
+        res.status(500).send(e.message);
+    }
+});
+
+// ==========================================
+// 예약 변경 웹훅: Beds24 → 우리 (생성/수정/취소 시 1건만 반영)
+// ==========================================
+// 설정: Beds24 > SETTINGS > PROPERTIES > ACCESS > Booking Webhook URL 에 이 함수 URL 입력
+// 동작: 변경된 예약만 수신 → Firestore 1건 upsert. 15분 풀 동기화보다 API 호출·처리 비용 대폭 절감
+exports.beds24BookingWebhook = onRequest({ cors: true, timeoutSeconds: 60 }, async (req, res) => {
+    try {
+        if (req.method !== "POST" || !req.body || typeof req.body !== "object") {
+            res.status(400).send("POST JSON required");
+            return;
+        }
+        const payload = req.body;
+        const booking = payload.booking;
+        if (!booking || !booking.id) {
+            console.log("[Booking Webhook] No booking.id in payload, skipping.");
+            res.status(200).send("OK");
+            return;
+        }
+
+        const propertyId = booking.propertyId;
+        const prop = PROPERTIES.find(p => p.v2Id === propertyId);
+        if (!prop || prop.disabled) {
+            console.log(`[Booking Webhook] Unknown or disabled propertyId=${propertyId}, skipping.`);
+            res.status(200).send("OK");
+            return;
+        }
+
+        const companyId = prop.companyId || DEFAULT_COMPANY_ID;
+        const bookingRef = db.collection("reservations").doc(String(booking.id));
+        const existingSnap = await bookingRef.get();
+        const existingData = existingSnap.exists ? existingSnap.data() : null;
+        const eventAt = payload.timeStamp || booking.modifiedTime || booking.bookingTime || null;
+        const normalizedBase = normalize(booking, prop.id, prop.name, companyId);
+        const mutationSummary = buildReservationMutationSummary(existingData, normalizedBase);
+        const normalized = applyReservationActorMetadata({
+            ...normalizedBase,
+            lastEventType: mutationSummary.eventType,
+            lastChangedFields: mutationSummary.changedFields.slice(0, 20),
+            lastChangeSummary: mutationSummary.changes.slice(0, 20),
+            lastEventAt: eventAt || new Date().toISOString()
+        }, existingData, mutationSummary.eventType);
+        const upsertResult = await upsertReservations([normalized], {
+            companyId,
+            syncSource: "beds24_booking_webhook",
+            syncMode: "webhook",
+            sourceEventTime: eventAt
+        });
+        await recordReservationSyncAudit({
+            syncType: "webhook",
+            syncVariant: "webhook",
+            syncSource: "beds24_booking_webhook",
+            companyId,
+            rangeStart: normalized.arrival || null,
+            rangeEnd: normalized.departure || null,
+            fetchedCount: 1,
+            upsertedCount: upsertResult.upsertedCount,
+            cancelledCount: mutationSummary.eventType === "cancelled" ? 1 : 0,
+            invalidCriticalCount: upsertResult.invalidCriticalCount,
+            invalidReportCount: upsertResult.invalidReportCount,
+            sampleIds: [String(booking.id)],
+            note: `${mutationSummary.eventType}${normalized.lastActorId ? ` by ${normalized.lastActorId}` : ""}`,
+            metadata: {
+                bookingId: String(booking.id),
+                building: prop.name,
+                eventType: mutationSummary.eventType,
+                actorId: normalized.lastActorId || "",
+                actorSource: normalized.lastActorSource || "",
+                changedFields: mutationSummary.changedFields.slice(0, 20),
+                changes: mutationSummary.changes.slice(0, 20)
+            }
+        });
+
+        try {
+            await scheduleOutputUpdates([buildReservationOutputImpact(normalized)]);
+        } catch (e) {
+            console.warn("[Booking Webhook] Output update failed:", e.message);
+        }
+
+        // 당일 예약 알람: 오늘 예약 + 오늘 체크인(당일예약). 신규 확정, 금액>0, 다이쿄초 제외, 플랫폼 무관
+        const todayKst = dayjs().tz("Asia/Tokyo").format("YYYY-MM-DD");
+        const amount = getBookingAmount(normalized);
+        const isCreated = mutationSummary.eventType === "created";
+        const isConfirmed = normalized.status === "confirmed";
+        const bookDateOnly = normalized.bookDate ? String(normalized.bookDate).slice(0, 10) : "";
+        const arrivalDateOnly = normalized.arrival ? String(normalized.arrival).slice(0, 10) : "";
+        const bookDateToday = bookDateOnly === todayKst;
+        const arrivalToday = arrivalDateOnly === todayKst;
+        const amountOk = amount > 0;
+        const notDaikyo = normalized.building !== "다이쿄초";
+        const isSameDayCreated = isCreated && isConfirmed && bookDateToday && arrivalToday && amountOk && notDaikyo;
+
+        console.log("[SameDayAlert] check", {
+            bookingId: booking.id,
+            eventType: mutationSummary.eventType,
+            status: normalized.status,
+            bookDate: bookDateOnly || normalized.bookDate,
+            arrival: arrivalDateOnly || normalized.arrival,
+            todayKst,
+            amount,
+            building: normalized.building,
+            fire: isSameDayCreated,
+            reason: !isSameDayCreated ? {
+                created: isCreated,
+                confirmed: isConfirmed,
+                bookDateToday,
+                arrivalToday,
+                amountOk,
+                notDaikyo
+            } : null
+        });
+
+        if (isSameDayCreated) {
+            try {
+                await sendSameDayBookingAlert(normalized);
+                console.log(`[Booking Webhook] 당일 예약 알람 전송 완료: ${booking.id} (${normalized.building} ${normalized.room})`);
+            } catch (e) {
+                console.warn("[Booking Webhook] 당일 예약 알람 전송 실패:", e.message);
+            }
+        }
+
+        // 당일 취소 알람: 취소 건 중 입실일이 오늘 기준 앞뒤 6개월 이내인 경우 당일취소알람 채널로 전송
+        if (mutationSummary.eventType === "cancelled") {
+            try {
+                await sendCancelAlert(normalized);
+                console.log(`[Booking Webhook] 당일 취소 알람 전송 완료: ${booking.id} (${normalized.building} ${normalized.room})`);
+            } catch (e) {
+                console.warn("[Booking Webhook] 당일 취소 알람 전송 실패:", e.message);
+            }
+        }
+
+        console.log(`[Booking Webhook] Upserted booking ${booking.id} (${prop.name}, status=${normalized.status})`);
+        res.status(200).send("OK");
+    } catch (e) {
+        console.error("beds24BookingWebhook Error:", e.message);
+        await recordReservationSyncAudit({
+            syncType: "webhook",
+            status: "error",
+            syncSource: "beds24_booking_webhook",
+            errorMessage: e.message
+        });
+        await sendSyncAlert("beds24BookingWebhook failed", [e.message]);
         res.status(500).send(e.message);
     }
 });
@@ -1713,7 +3000,8 @@ function getRoomNameByRoomId(roomId) {
 exports.createBooking = onRequest({ cors: true }, async (req, res) => {
     try {
         // roomId를 직접 받음 (프론트엔드에서 전송)
-        const { building, roomId, room, arrival, departure, guestName, numAdult, numChild, guestPhone, guestEmail, source, price, comments } = req.body;
+        const { companyId, building, roomId, room, arrival, departure, guestName, numAdult, numChild, guestPhone, guestEmail, source, price, comments, staffId, operatorId } = req.body;
+        const actorId = firstNonEmptyValue(normalizePossibleActorId(staffId), normalizePossibleActorId(operatorId), normalizePossibleActorId(source));
 
         // roomId 필수
         if (!roomId) throw new Error("Missing roomId");
@@ -1724,6 +3012,9 @@ exports.createBooking = onRequest({ cors: true }, async (req, res) => {
 
         // room 이름 (전달받거나 roomId에서 추출)
         const roomName = room || getRoomNameByRoomId(roomId);
+
+        // ★ 블락 여부: 우리 시스템에서 블락으로 생성한 경우 Beds24에도 status=black으로 생성
+        const isBlock = !!(guestName && (String(guestName).toLowerCase().includes("room block") || String(guestName).toLowerCase().includes("blackout")) || comments === "System Block");
 
         // V2 API payload (배열 형식)
         const payload = [{
@@ -1739,11 +3030,11 @@ exports.createBooking = onRequest({ cors: true }, async (req, res) => {
             phone: guestPhone || "",
             comments: comments || "",
             apiSource: source || "Direct",
-            price: parseFloat(price) || 0
-            // status 필드 제거 (V2에서 유효하지 않음)
+            price: parseFloat(price) || 0,
+            ...(isBlock ? { status: "black" } : {})
         }];
 
-        console.log(`[createBooking] 예약 생성: ${building} ${roomName} (roomId: ${roomId}, propertyId: ${propertyId})`);
+        console.log(`[createBooking] 예약 생성: ${building} ${roomName} (roomId: ${roomId}, propertyId: ${propertyId})${isBlock ? " [BLOCK]" : ""}`);
 
         const response = await beds24PostV2WithRetry("/bookings", payload);
 
@@ -1756,23 +3047,48 @@ exports.createBooking = onRequest({ cors: true }, async (req, res) => {
 
         const newBookingId = result.new?.id || result.id; // V2 응답 구조
 
-        // Firestore에도 저장
+        // Firestore에도 저장 (블락이면 status=blackout, 수기 예약이면 confirmed)
         const newBooking = {
             id: String(newBookingId),
             bookId: String(newBookingId),
+            companyId: companyId || null,
             building,
             room: roomName,
             roomId: String(roomId),
             guestName: guestName || "Guest",
             arrival: arrival,
             departure: departure,
-            status: "confirmed",
+            status: isBlock ? "blackout" : "confirmed",
             price: parseFloat(price) || 0,
             source: source || "Direct",
+            referer: actorId || "",
+            apiSource: source || "Direct",
+            createdByStaffId: actorId || "",
+            createdBySource: actorId ? "manual_request" : "",
+            lastModifiedByStaffId: actorId || "",
+            lastModifiedBySource: actorId ? "manual_request" : "",
+            lastActorId: actorId || "",
+            lastActorSource: actorId ? "manual_request" : "",
             updatedAt: new Date()
         };
-        await db.collection("reservations").doc(String(newBookingId)).set(newBooking);
-
+        const newBookingEnriched = {
+            ...newBooking,
+            bookDate: newBooking.bookDate || dayjs().tz("Asia/Tokyo").format("YYYY-MM-DD"),
+            stayMonth: newBooking.arrival ? String(newBooking.arrival).slice(0, 7) : ""
+        };
+        await db.collection("reservations").doc(String(newBookingId)).set(
+            enrichReservationDocument(newBookingEnriched, {
+                companyId: companyId || DEFAULT_COMPANY_ID,
+                syncSource: "manual_create_booking",
+                syncMode: "manual"
+            }),
+            { merge: true }
+        );
+        try {
+            await scheduleOutputUpdates([buildReservationOutputImpact(newBookingEnriched)]);
+        } catch (e) {
+            console.warn("[createBooking] Output update failed:", e.message);
+        }
         console.log(`[createBooking] 예약 생성 성공: bookingId=${newBookingId}`);
         res.json({ success: true, bookingId: newBookingId });
     } catch (e) {
@@ -1819,10 +3135,40 @@ exports.updateBooking = onRequest({ cors: true }, async (req, res) => {
         }
 
         // Firestore 업데이트
-        await db.collection("reservations").doc(String(bookId)).update({
-            ...updates,
-            updatedAt: new Date()
-        });
+        const existingSnap = await db.collection("reservations").doc(String(bookId)).get();
+        const existingData = existingSnap.exists ? existingSnap.data() : {};
+        const actorId = firstNonEmptyValue(
+            normalizePossibleActorId(req.body?.staffId),
+            normalizePossibleActorId(req.body?.operatorId),
+            normalizePossibleActorId(updates?.source),
+            normalizePossibleActorId(existingData?.lastActorId)
+        );
+        await db.collection("reservations").doc(String(bookId)).set(
+            enrichReservationDocument({
+                ...existingData,
+                ...updates,
+                id: String(bookId),
+                bookId: String(bookId),
+                lastEventType: "manual_update",
+                lastChangedFields: Object.keys(updates || {}).slice(0, 20),
+                lastEventAt: new Date().toISOString(),
+                lastActorId: actorId || existingData.lastActorId || "",
+                lastActorSource: actorId ? "manual_request" : (existingData.lastActorSource || ""),
+                lastModifiedByStaffId: actorId || existingData.lastModifiedByStaffId || "",
+                lastModifiedBySource: actorId ? "manual_request" : (existingData.lastModifiedBySource || "")
+            }, {
+                companyId: getEffectiveCompanyId(existingData),
+                syncSource: "manual_update_booking",
+                syncMode: "manual"
+            }),
+            { merge: true }
+        );
+        try {
+            const merged = { ...existingData, ...updates, id: String(bookId), bookId: String(bookId) };
+            await scheduleOutputUpdates([buildReservationOutputImpact(merged)]);
+        } catch (e) {
+            console.warn("[updateBooking] Output update failed:", e.message);
+        }
         res.json({ success: true });
 
     } catch (e) {
@@ -1837,7 +3183,7 @@ exports.updateBooking = onRequest({ cors: true }, async (req, res) => {
 // ★ 예약 취소 - V2 마이그레이션 완료
 exports.cancelBooking = onRequest({ cors: true }, async (req, res) => {
     try {
-        const { bookId, reason } = req.body;
+        const { bookId, reason, cancelledBy, staffId, operatorId } = req.body;
 
         if (!bookId) return res.status(400).json({ error: "Missing bookId" });
 
@@ -1857,12 +3203,44 @@ exports.cancelBooking = onRequest({ cors: true }, async (req, res) => {
         }
 
         // Firestore 업데이트 (문서 없으면 생성)
-        await db.collection("reservations").doc(String(bookId)).set({
-            status: "cancelled",
-            cancelReason: reason || "",
-            updatedAt: new Date()
-        }, { merge: true });
-
+        const existingSnap = await db.collection("reservations").doc(String(bookId)).get();
+        const existingData = existingSnap.exists ? existingSnap.data() : {};
+        const actorId = firstNonEmptyValue(
+            normalizePossibleActorId(cancelledBy),
+            normalizePossibleActorId(staffId),
+            normalizePossibleActorId(operatorId),
+            normalizePossibleActorId(existingData?.lastActorId)
+        );
+        await db.collection("reservations").doc(String(bookId)).set(
+            enrichReservationDocument({
+                ...existingData,
+                id: String(bookId),
+                bookId: String(bookId),
+                status: "cancelled",
+                cancelReason: reason || "",
+                cancelTime: new Date().toISOString(),
+                lastEventType: "manual_cancel",
+                lastChangedFields: ["status", "cancelReason", "cancelTime"],
+                lastEventAt: new Date().toISOString(),
+                lastActorId: actorId || existingData.lastActorId || "",
+                lastActorSource: actorId ? "manual_request" : (existingData.lastActorSource || ""),
+                lastModifiedByStaffId: actorId || existingData.lastModifiedByStaffId || "",
+                lastModifiedBySource: actorId ? "manual_request" : (existingData.lastModifiedBySource || ""),
+                cancelledByStaffId: actorId || existingData.cancelledByStaffId || "",
+                cancelledBySource: actorId ? "manual_request" : (existingData.cancelledBySource || "")
+            }, {
+                companyId: getEffectiveCompanyId(existingData),
+                syncSource: "manual_cancel_booking",
+                syncMode: "manual"
+            }),
+            { merge: true }
+        );
+        try {
+            const cancelledDoc = { ...existingData, id: String(bookId), bookId: String(bookId), status: "cancelled", cancelTime: new Date().toISOString() };
+            await scheduleOutputUpdates([buildReservationOutputImpact(cancelledDoc)]);
+        } catch (e) {
+            console.warn("[cancelBooking] Output update failed:", e.message);
+        }
         console.log(`[cancelBooking] 예약 취소 완료: bookId=${bookId}`);
         res.json({ success: true });
     } catch (e) {
@@ -1877,343 +3255,46 @@ exports.cancelBooking = onRequest({ cors: true }, async (req, res) => {
 // ==========================================
 
 // 특정 날짜의 매출 스냅샷 생성 (미래 월별 매출 포함)
-async function createDailySalesLog(date) {
-    console.log(`📊 매출 일지 생성 시작: ${date}`);
 
-    // 1. 해당 날짜에 confirmed된 모든 예약 조회
-    const reservationsSnap = await db.collection("reservations")
-        .where("status", "==", "confirmed")
-        .get();
 
-    const allReservations = [];
-    reservationsSnap.forEach(doc => allReservations.push(doc.data()));
 
-    // ★ 미래 월별 매출 계산 (1박당 분배 방식 - RevenueDashboard와 동일)
-    const futureMonths = {};
-    const baseDate = dayjs(date).utcOffset(9);
-
-    // 2. 2026년 1월부터 (기록일 + 6개월)까지 데이터 순회
-    // (매일매일 1월~미래6개월까지의 누적/변동 데이터를 기록)
-    const startRecord = dayjs("2026-01-01");
-    const endRecord = dayjs(date).add(6, 'month');
-
-    let ptr = startRecord;
-    while (ptr.isBefore(endRecord) || ptr.isSame(endRecord, 'month')) {
-        const targetMonth = ptr.format('YYYY-MM');
-        futureMonths[targetMonth] = {
-            revenue: 0,           // 1박당 분배 매출
-            reservationCount: 0   // 해당 월에 숙박하는 예약 수
-        };
-        ptr = ptr.add(1, 'month');
-    }
-
-    // 각 예약별로 1박당 분배 계산
-    allReservations.forEach(reservation => {
-        if (!reservation.arrival || !reservation.departure) return;
-
-        const totalPrice = Number(reservation.totalPrice || reservation.price) || 0;
-        if (totalPrice <= 0) return;
-
-        // 총 박수 계산
-        const arrivalDate = dayjs(reservation.arrival);
-        const departureDate = dayjs(reservation.departure);
-        const totalNights = departureDate.diff(arrivalDate, 'day');
-
-        if (totalNights <= 0) return;
-
-        // 1박당 금액
-        const pricePerNight = totalPrice / totalNights;
-
-        // 각 월별로 분배
-        Object.keys(futureMonths).forEach(targetMonth => {
-            const monthStart = dayjs(`${targetMonth}-01`);
-            const monthEnd = monthStart.add(1, 'month');
-
-            // 예약 기간과 해당 월이 겹치는지 확인
-            // departure는 체크아웃 날이므로, 숙박은 arrival ~ departure-1일
-            if (departureDate.isAfter(monthStart) && arrivalDate.isBefore(monthEnd)) {
-                // 겹치는 구간 계산
-                const overlapStart = arrivalDate.isBefore(monthStart) ? monthStart : arrivalDate;
-                const lastNight = departureDate.subtract(1, 'day'); // 마지막 숙박일
-                const overlapEnd = lastNight.isAfter(monthEnd.subtract(1, 'day'))
-                    ? monthEnd.subtract(1, 'day')
-                    : lastNight;
-
-                if (overlapStart.isBefore(overlapEnd) || overlapStart.isSame(overlapEnd)) {
-                    // 겹치는 박수 (시작일부터 종료일까지 포함)
-                    const overlapNights = overlapEnd.diff(overlapStart, 'day') + 1;
-                    const overlapRevenue = pricePerNight * overlapNights;
-
-                    futureMonths[targetMonth].revenue += overlapRevenue;
-
-                    // 예약 건수는 해당 월에 숙박하면 1건으로 카운트 (중복 방지를 위해 Set 사용 필요시 추후 수정)
-                }
-            }
-        });
-
-        // 예약 건수 카운트 (해당 월에 숙박하면 1건)
-        Object.keys(futureMonths).forEach(targetMonth => {
-            const monthStart = dayjs(`${targetMonth}-01`);
-            const monthEnd = monthStart.add(1, 'month');
-
-            if (departureDate.isAfter(monthStart) && arrivalDate.isBefore(monthEnd)) {
-                futureMonths[targetMonth].reservationCount++;
-            }
-        });
-    });
-
-    // 로그 출력
-    Object.entries(futureMonths).forEach(([month, data]) => {
-        console.log(`  📅 ${month}: 매출 ¥${Math.round(data.revenue).toLocaleString()}, 예약 ${data.reservationCount}건`);
-    });
-
-    // 2. 체크인 매출 계산 (arrival === date)
-    const checkinReservations = allReservations.filter(r => r.arrival === date);
-    const checkinRevenue = checkinReservations.reduce((sum, r) => sum + (r.totalPrice || r.price || 0), 0);
-
-    // 3. 예약 접수 매출 계산 (bookDate === date)
-    const bookingReservations = allReservations.filter(r => r.bookDate === date);
-    const bookingRevenue = bookingReservations.reduce((sum, r) => sum + (r.totalPrice || r.price || 0), 0);
-
-    // 4. 신규 예약 상세 (bookDate === date) - 일일 보고서용
-    // ★ 중복 제거 강화 (bookId 우선, 없으면 apiReference, 마지막으로 guestName+arrival+building)
-    const uniqueBookings = new Map();
-    bookingReservations.forEach(r => {
-        // bookId가 가장 신뢰할 수 있는 키
-        let key = r.bookId;
-
-        // bookId가 없거나 유효하지 않으면 apiReference 사용
-        if (!key || key === 'undefined' || key === 'null') {
-            key = r.apiReference;
-        }
-
-        // 그래도 없으면 조합 키 사용 (같은 게스트가 같은 날 같은 건물에 예약하면 동일 건으로 처리)
-        if (!key || key === 'undefined' || key === 'null') {
-            key = `${(r.guestName || '').trim()}_${r.arrival}_${r.building}`;
-        }
-
-        if (key && !uniqueBookings.has(key)) {
-            uniqueBookings.set(key, r);
-        }
-    });
-    const newBookingsList = Array.from(uniqueBookings.values());
-    const newBookings = newBookingsList.length;
-
-    console.log(`📋 신규예약 중복제거: 원본 ${bookingReservations.length}건 → 최종 ${newBookings}건`);
-
-    // 플랫폼별 집계 (예약)
-    const bookingByPlatform = { Airbnb: 0, Booking: 0 };
-    newBookingsList.forEach(r => {
-        const platform = (r.platform || "").toLowerCase();
-        if (platform.includes("booking")) {
-            bookingByPlatform.Booking++;
-        } else {
-            bookingByPlatform.Airbnb++;
-        }
-    });
-
-    // 월별 집계 (예약) - stayMonth 기준
-    const bookingByMonth = {};
-    newBookingsList.forEach(r => {
-        const month = r.stayMonth || (r.arrival ? r.arrival.slice(0, 7) : null);
-        if (month) {
-            bookingByMonth[month] = (bookingByMonth[month] || 0) + 1;
-        }
-    });
-
-    // 5. 취소 상세 (cancelTime이 해당 날짜로 시작) - 일일 보고서용
-    const cancelledSnap = await db.collection("reservations")
-        .where("status", "==", "cancelled")
-        .get();
-
-    const cancelDocs = [];
-    cancelledSnap.forEach(doc => {
-        const data = doc.data();
-        if (data.cancelTime && data.cancelTime.slice(0, 10) === date) {
-            cancelDocs.push(data);
-        }
-    });
-
-    // 중복 제거 (bookId 기준)
-    const uniqueCancels = new Map();
-    cancelDocs.forEach(r => {
-        const key = r.bookId || r.refNum || `${r.guestName}_${r.arrival}`;
-        if (!uniqueCancels.has(key)) {
-            uniqueCancels.set(key, r);
-        }
-    });
-    const cancelList = Array.from(uniqueCancels.values());
-    const cancellations = cancelList.length;
-
-    // 플랫폼별 집계 (취소)
-    const cancelByPlatform = { Airbnb: 0, Booking: 0 };
-    cancelList.forEach(r => {
-        const platform = (r.platform || "").toLowerCase();
-        if (platform.includes("booking")) {
-            cancelByPlatform.Booking++;
-        } else {
-            cancelByPlatform.Airbnb++;
-        }
-    });
-
-    // 월별 집계 (취소)
-    const cancelByMonth = {};
-    cancelList.forEach(r => {
-        const month = r.stayMonth || (r.arrival ? r.arrival.slice(0, 7) : null);
-        if (month) {
-            cancelByMonth[month] = (cancelByMonth[month] || 0) + 1;
-        }
-    });
-
-    console.log(`📋 일일보고서 - 예약: ${newBookings}건 (에어${bookingByPlatform.Airbnb}/부킹${bookingByPlatform.Booking}), 취소: ${cancellations}건 (에어${cancelByPlatform.Airbnb}/부킹${cancelByPlatform.Booking})`);
-
-    // 6. 체크인/체크아웃 수
-    const checkins = checkinReservations.length;
-    const checkouts = allReservations.filter(r => r.departure === date).length;
-
-    // 7. 가동률 계산 (사노시 제외)
-    // 해당 날짜에 점유 중인 객실 수 / 전체 객실 수
-    let occupiedRooms = 0;
-    let totalRooms = 0;
-
-    // 건물별 상세 데이터
-    const buildings = {};
-
-    Object.entries(BUILDING_ROOMS).forEach(([building, rooms]) => {
-        if (building === "사노시") return; // 사노시 제외
-
-        const buildingRooms = {};
-        let buildingRevenue = 0;
-        let buildingOccupied = 0;
-        let buildingCheckins = 0;
-        let buildingCheckouts = 0;
-
-        rooms.forEach(room => {
-            const roomName = room.name;
-            totalRooms++;
-
-            // 해당 날짜에 이 객실이 점유되어 있는지 확인
-            // arrival <= date < departure (departure는 체크아웃 날이므로 제외)
-            const isOccupied = allReservations.some(r =>
-                r.building === building &&
-                r.room === roomName &&
-                r.arrival <= date &&
-                r.departure > date
-            );
-
-            if (isOccupied) {
-                occupiedRooms++;
-                buildingOccupied++;
-            }
-
-            // 해당 객실의 체크인 매출
-            const roomCheckins = checkinReservations.filter(r =>
-                r.building === building && r.room === roomName
-            );
-            const roomRevenue = roomCheckins.reduce((sum, r) => sum + (r.totalPrice || r.price || 0), 0);
-            buildingRevenue += roomRevenue;
-
-            // 체크인/체크아웃 카운트
-            const roomCheckinCount = roomCheckins.length;
-            const roomCheckoutCount = allReservations.filter(r =>
-                r.building === building && r.room === roomName && r.departure === date
-            ).length;
-            buildingCheckins += roomCheckinCount;
-            buildingCheckouts += roomCheckoutCount;
-
-            buildingRooms[roomName] = {
-                revenue: roomRevenue,
-                occupied: isOccupied,
-                checkin: roomCheckinCount > 0,
-                checkout: roomCheckoutCount > 0
-            };
-        });
-
-        const buildingOccupancy = rooms.length > 0 ? (buildingOccupied / rooms.length * 100) : 0;
-
-        buildings[building] = {
-            revenue: buildingRevenue,
-            occupancy: parseFloat(buildingOccupancy.toFixed(1)),
-            checkins: buildingCheckins,
-            checkouts: buildingCheckouts,
-            occupiedRooms: buildingOccupied,
-            totalRooms: rooms.length,
-            rooms: buildingRooms
-        };
-    });
-
-    const occupancyRate = totalRooms > 0 ? (occupiedRooms / totalRooms * 100) : 0;
-
-    // 8. 문서 저장
-    const salesLogData = {
-        date: date,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        isAutoGenerated: true,
-
-        summary: {
-            checkinRevenue: checkinRevenue,
-            bookingRevenue: bookingRevenue,
-            totalReservations: allReservations.length,
-            newBookings: newBookings,
-            cancellations: cancellations,
-            checkins: checkins,
-            checkouts: checkouts,
-            occupancyRate: parseFloat(occupancyRate.toFixed(1)),
-            occupiedRooms: occupiedRooms,
-            totalRooms: totalRooms
-        },
-
-        // ★ 미래 월별 매출 (구글 스프레드시트 대체)
-        futureMonths: futureMonths,
-
-        // ★ 일일 보고서 데이터 (아침 보고용)
-        dailyReport: {
-            bookings: {
-                total: newBookings,
-                byPlatform: bookingByPlatform,
-                byMonth: bookingByMonth
-            },
-            cancellations: {
-                total: cancellations,
-                byPlatform: cancelByPlatform,
-                byMonth: cancelByMonth
-            }
-        },
-
-        buildings: buildings,
-        memo: ""
-    };
-
-    // 기존 문서가 있으면 메모 유지
-    const existingDoc = await db.collection("dailySalesLog").doc(date).get();
-    if (existingDoc.exists) {
-        const existingData = existingDoc.data();
-        salesLogData.memo = existingData.memo || "";
-        salesLogData.createdAt = existingData.createdAt; // 최초 생성 시간 유지
-    }
-
-    await db.collection("dailySalesLog").doc(date).set(salesLogData);
-
-    const totalFutureRevenue = Object.values(futureMonths).reduce((sum, m) => sum + m.revenue, 0);
-    console.log(`✅ 매출 일지 저장 완료: ${date} (당일체크인: ¥${checkinRevenue}, 미래총합: ¥${totalFutureRevenue.toLocaleString()})`);
-    return salesLogData;
-}
-
-// 매일 자정 (도쿄 시간) 자동 스냅샷
-exports.dailySalesSnapshot = onSchedule({
-    schedule: "0 0 * * *",
-    timeZone: "Asia/Tokyo",
-    memory: "512MiB"
-}, async () => {
-    // 어제 날짜 기준 (자정에 실행되므로 어제 데이터 확정)
-    const yesterday = dayjs().utcOffset(9).subtract(1, 'day').format('YYYY-MM-DD');
-    console.log(`🕐 자동 매출 스냅샷 실행: ${yesterday}`);
-    await createDailySalesLog(yesterday);
-});
 
 // 수동 저장 API
-exports.saveSalesLogManual = onRequest({ cors: true, timeoutSeconds: 120, memory: "512MiB" }, async (req, res) => {
+// 날짜 범위 일괄 재생성 (startDate ~ endDate)
+exports.bulkRegenerateSalesLog = onRequest({ cors: true, timeoutSeconds: 540, memory: "1GiB" }, async (req, res) => {
+    try {
+        const { startDate, endDate } = req.body;
+        if (!startDate || !endDate) {
+            return res.status(400).json({ success: false, error: "startDate, endDate 필요" });
+        }
+
+        const results = [];
+        let current = dayjs(startDate).tz("Asia/Tokyo");
+        const end = dayjs(endDate).tz("Asia/Tokyo");
+
+        while (current.isBefore(end) || current.isSame(end, 'day')) {
+            const dateStr = current.format("YYYY-MM-DD");
+            try {
+                await createDailySalesLog(dateStr, { overwrite: true });
+                results.push({ date: dateStr, status: "ok" });
+                console.log(`[BulkRegen] ${dateStr} 완료`);
+            } catch (e) {
+                results.push({ date: dateStr, status: "error", error: e.message });
+                console.error(`[BulkRegen] ${dateStr} 실패:`, e.message);
+            }
+            current = current.add(1, 'day');
+            // Rate limit 방지
+            await new Promise(r => setTimeout(r, 200));
+        }
+
+        res.json({ success: true, total: results.length, results });
+    } catch (e) {
+        console.error("bulkRegenerateSalesLog Error:", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+exports.saveSalesLogManual = onRequest({ cors: true, timeoutSeconds: 120, memory: "1GiB" }, async (req, res) => {
     try {
         const { date } = req.body;
 
@@ -2221,13 +3302,13 @@ exports.saveSalesLogManual = onRequest({ cors: true, timeoutSeconds: 120, memory
         const targetDate = date || dayjs().utcOffset(9).format('YYYY-MM-DD');
 
         console.log(`📝 수동 매출 저장 요청: ${targetDate}`);
-        const result = await createDailySalesLog(targetDate);
+        const result = await createDailySalesLog(targetDate, { overwrite: true });
 
-        // 수동 저장인 경우 플래그 업데이트
-        await db.collection("dailySalesLog").doc(targetDate).update({
+        // 수동 저장인 경우 플래그 업데이트 (set+merge로 문서 없어도 안전)
+        await db.collection("dailySalesLog").doc(targetDate).set({
             isAutoGenerated: false,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+        }, { merge: true });
 
         res.json({
             success: true,
@@ -2267,17 +3348,6 @@ exports.saveSalesLogMemo = onRequest({ cors: true }, async (req, res) => {
 // ==========================================
 // 수동 동기화 트리거 (비상용)
 // ==========================================
-exports.manualPriceSync = onRequest({ cors: true, timeoutSeconds: 540 }, async (req, res) => {
-    try {
-        console.log("수동 가격 동기화 시작...");
-        const result = await syncAllPrices();
-        res.json({ success: true, result });
-    } catch (e) {
-        console.error("Manual Sync Error:", e);
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
-
 // ==========================================
 // 5) SALES LOG LOGIC (Daily Distribution)
 // ==========================================
@@ -2290,6 +3360,8 @@ async function createDailySalesLog(targetDateStr, { overwrite = false } = {}) {
             return { skipped: true, existing: existingDoc.data().monthlyStats };
         }
     }
+
+    await assertReservationDataReady("createDailySalesLog");
 
     // 1. Target Period: This Month ~ +5 Months (Total 6 Months)
     // targetDateStr는 "기록일"(Snapshot Date)입니다.
@@ -2309,6 +3381,7 @@ async function createDailySalesLog(targetDateStr, { overwrite = false } = {}) {
     // 쿼리: departure > start AND arrival < end
     // Firestore 복합 쿼리 제약으로 인해, start보다 늦게 끝나는 것들을 가져와서 메모리 필터링
     const snapshot = await db.collection("reservations")
+        .where("companyId", "==", DEFAULT_COMPANY_ID)
         .where("departure", ">", startStr)
         .where("status", "==", "confirmed")
         .get();
@@ -2330,12 +3403,11 @@ async function createDailySalesLog(targetDateStr, { overwrite = false } = {}) {
         // ★ Exclude Sano (사노시) and Okubo A (오쿠보A동) from statistics
         if (data.building === "사노시" || data.building === "오쿠보A동") return;
 
-        // ★ Exclude Daikyocho (다이쿄초) - 예약일(bookDate) 기준
-        // 2026-01-25까지 예약한 건 체크인 날짜 상관없이 우리 매출
-        // 2026-01-26 이후 예약한 건 제외 (매각 후 다른 업체)
-        const DAIKYO_SOLD_DATE = "2026-01-26";
-        const bookDate = data.bookDate || data.arrival;  // 예약일 우선, 없으면 체크인일
-        if (data.building === "다이쿄초" && bookDate >= DAIKYO_SOLD_DATE) return;
+        // ★ 다이쿄초 전체 제외 (매각)
+        if (data.building === "다이쿄초") return;
+
+        // ★ 수기 예약 제외 (에어비앤비, 부킹닷컴만 포함)
+        if (data.referer !== "Airbnb" && data.referer !== "Booking.com") return;
 
         // 도착일이 범위 이후면 스킵
         if (data.arrival >= endStr) return;
@@ -2362,6 +3434,9 @@ async function createDailySalesLog(targetDateStr, { overwrite = false } = {}) {
                     if (stats[monthKey]) {
                         stats[monthKey].revenue += pricePerNight;
                         stats[monthKey].nights += 1;
+                        // [DEBUG] 건물별 매출 추적
+                        if (!stats[monthKey]._buildingDebug) stats[monthKey]._buildingDebug = {};
+                        stats[monthKey]._buildingDebug[data.building || 'UNKNOWN'] = (stats[monthKey]._buildingDebug[data.building || 'UNKNOWN'] || 0) + pricePerNight;
                         // occupancy는 방 개수 대비 %지만, 여기서는 예약된 박수(nights) 총합으로 일단 기록
                         // 프론트엔드나 2차 가공시 총 방 개수(47실?)로 나누어 % 계산 가능
                     }
@@ -2410,10 +3485,39 @@ async function createDailySalesLog(targetDateStr, { overwrite = false } = {}) {
     // 5. Save to Firestore
     await db.collection("sales_logs").doc(targetDateStr).set({
         recordedAt: admin.firestore.FieldValue.serverTimestamp(),
+        companyId: DEFAULT_COMPANY_ID,
         monthlyStats: stats
     });
 
+    // [DEBUG] 건물별 매출 출력
+    const debugMonth = Object.keys(stats).find(k => k === dayjs(targetDateStr).format("YYYY-MM"));
+    if (debugMonth && stats[debugMonth]._buildingDebug) {
+        const sorted = Object.entries(stats[debugMonth]._buildingDebug).sort((a, b) => b[1] - a[1]);
+        console.log(`[DEBUG] ${debugMonth} 건물별 매출:`);
+        sorted.forEach(([b, rev]) => console.log(`  ${b}: ¥${Math.round(rev).toLocaleString()}`));
+    }
     console.log(`[SalesLog] ${targetDateStr} 저장 완료.`, stats);
+
+    // ★ 6. Also ensure data exists in 'dailySalesLog' collection for manual trigger (memo support)
+    const dailyLogRef = db.collection("dailySalesLog").doc(targetDateStr);
+    const dailyLogSnapshot = await dailyLogRef.get();
+
+    if (!dailyLogSnapshot.exists) {
+        await dailyLogRef.set({
+            date: targetDateStr,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            isAutoGenerated: true,
+            memo: ""
+        });
+        console.log(`[SalesLog] DailySalesLog 문서 생성 완료: ${targetDateStr}`);
+    } else {
+        // Update updated_at just in case
+        await dailyLogRef.update({
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+    }
+
     return stats;
 }
 
@@ -2422,10 +3526,10 @@ exports.dailySalesSnapshot = onSchedule({
     schedule: "0 0 * * *", // 매일 00:00
     timeZone: "Asia/Tokyo",
     timeoutSeconds: 540,
-    memory: "512MiB"
+    memory: "1GiB"
 }, async (event) => {
-    const today = dayjs().tz("Asia/Tokyo").format("YYYY-MM-DD");
-    await createDailySalesLog(today);
+    const yesterday = dayjs().tz("Asia/Tokyo").subtract(1, "day").format("YYYY-MM-DD");
+    await createDailySalesLog(yesterday);
 });
 
 // 수동 트리거 (HTTP)
@@ -2513,305 +3617,206 @@ exports.deleteSalesLog = onRequest({ cors: true }, async (req, res) => {
 });
 
 // ==========================================
-// 게스트 메시지 관리 (Guest Messages - Beds24 API V2)
+// 6) SCHEDULED DAILY REPORT (Premium Styling)
 // ==========================================
 
 /**
- * 여러 예약의 메시지 조회
- * POST /getBookingMessages
- * Body: { bookingIds: string[] }
+ * 매일 아침 9시(한국 시간)에 구글 시트 보고서를 업데이트합니다.
+ * 'Daily_Log' 탭에 프리미엄 대시보드와 당월 데이터를 생성합니다.
+ * ★ 월간 시트/노션은 스케줄 전체 재계산만 수행 (이벤트 기반 부분 갱신 없음). 데이터 일치는 당일 슬랙 리포트·매출일지로 보완.
  */
-exports.getBookingMessages = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, res) => {
+exports.scheduledDailyReport = onSchedule({
+    schedule: "45 8 * * *", // 매일 08:45 JST (9시 출근 전 안정 반영)
+    timeZone: "Asia/Tokyo",
+    timeoutSeconds: 540,
+    memory: "512MiB"
+}, async () => {
+    await runScheduledDailyReport();
+});
+
+/** 노션 연동 테스트: 토큰 여부 + 한 페이지에 블록 추가 시도 → 결과 JSON 반환 */
+exports.testNotionSync = onRequest({ cors: true, timeoutSeconds: 30 }, async (req, res) => {
     try {
-        const { bookingIds } = req.body;
-
-        if (!bookingIds || !Array.isArray(bookingIds) || bookingIds.length === 0) {
-            return res.status(400).json({ success: false, error: "bookingIds 배열이 필요합니다" });
-        }
-
-        const token = await getBeds24Token();
-        const messageThreads = [];
-
-        // 각 booking ID에 대해 메시지 조회
-        for (const bookingId of bookingIds) {
-            try {
-                const response = await axios.get(
-                    `https://beds24.com/api/v2/bookings/${bookingId}/messages`,
-                    {
-                        headers: {
-                            "accept": "application/json",
-                            "token": token
-                        }
-                    }
-                );
-
-                const messages = response.data.data || [];
-
-                if (messages.length > 0) {
-                    // 메시지 포맷 변환
-                    const formattedMessages = messages.map(msg => ({
-                        text: msg.message || msg.text || '',
-                        from: msg.type === 'guest' ? 'guest' : 'host',
-                        time: msg.createdAt || msg.time || new Date().toISOString(),
-                        senderName: msg.senderName || (msg.type === 'host' ? 'Staff' : 'Guest'),
-                        messageId: msg.id || null
-                    }));
-
-                    // 시간순 정렬 (오래된 것부터)
-                    formattedMessages.sort((a, b) => new Date(a.time) - new Date(b.time));
-
-                    // 마지막 메시지
-                    const lastMessage = formattedMessages[formattedMessages.length - 1];
-
-                    // 읽지 않은 메시지 확인 (guest 메시지 중 읽지 않은 것)
-                    const hasUnread = messages.some(msg =>
-                        msg.type === 'guest' && msg.read === false
-                    );
-
-                    messageThreads.push({
-                        bookingId,
-                        messages: formattedMessages,
-                        messageCount: formattedMessages.length,
-                        lastMessage: lastMessage.text,
-                        lastMessageTime: lastMessage.time,
-                        hasUnread
-                    });
-                }
-            } catch (bookingError) {
-                // 개별 예약 조회 실패는 로그만 남기고 계속 진행
-                console.warn(`메시지 조회 실패 (bookingId: ${bookingId}):`, bookingError.message);
-            }
-        }
-
-        console.log(`✉️ 메시지 조회 완료: ${messageThreads.length}개 스레드 (총 ${bookingIds.length}개 예약)`);
-
-        res.json({
-            success: true,
-            messages: messageThreads,
-            totalThreads: messageThreads.length,
-            queriedBookings: bookingIds.length
-        });
+        const pageId = NOTION_PAGES.dailyLog || NOTION_PAGES.salesLog;
+        const result = await testNotionConnection(pageId);
+        res.json(result);
     } catch (e) {
-        console.error("getBookingMessages Error:", e.message);
-        res.status(500).json({ success: false, error: e.message });
+        res.status(500).json({ ok: false, error: e.message });
     }
 });
 
-/**
- * 예약에 메시지 전송
- * POST /sendBookingMessage
- * Body: { bookingId: string, message: string, senderName?: string }
- */
-exports.sendBookingMessage = onRequest({ cors: true, timeoutSeconds: 60 }, async (req, res) => {
+/** 구글 시트 일일 리포트 지금 한 번 실행 (임시 수동 갱신용). 노션 7종(일일/취소/매출일지/플랫폼/인원현황 + 매출·가동률 대시보드) 동기화 포함 */
+exports.runDailyReportNow = onRequest({ cors: true, timeoutSeconds: 540, memory: "1GiB" }, async (req, res) => {
     try {
-        const { bookingId, message, senderName } = req.body;
-
-        if (!bookingId || !message) {
-            return res.status(400).json({
-                success: false,
-                error: "bookingId와 message가 필요합니다"
+        await runScheduledDailyReport();
+        const dashboardResult = await runNotionDashboardSync();
+        if (NOTION_PAGES.paxOccupancy) {
+            const tokyoNow = dayjs().tz("Asia/Tokyo");
+            let paxData = null;
+            try {
+                const { runPaxOccupancyReport } = require("./modules/paxOccupancyReport");
+                const paxResult = await runPaxOccupancyReport();
+                paxData = paxResult.paxDataForNotion || null;
+            } catch (paxErr) {
+                console.warn("runPaxOccupancyReport (인원현황) 실패, 노션은 요약만 반영:", paxErr.message);
+            }
+            await syncNotionPaxOccupancy(NOTION_PAGES.paxOccupancy, {
+                title: "인원현황",
+                tokyoNow,
+                summaryText: paxData ? "수동 갱신으로 구글 시트·노션 동기화됨." : "인원현황 데이터 생성 실패. 매일 08:50 JST PAX 리포트 후 반영됩니다.",
+                paxData
             });
         }
-
-        const token = await getBeds24Token();
-
-        // Beds24 API V2로 메시지 전송
-        const response = await axios.post(
-            `https://beds24.com/api/v2/bookings/${bookingId}/messages`,
-            {
-                message: message.trim(),
-                type: 'host',
-                senderName: senderName || 'Staff'
-            },
-            {
-                headers: {
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                    "token": token
-                }
-            }
-        );
-
-        console.log(`📤 메시지 전송 완료: bookingId=${bookingId}`);
-
+        const notionTest = await testNotionConnection(NOTION_PAGES.dailyLog || NOTION_PAGES.salesLog);
         res.json({
             success: true,
-            messageId: response.data.id || null,
-            sentAt: new Date().toISOString()
+            message: "Google Sheet daily report updated",
+            notionTest: notionTest,
+            ...(dashboardResult && dashboardResult.salesDashboardError && { notionSalesDashboardError: dashboardResult.salesDashboardError })
         });
     } catch (e) {
-        console.error("sendBookingMessage Error:", e.message);
-
-        // Beds24 API 에러 상세 정보 추출
-        let errorDetail = e.message;
-        if (e.response?.data) {
-            errorDetail = JSON.stringify(e.response.data);
-        }
-
-        res.status(500).json({
-            success: false,
-            error: errorDetail
-        });
-    }
-});
-
-/**
- * 수동 메시지 동기화 트리거 (사용자 요청)
- * POST /triggerMessageSync
- * Body: { companyId?: string } - 특정 회사만 동기화, 없으면 전체
- */
-exports.triggerMessageSync = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, res) => {
-    try {
-        const { companyId } = req.body;
-
-        console.log(`🔄 수동 메시지 동기화 시작 (companyId: ${companyId || 'ALL'})`);
-
-        const result = await syncBookingMessages(companyId);
-
-        res.json({
-            success: true,
-            ...result,
-            message: `메시지 동기화 완료: ${result.syncedCount}건`
-        });
-    } catch (e) {
-        console.error("triggerMessageSync Error:", e.message);
+        console.error("runDailyReportNow:", e);
         res.status(500).json({ success: false, error: e.message });
     }
 });
 
-/**
- * 모든 예약의 메시지를 Beds24에서 동기화하여 Firestore에 저장
- * 15분 자동 동기화에서 호출됨
- * @param {string} targetCompanyId - 특정 회사만 동기화 (선택)
- */
-async function syncBookingMessages(targetCompanyId = null) {
-    try {
-        console.log('📬 메시지 동기화 시작...');
+exports.scheduledPlatformAnalysisHourly = scheduledPlatformAnalysisHourly;
+exports.scheduledPaxOccupancyReport = scheduledPaxOccupancyReport;
+exports.scheduledMonthlyBriefingSetup = scheduledMonthlyBriefingSetup;
 
-        // 1. Firestore에서 confirmed 상태의 모든 예약 조회
-        const reservationsSnap = await db.collection("reservations")
-            .where("status", "==", "confirmed")
-            .get();
+/** 매출·가동률 대시보드 요약을 노션에 동기화 (매일 09:00 JST). 반환: { salesDashboardError? } */
+async function runNotionDashboardSync() {
+    let salesDashboardError = null;
+    const tokyoNow = dayjs().tz("Asia/Tokyo");
+    const year = tokyoNow.year();
+    const month = tokyoNow.month() + 1;
+    const monthStart = `${year}-${String(month).padStart(2, "0")}-01`;
+    const monthEnd = dayjs(`${year}-${String(month).padStart(2, "0")}-01`).endOf("month").format("YYYY-MM-DD");
+    const daysInMonth = dayjs(monthStart).daysInMonth();
 
-        const bookingIds = new Set();
-        const reservationMap = new Map();
+    let totalRevenue = 0;
+    let bookingCount = 0;
+    let occupiedRoomNights = 0;
 
-        reservationsSnap.forEach(doc => {
-            const data = doc.data();
-            // 특정 회사만 필터링 (옵션)
-            if (targetCompanyId && data.companyId !== targetCompanyId) {
-                return;
-            }
-            // OTA 예약만 (bookId가 있고 platform이 Manual이 아닌 것)
-            if (data.bookId && data.platform && data.platform !== 'Manual') {
-                bookingIds.add(data.bookId);
-                reservationMap.set(data.bookId, {
-                    companyId: data.companyId,
-                    guestName: data.guestName,
-                    guestCountry: data.guestCountry || data.guestCountry2 || '',
-                    building: data.building,
-                    room: data.room,
-                    arrival: data.arrival,
-                    departure: data.departure,
-                    platform: data.platform
-                });
-            }
-        });
+    const snap = await db.collection("reservations")
+        .where("companyId", "==", DEFAULT_COMPANY_ID)
+        .where("status", "==", "confirmed")
+        .where("stayMonth", "==", `${year}-${String(month).padStart(2, "0")}`)
+        .get();
 
-        if (bookingIds.size === 0) {
-            console.log('⚠️ 메시지 동기화할 OTA 예약 없음');
-            return { success: true, syncedCount: 0 };
-        }
-
-        const token = await getBeds24Token();
-        let syncedCount = 0;
-        let errorCount = 0;
-
-        // 2. 각 예약의 메시지 조회 및 Firestore 저장
-        for (const bookingId of bookingIds) {
-            try {
-                const response = await axios.get(
-                    `https://beds24.com/api/v2/bookings/${bookingId}/messages`,
-                    {
-                        headers: {
-                            "accept": "application/json",
-                            "token": token
-                        }
-                    }
-                );
-
-                const messages = response.data.data || [];
-                const reservation = reservationMap.get(bookingId);
-
-                if (!reservation || !reservation.companyId) {
-                    console.warn(`⚠️ companyId 없음: bookingId=${bookingId}`);
-                    continue;
-                }
-
-                // 메시지 포맷 변환
-                const formattedMessages = messages.map(msg => ({
-                    text: msg.message || msg.text || '',
-                    from: msg.type === 'guest' ? 'guest' : 'host',
-                    time: msg.createdAt || msg.time || new Date().toISOString(),
-                    senderName: msg.senderName || (msg.type === 'host' ? 'Staff' : 'Guest'),
-                    messageId: msg.id || null,
-                    read: msg.read !== false // 기본값 true
-                }));
-
-                // 시간순 정렬
-                formattedMessages.sort((a, b) => new Date(a.time) - new Date(b.time));
-
-                // 마지막 메시지 및 읽지 않은 메시지 확인
-                const lastMessage = formattedMessages.length > 0
-                    ? formattedMessages[formattedMessages.length - 1]
-                    : null;
-
-                const hasUnread = messages.some(msg =>
-                    msg.type === 'guest' && msg.read === false
-                );
-
-                // Firestore에 저장 (문서 ID: companyId_bookingId)
-                const docId = `${reservation.companyId}_${bookingId}`;
-                await db.collection("booking_messages").doc(docId).set({
-                    companyId: reservation.companyId,
-                    bookingId: bookingId,
-                    guestName: reservation.guestName,
-                    guestCountry: reservation.guestCountry,
-                    building: reservation.building,
-                    room: reservation.room,
-                    arrival: reservation.arrival,
-                    departure: reservation.departure,
-                    platform: reservation.platform,
-                    messages: formattedMessages,
-                    messageCount: formattedMessages.length,
-                    lastMessage: lastMessage ? lastMessage.text : '',
-                    lastMessageTime: lastMessage ? lastMessage.time : null,
-                    lastMessageFrom: lastMessage ? lastMessage.from : null,
-                    hasUnread: hasUnread,
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                syncedCount++;
-            } catch (bookingError) {
-                // 개별 예약 실패는 로그만 남기고 계속 진행
-                console.warn(`⚠️ 메시지 동기화 실패 (bookingId: ${bookingId}):`, bookingError.message);
-                errorCount++;
-            }
-        }
-
-        console.log(`✅ 메시지 동기화 완료: ${syncedCount}건 성공, ${errorCount}건 실패 (총 ${bookingIds.size}건)`);
-
-        return {
-            success: true,
-            syncedCount,
-            errorCount,
-            totalBookings: bookingIds.size
-        };
-    } catch (e) {
-        console.error("syncBookingMessages Error:", e.message);
-        return {
-            success: false,
-            error: e.message
-        };
+    const EXCLUDED = new Set(["다이쿄초"]);
+    let totalRooms = 0;
+    for (const [bName, rooms] of Object.entries(BUILDING_ROOMS)) {
+        if (EXCLUDED.has(bName)) continue;
+        totalRooms += rooms.length;
     }
+    const totalRoomNights = totalRooms * daysInMonth;
+
+    snap.docs.forEach((doc) => {
+        const d = doc.data();
+        const rev = Number(d.totalPrice ?? d.price ?? 0) || 0;
+        totalRevenue += rev;
+        bookingCount += 1;
+        const arrival = d.arrival ? dayjs(d.arrival) : null;
+        const departure = d.departure ? dayjs(d.departure) : null;
+        if (arrival && departure) {
+            const nights = Math.max(0, departure.diff(arrival, "day"));
+            occupiedRoomNights += nights;
+        }
+    });
+
+    const occupancyPct = totalRoomNights > 0 ? ((occupiedRoomNights / totalRoomNights) * 100).toFixed(1) : "0";
+
+    const salesSummary = `당월(${year}-${String(month).padStart(2, "0")}) 예약 ${bookingCount}건 · 누적 매출 ¥${totalRevenue.toLocaleString()}`;
+    const occSummary = `당월 가동률 ${occupancyPct}% (점유 ${occupiedRoomNights} room-nights / 전체 ${totalRoomNights})`;
+
+    const monthlyReports = [];
+    const startYear = 2026;
+    const endYear = tokyoNow.year();
+    const endMonth = tokyoNow.month() + 1;
+    try {
+        for (let y = startYear; y <= endYear; y++) {
+            const startM = y === startYear ? 1 : 1;
+            const endM = y === endYear ? endMonth : 12;
+            for (let m = startM; m <= endM; m++) {
+                const yearMonth = `${y}-${String(m).padStart(2, "0")}`;
+                const salesData = await computeRevenueDashboardData(db, {
+                    companyId: DEFAULT_COMPANY_ID,
+                    BUILDING_ROOMS,
+                    forYearMonth: yearMonth
+                });
+                let chartUrl = null;
+                let buildingChartUrl = null;
+                if (salesData && Array.isArray(salesData.monthlySeries) && salesData.monthlySeries.length > 0) {
+                    chartUrl = await getMonthlyRevenueChartUrl(salesData.monthlySeries, yearMonth);
+                }
+                if (salesData && Array.isArray(salesData.buildingBreakdown) && salesData.buildingBreakdown.length > 0) {
+                    buildingChartUrl = await getBuildingRevenueChartUrl(salesData.buildingBreakdown, yearMonth);
+                }
+                monthlyReports.push({ yearMonth, salesData, chartUrl, buildingChartUrl });
+            }
+        }
+    } catch (e) {
+        console.warn("[Notion] Sales dashboard data/chart:", e.message);
+    }
+
+    const runReportUrl = process.env.REPORT_BASE_URL ? `${process.env.REPORT_BASE_URL}/runDailyReportNow` : null;
+    const appDashboardUrl = process.env.APP_BASE_URL ? `${process.env.APP_BASE_URL.replace(/\/$/, "")}/#/revenue` : null;
+
+    if (NOTION_PAGES.salesDashboard) {
+        try {
+            await syncNotionSalesDashboard(NOTION_PAGES.salesDashboard, {
+                tokyoNow,
+                summaryText: salesSummary,
+                monthlyReports,
+                runReportUrl,
+                appDashboardUrl
+            });
+        } catch (e) {
+            salesDashboardError = e.message || String(e);
+            console.error("syncNotionSalesDashboard 실패:", e.message, e.stack);
+        }
+    }
+    // 가동률 대시보드 페이지는 비워 둠 (나중에 다른 보고서용으로 사용할 수 있도록 sync 안 함)
+    // if (NOTION_PAGES.occupancyDashboard) {
+    //     await syncNotionOccupancyDashboard(NOTION_PAGES.occupancyDashboard, { tokyoNow, summaryText: occSummary });
+    // }
+    return salesDashboardError ? { salesDashboardError } : {};
 }
+
+exports.scheduledNotionDashboardSync = onSchedule({
+    schedule: "0 9 * * *",
+    timeZone: "Asia/Tokyo",
+    timeoutSeconds: 120,
+    memory: "256MiB"
+}, async () => {
+    try {
+        await runNotionDashboardSync();
+        console.log("✅ [Notion] 매출·가동률 대시보드 동기화 완료");
+    } catch (e) {
+        console.error("❌ [Notion] Dashboard sync failed:", e.message);
+    }
+});
+
+exports.scheduledSlackDailyReport = scheduledSlackDailyReport;
+exports.sendSlackDailyReportManual = sendSlackDailyReportManual;
+exports.scheduledSlackCleaningReport = scheduledSlackCleaningReport;
+exports.sendSlackCleaningReportManual = sendSlackCleaningReportManual;
+
+exports.scheduledMonthlyNotionReport = scheduledMonthlyNotionReport;
+exports.sendNotionReport = sendNotionReport;
+
+// 리뷰 수동 동기화 (날짜 범위 지정)
+exports.syncReviewsManual = onRequest({ cors: true, timeoutSeconds: 540, memory: "512MiB" }, async (req, res) => {
+    try {
+        const { companyId, fromDate, toDate } = req.body;
+        if (!companyId) return res.status(400).json({ success: false, error: "Missing companyId" });
+        const from = fromDate || dayjs().tz("Asia/Tokyo").subtract(30, "day").format("YYYY-MM-DD");
+        console.log(`🔄 [syncReviewsManual] fromDate=${from}, toDate=${toDate || "auto"}, companyId=${companyId}`);
+        const synced = await syncAllReviews(companyId, from, { insertOnly: false, toDate: toDate || null });
+        res.json({ success: true, synced });
+    } catch (e) {
+        console.error("syncReviewsManual:", e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});

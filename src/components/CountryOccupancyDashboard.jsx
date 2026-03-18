@@ -8,7 +8,7 @@ import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, CartesianGrid, Toolti
 const COUNTRY_NAMES = {
   // Korea
   'KR': 'South Korea',
-  'KO': 'South Korea',
+  // 'KO' 제거 - 'ko'는 ISO 639-1 언어 코드(한국어)이며 국적 코드가 아님
 
   // Asia
   'JP': 'Japan',
@@ -144,8 +144,10 @@ const COUNTRY_NAMES = {
   'SOUTH KOREA': 'South Korea',
 
   // Abbreviations and special cases
-  'JA': 'Japan',
-  'ZH': 'China',
+  // 언어 코드 → Unknown 처리 (ISO 639-1 언어 코드는 국적 코드가 아님)
+  'KO': 'Unknown', // 한국어 언어 코드 → Unknown
+  'JA': 'Unknown', // 일본어 언어 코드 → Unknown
+  'ZH': 'China', // 'zh'는 중국어 언어 코드이지만 Beds24에서 중국 국적으로 사용하는 경우가 있음
   '19': 'Unclassified',
   'UNDEFINED': 'Unknown',
   'NULL': 'Unknown',
@@ -184,48 +186,43 @@ const CountryOccupancyDashboard = () => {
       fetchCountryData();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPeriod]);
+  }, [selectedPeriod, companyId]);
 
   const fetchCountryData = async () => {
     setLoading(true);
     try {
-      // 날짜 범위 계산
-      const today = new Date();
-      let startDate = null;
-
-      if (selectedPeriod === 'thisYear') {
-        startDate = `${today.getFullYear()}-01-01`;
-      } else if (selectedPeriod === 'thisMonth') {
-        const year = today.getFullYear();
-        const month = String(today.getMonth() + 1).padStart(2, '0');
-        startDate = `${year}-${month}-01`;
-      }
-
-      // 쿼리 생성 (확정된 예약만)
-      let q;
       if (!companyId) {
         console.warn('⚠️ No companyId for CountryOccupancyDashboard');
         setLoading(false);
         return;
       }
 
-      if (startDate) {
-        q = query(
-          collection(db, "reservations"),
-          where("companyId", "==", companyId),
-          where("status", "==", "confirmed"),
-          where("arrival", ">=", startDate)
-        );
-      } else {
-        q = query(
-          collection(db, "reservations"),
-          where("companyId", "==", companyId),
-          where("status", "==", "confirmed")
-        );
-      }
+      // confirmed 예약만 로드 (취소/문의/블랙아웃 제외)
+      const q = query(
+        collection(db, "reservations"),
+        where("companyId", "==", companyId),
+        where("status", "==", "confirmed")
+      );
 
       const snapshot = await getDocs(q);
+
+      // 날짜 범위 계산 (클라이언트 필터링용)
+      const today = new Date();
+      let startDate = null;
+      let endDate = null;
+
+      if (selectedPeriod === 'thisYear') {
+        const year = today.getFullYear();
+        startDate = `${year}-01-01`;
+        endDate = `${year}-12-31`;
+      } else if (selectedPeriod === 'thisMonth') {
+        const year = today.getFullYear();
+        const month = String(today.getMonth() + 1).padStart(2, '0');
+        // 해당 월의 마지막 날 계산
+        const lastDay = new Date(year, today.getMonth() + 1, 0).getDate();
+        startDate = `${year}-${month}-01`;
+        endDate = `${year}-${month}-${String(lastDay).padStart(2, '0')}`;
+      }
 
       // ★ 중복 제거: bookId 기준으로 유니크하게 (아라키초A, 가부키초, 다카다노바바 계정 중복 방지)
       const uniqueMap = new Map();
@@ -239,9 +236,20 @@ const CountryOccupancyDashboard = () => {
         }
       });
 
-      const reservations = Array.from(uniqueMap.values());
+      let reservations = Array.from(uniqueMap.values());
 
-      console.log(`🌍 Country Analysis: Total ${snapshot.docs.length} docs → ${reservations.length} unique confirmed reservations after deduplication`);
+      // 다이쿄초 제외
+      reservations = reservations.filter(r => r.building !== '다이쿄초');
+
+      // 클라이언트 날짜 필터링 (arrival 기준, 시작/종료 모두 적용)
+      if (startDate) {
+        reservations = reservations.filter(r => r.arrival && r.arrival >= startDate);
+      }
+      if (endDate) {
+        reservations = reservations.filter(r => r.arrival && r.arrival <= endDate);
+      }
+
+      console.log(`🌍 Country Analysis: Total ${snapshot.docs.length} docs → ${reservations.length} unique confirmed reservations (period: ${selectedPeriod}, startDate: ${startDate || 'all'})`);
 
       // Debug: Check first 3 reservations
       if (reservations.length > 0) {
@@ -261,9 +269,10 @@ const CountryOccupancyDashboard = () => {
       const unknownSamples = []; // Collect unknown data samples
 
       reservations.forEach(r => {
-        const rawCountry = r.guestCountry || 'UNKNOWN';
+        // guestCountry 우선, 없으면 guestCountry2 fallback
+        const rawCountry = r.guestCountry || r.guestCountry2 || 'UNKNOWN';
         const countryCode = String(rawCountry).toUpperCase().trim();
-        const countryName = COUNTRY_NAMES[countryCode] || (countryCode === 'UNKNOWN' ? 'Unknown' : countryCode);
+        const countryName = COUNTRY_NAMES[countryCode] || (countryCode === 'UNKNOWN' || countryCode === '' ? 'Unknown' : countryCode);
 
         // Collect unknown data samples (first 10)
         if (countryName === 'Unknown' && unknownSamples.length < 10) {
@@ -271,6 +280,7 @@ const CountryOccupancyDashboard = () => {
             bookId: r.bookId,
             guestName: r.guestName,
             guestCountry: r.guestCountry,
+            guestCountry2: r.guestCountry2,
             rawValue: rawCountry,
             building: r.building,
             room: r.room
@@ -288,22 +298,38 @@ const CountryOccupancyDashboard = () => {
         console.log(`⚠️ 'Unknown' country data samples (${unknownSamples.length}):`, unknownSamples);
       }
 
-      // 국가별 데이터 정렬 (예약 건수 내림차순)
+      // 전체 raw country 값 분포 로그 (디버그용)
+      const rawCountryDist = {};
+      reservations.forEach(r => {
+        const val = (r.guestCountry || r.guestCountry2 || '__EMPTY__').trim();
+        rawCountryDist[val] = (rawCountryDist[val] || 0) + 1;
+      });
+      const sorted = Object.entries(rawCountryDist).sort((a, b) => b[1] - a[1]);
+      console.log('📊 Raw guestCountry 분포 (상위 20):', sorted.slice(0, 20));
+
+      // 국가별 데이터 정렬 (예약 건수 내림차순, Unknown은 맨 뒤)
       const countryArray = Object.entries(countryMap)
         .map(([name, count]) => ({
           name,
           count,
           percentage: ((count / reservations.length) * 100).toFixed(1)
         }))
-        .sort((a, b) => b.count - a.count);
+        .sort((a, b) => {
+          if (a.name === 'Unknown') return 1;
+          if (b.name === 'Unknown') return -1;
+          return b.count - a.count;
+        });
 
       setCountryData(countryArray);
       setTotalReservations(reservations.length);
 
-      // Guest size aggregation (based on numAdult)
+      // Guest size aggregation (numAdult + numChild, 베드24 客数 기준)
       const guestSizeMap = {};
       reservations.forEach(r => {
-        const size = r.numAdult || 1; // Default 1 guest
+        const adults = r.numAdult || 0;
+        const children = r.numChild || 0;
+        const total = adults + children;
+        const size = total > 0 ? total : 1; // 0인 경우 최소 1명
         const key = size === 1 ? '1 Guest' : `${size} Guests`;
 
         // Debug: Log reservations with 12+ guests
