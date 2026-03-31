@@ -3,9 +3,9 @@ import React, { useState, useEffect } from 'react';
 import { collection, getDocs, query, where } from "firebase/firestore";
 import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
-import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
+import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 
-import { BUILDING_ORDER, BUILDING_NAMES_EN, EXCLUDED_BUILDING_UI, ACTIVE_BUILDING_ORDER } from '../constants/buildingData';
+import { BUILDING_NAMES_EN, EXCLUDED_BUILDING_UI, ACTIVE_BUILDING_ORDER } from '../constants/buildingData';
 
 const getBuildingNameEN = (koreanName) => BUILDING_NAMES_EN[koreanName] || koreanName;
 
@@ -18,7 +18,6 @@ const getRoomNameEN = (koreanRoom) => {
   return koreanRoom.replace("호", "").replace(/^(\d+)/, "Room $1");
 };
 
-const getActiveBuildingOrder = () => ACTIVE_BUILDING_ORDER;
 const ACTIVE_BUILDINGS = ACTIVE_BUILDING_ORDER;
 
 // 각 건물의 객실 수 (객실 리스트의 길이)

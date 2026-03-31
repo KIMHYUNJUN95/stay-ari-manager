@@ -81,7 +81,7 @@ function MaintenanceScreen({ message }) {
 
 // 점검 상태를 감시하고, 점검 중이면 해당 화면으로 교체
 export default function MaintenanceGuard({ children }) {
-  const { user, userData, companyId, loading } = useUser();
+  const { user, companyId, loading } = useUser();
   const [maintenance, setMaintenance] = useState(null); // null = 로딩중
 
   useEffect(() => {

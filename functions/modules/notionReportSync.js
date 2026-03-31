@@ -71,6 +71,14 @@ function callout(content, emoji = "💡", color = "gray_background") {
     };
 }
 
+function criteriaCallout(lines = []) {
+    const normalized = (Array.isArray(lines) ? lines : [])
+        .map((line) => String(line || "").trim())
+        .filter(Boolean);
+    const content = ["집계 기준", ...normalized.map((line) => `• ${line}`)].join("\n");
+    return callout(content, "📌", "yellow_background");
+}
+
 /** 업데이트 시각 문구 (작은 설명용, 연하게) */
 function updatedAt(tokyoNow) {
     return { type: "paragraph", paragraph: { rich_text: richTextAnnotated(`🕐 최종 업데이트: ${tokyoNow.format("YYYY-MM-DD HH:mm")} (JST)`, { color: "gray", italic: true }) } };
@@ -234,7 +242,7 @@ function pct(value, total, digits = 1) {
 }
 
 /** 일일로그 (Daily_Log MTD) — 고도화 버전 */
-async function syncNotionDailyLog(pageId, { rows, monthlySummaryRows, mtdNew, mtdCancel, mtdRevenue, year, month, tokyoNow }) {
+async function syncNotionDailyLog(pageId, { rows, monthlySummaryRows, monthlyRevenueSummaryRows, mtdNew, mtdCancel, mtdRevenue, year, month, tokyoNow }) {
     const notion = getNotionClient();
     if (!notion || !pageId) return;
 
@@ -255,6 +263,10 @@ async function syncNotionDailyLog(pageId, { rows, monthlySummaryRows, mtdNew, mt
     ]);
 
     const blocks = [];
+    const monthlyRevenueMap = new Map(
+        (Array.isArray(monthlyRevenueSummaryRows) ? monthlyRevenueSummaryRows : [])
+            .map(([label, revenue]) => [String(label), Number(revenue || 0)])
+    );
 
     // ━━ 헤더 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     blocks.push({
@@ -271,6 +283,12 @@ async function syncNotionDailyLog(pageId, { rows, monthlySummaryRows, mtdNew, mt
             }]
         }
     });
+    blocks.push(criteriaCallout([
+        "기간: 당월 1일~전일(JST). 신규는 bookDate 기준, 취소는 cancelTime 또는 modified 기준",
+        "포함: Airbnb · Booking.com, companyId 기본 회사, 신규 예약은 confirmed + 매출 > 0",
+        "제외: 다이쿄초, 수기예약(Direct), Expedia, Agoda 등 기타 채널",
+        "취소 집계는 입실일이 취소일 기준 ±6개월 안인 예약만 반영"
+    ]));
     blocks.push(divider());
 
     // ━━ KPI 요약 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -319,11 +337,10 @@ async function syncNotionDailyLog(pageId, { rows, monthlySummaryRows, mtdNew, mt
     // ━━ 입실 월별 분포 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if (Array.isArray(monthlySummaryRows) && monthlySummaryRows.length) {
         blocks.push({ type: "heading_2", heading_2: { rich_text: richText("📅 입실월별 누적 예약 현황") } });
-        const tblChildren = [tableRow(["입실 월", "예약 건수", "비율", "누적"], true)];
-        let cum = 0;
+        const tblChildren = [tableRow(["입실 월", "예약 건수", "비율", "매출(¥)"], true)];
         monthlySummaryRows.forEach(([label, cnt, ratio]) => {
-            cum += cnt;
-            tblChildren.push(tableRow([label, `${cnt}건`, `${(ratio * 100).toFixed(1)}%`, `${cum}건`]));
+            const revenue = monthlyRevenueMap.get(String(label)) || 0;
+            tblChildren.push(tableRow([label, `${cnt}건`, `${(ratio * 100).toFixed(1)}%`, `¥${revenue.toLocaleString()}`]));
         });
         blocks.push({
             type: "table",
@@ -423,6 +440,12 @@ async function syncNotionCancelLog(pageId, { cancelRows, cancelSummaryRows, buil
             }]
         }
     });
+    blocks.push(criteriaCallout([
+        "기간: 당월 1일~전일(JST), cancelTime 또는 modified 기준",
+        "포함: cancelled 상태의 Airbnb · Booking.com 예약",
+        "제외: 다이쿄초, 수기예약(Direct), Expedia, Agoda 등 기타 채널",
+        "건물·객실 취소율 표의 분모는 같은 기간 bookDate 기준 confirmed + 매출 > 0 예약"
+    ]));
     blocks.push(divider());
 
     // ━━ KPI 요약 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -572,6 +595,12 @@ async function syncNotionSalesLog(pageId, { year, month, tokyoNow, salesLogRows,
             }]
         }
     });
+    blocks.push(criteriaCallout([
+        "원본: 기록일 기준 sales_logs 일별 스냅샷",
+        "포함: confirmed 상태의 Airbnb · Booking.com 예약",
+        "제외: 다이쿄초, 사노시, 오쿠보A동, 수기예약(Direct), Expedia, Agoda",
+        "집계 방식: 총매출을 숙박일수 기준 1박당으로 나눠 월별 배분, 표시는 당월~+5개월"
+    ]));
     blocks.push(divider());
 
     blocks.push({ type: "heading_2", heading_2: { rich_text: richText("📊 핵심 지표 (당월 기준)") } });
@@ -635,6 +664,52 @@ async function syncNotionSalesLog(pageId, { year, month, tokyoNow, salesLogRows,
     }
 }
 
+const PLATFORM_ANALYSIS_HIDE_SHARE_COLUMN_BUILDINGS = new Set([
+    "오쿠보A동",
+    "오쿠보B동",
+    "오쿠보C동",
+    "사노시"
+]);
+
+function buildPlatformAnalysisHeaderRow(hideShareColumn = false) {
+    return tableRowWithOpts([
+        { content: "객실", bold: true },
+        ...(hideShareColumn ? [] : [{ content: "유입 비중(%)", bold: true }]),
+        { content: "유입 A%", bold: true, color: "pink" },
+        { content: "유입 B%", bold: true, color: "blue" },
+        { content: "매출 A(¥)", bold: true, color: "pink" },
+        { content: "매출 B(¥)", bold: true, color: "blue" },
+        { content: "매출(¥)", bold: true, color: "green" },
+        { content: "매출 A%", bold: true, color: "pink" },
+        { content: "매출 B%", bold: true, color: "blue" },
+        { content: "예약 A", bold: true, color: "pink" },
+        { content: "예약 B", bold: true, color: "blue" },
+        { content: "예약", bold: true },
+        { content: "플래그", bold: true }
+    ]);
+}
+
+function buildPlatformAnalysisRoomRow(room, hideShareColumn = false) {
+    const flagStr = String(room.flag || "—").slice(0, 32);
+    const color = flagColor(flagStr);
+
+    return tableRowWithOpts([
+        { content: String(room.room).slice(0, 24) },
+        ...(hideShareColumn ? [] : [{ content: `${(room.sharePct || 0).toFixed(1)}%` }]),
+        { content: `${(room.aOccPct || 0).toFixed(1)}%`, color: "pink" },
+        { content: `${(room.bOccPct || 0).toFixed(1)}%`, color: "blue" },
+        { content: `¥${Number(room.revA || 0).toLocaleString()}`, color: "pink" },
+        { content: `¥${Number(room.revB || 0).toLocaleString()}`, color: "blue" },
+        { content: `¥${Number(room.revAB || 0).toLocaleString()}`, color: "green" },
+        { content: `${(room.aRevPct || 0).toFixed(1)}%`, color: "pink" },
+        { content: `${(room.bRevPct || 0).toFixed(1)}%`, color: "blue" },
+        { content: String(room.bookingA ?? "—"), color: "pink" },
+        { content: String(room.bookingB ?? "—"), color: "blue" },
+        { content: String(room.bookingAB ?? "—") },
+        { content: flagStr, color: color !== "default" ? color : undefined }
+    ]);
+}
+
 /** 플랫폼 분석 → 노션 (경영용: KPI·점검필요·건물별 객실 테이블, 구글시트 연동) */
 async function syncNotionPlatformAnalysis(pageId, { year, month, tokyoNow, platformData, summaryText }) {
     const notion = getNotionClient();
@@ -657,6 +732,13 @@ async function syncNotionPlatformAnalysis(pageId, { year, month, tokyoNow, platf
             }]
         }
     });
+    blocks.push(criteriaCallout([
+        `기간: ${year}-${String(month).padStart(2, "0")}-01부터 보고서 기준일(${platformData && platformData.reportEndDate ? platformData.reportEndDate : "당월 말"})까지, bookDate 기준`,
+        "포함: confirmed 상태의 Airbnb · Booking.com 예약",
+        "제외: 다이쿄초, 수기예약(Direct), Expedia, Agoda 등 기타 채널",
+        "유입 비중은 건물 내 객실별 예약박 비중, 매출은 예약 금액 합산 기준",
+        "오쿠보A/B/C와 사노시는 유입 비중(%) 열을 표시하지 않음"
+    ]));
     blocks.push(divider());
 
     if (!platformData || !platformData.buildings || platformData.buildings.length === 0) {
@@ -687,46 +769,23 @@ async function syncNotionPlatformAnalysis(pageId, { year, month, tokyoNow, platf
     blocks.push(divider());
 
     blocks.push({ type: "heading_2", heading_2: { rich_text: [{ type: "text", text: { content: "🏢 건물별 · 객실별 상세" }, annotations: { color: "brown", bold: true } }] } });
-    const headerRow = tableRowWithOpts([
-        { content: "객실", bold: true },
-        { content: "유입 비중(%)", bold: true },
-        { content: "유입 A%", bold: true, color: "pink" },
-        { content: "유입 B%", bold: true, color: "blue" },
-        { content: "매출 A(¥)", bold: true, color: "pink" },
-        { content: "매출 B(¥)", bold: true, color: "blue" },
-        { content: "매출(¥)", bold: true, color: "green" },
-        { content: "매출 A%", bold: true, color: "pink" },
-        { content: "매출 B%", bold: true, color: "blue" },
-        { content: "예약 A", bold: true, color: "pink" },
-        { content: "예약 B", bold: true, color: "blue" },
-        { content: "예약", bold: true },
-        { content: "플래그", bold: true }
-    ]);
-
     for (let i = 0; i < buildings.length; i++) {
         const b = buildings[i];
+        const hideShareColumn = PLATFORM_ANALYSIS_HIDE_SHARE_COLUMN_BUILDINGS.has(b.name);
         blocks.push({ type: "heading_3", heading_3: { rich_text: [{ type: "text", text: { content: `▸ ${b.name} (${b.roomCount}개 객실)  ·  매출 A ${b.aRevPct.toFixed(1)}% / B ${b.bRevPct.toFixed(1)}%` }, annotations: { color: "gray" } }] } });
-        const tblChildren = [headerRow];
+        const tblChildren = [buildPlatformAnalysisHeaderRow(hideShareColumn)];
         b.rooms.forEach((r) => {
-            const flagStr = String(r.flag || "—").slice(0, 32);
-            const color = flagColor(flagStr);
-            tblChildren.push(tableRowWithOpts([
-                { content: String(r.room).slice(0, 24) },
-                { content: `${(r.sharePct || 0).toFixed(1)}%` },
-                { content: `${(r.aOccPct || 0).toFixed(1)}%`, color: "pink" },
-                { content: `${(r.bOccPct || 0).toFixed(1)}%`, color: "blue" },
-                { content: `¥${Number(r.revA || 0).toLocaleString()}`, color: "pink" },
-                { content: `¥${Number(r.revB || 0).toLocaleString()}`, color: "blue" },
-                { content: `¥${Number(r.revAB || 0).toLocaleString()}`, color: "green" },
-                { content: `${(r.aRevPct || 0).toFixed(1)}%`, color: "pink" },
-                { content: `${(r.bRevPct || 0).toFixed(1)}%`, color: "blue" },
-                { content: String(r.bookingA ?? "—"), color: "pink" },
-                { content: String(r.bookingB ?? "—"), color: "blue" },
-                { content: String(r.bookingAB ?? "—") },
-                { content: flagStr, color: color !== "default" ? color : undefined }
-            ]));
+            tblChildren.push(buildPlatformAnalysisRoomRow(r, hideShareColumn));
         });
-        blocks.push({ type: "table", table: { table_width: 13, has_column_header: true, has_row_header: false, children: tblChildren } });
+        blocks.push({
+            type: "table",
+            table: {
+                table_width: hideShareColumn ? 12 : 13,
+                has_column_header: true,
+                has_row_header: false,
+                children: tblChildren
+            }
+        });
         if (i < buildings.length - 1) blocks.push(divider());
     }
 
@@ -766,6 +825,12 @@ async function syncNotionPaxOccupancy(pageId, { title, tokyoNow, summaryText, pa
             }]
         }
     });
+    blocks.push(criteriaCallout([
+        `기간: ${paxData && paxData.start ? paxData.start : "시작일"} ~ ${paxData && paxData.end ? paxData.end : "종료일"}, bookDate 기준`,
+        "포함: confirmed 상태의 Airbnb · Booking.com 예약 + 매출 > 0",
+        "제외: 다이쿄초, 수기예약(Direct), Expedia, Agoda 등 기타 채널",
+        "일일로그 예약건수와 동일 기준으로 집계"
+    ]));
     blocks.push(divider());
 
     if (!paxData || !paxData.buildings || paxData.buildings.length === 0) {
@@ -1084,6 +1149,7 @@ function buildBuildingDetailSections(coreBuildingStats = []) {
                 buildingName: building.building,
                 totalRevenue: building.revenue,
                 occupancyPct: building.occupancyPct,
+                roomCount: building.roomCount,
                 childBlocks: [
                     callout(
                         `${building.buildingType} · 객실 ${building.roomCount}개 · 매출 ${fmtYen(building.revenue)} · 가동률 ${building.occupancyPct}% · ADR ${fmtYen(building.adr)}`,
@@ -1095,6 +1161,31 @@ function buildBuildingDetailSections(coreBuildingStats = []) {
                 ]
             };
         });
+}
+
+function buildTopRoomTable(title, rows, columns) {
+    const header = tableRowWithOpts(columns.map((column) => ({
+        content: column.label,
+        bold: true,
+        color: column.color || "gray"
+    })));
+    const children = [
+        header,
+        ...rows.map((row, index) => tableRowWithOpts(columns.map((column) => ({
+            content: String(column.render(row, index) ?? ""),
+            color: column.cellColor ? column.cellColor(row, index) : undefined
+        }))))
+    ];
+
+    return {
+        type: "table",
+        table: {
+            table_width: columns.length,
+            has_column_header: true,
+            has_row_header: false,
+            children
+        }
+    };
 }
 
 /** 한 달치 매출+가동률 통합 보고서: { blocksBeforePricing, blocksAfterPricing, buildingToggles } */
@@ -1146,7 +1237,7 @@ function buildOneMonthReportBlocks(report) {
         topCoreBuilding ? `일반 건물군 핵심 건물은 ${topCoreBuilding.building}이며, 객실 ${topCoreBuilding.roomCount}개 기준 ${fmtYen(topCoreBuilding.revenue)}를 기록했습니다.` : "일반 건물군 데이터가 아직 충분하지 않습니다.",
         topOkuboHome ? `오쿠보 단독주택군에서는 ${topOkuboHome.building}이 ${fmtYen(topOkuboHome.revenue)}로 가장 높았습니다.` : "오쿠보 단독주택 데이터가 부족합니다.",
         dominantPlatform ? `주요 플랫폼은 ${dominantPlatform.name}이며, core 매출 비중 ${dominantPlatform.share}%입니다.` : "플랫폼별 집계 데이터가 없습니다.",
-        topRoom ? `일반 건물군 최고 매출 객실은 ${topRoom.building} · ${topRoom.room} (${fmtYen(topRoom.revenue)})입니다.` : "일반 건물 객실 매출 데이터가 없습니다."
+        topRoom ? `일반 건물군 상대 성과 상위 객실은 ${topRoom.building} · ${topRoom.room} (${topRoom.relativePerformanceScore || 0}점, ${topRoom.relativePerformanceLabel || "보통"})입니다.` : "일반 건물 객실 성과 데이터가 없습니다."
     ].join("\n");
 
     const strategicNotes = [
@@ -1327,76 +1418,75 @@ function buildOneMonthReportBlocks(report) {
     blocks.push(
         divider(),
         { type: "heading_3", heading_3: { rich_text: richTextAnnotated("건물별 객실 · 가격 적정성", { bold: true, color: "brown" }) } },
-        callout("건물별로 펼치면 해당 건물 전체 객실의 매출·가동률·ADR·가격 적정성 진단과 해석을 한 번에 볼 수 있습니다. 같은 건물 안에서만 비교합니다. 오쿠보·사노시는 제외.", "🔎", "blue_background")
+        callout("건물별로 펼치면 해당 건물 전체 객실의 매출·가동률·ADR·가격 적정성 진단과 해석을 한 번에 볼 수 있습니다. 같은 건물 안에서만 비교합니다. 오쿠보·사노시는 제외.", "🔎", "blue_background"),
+        criteriaCallout([
+            "우수 운영: 절대 매출·가동률이 최상위이거나, 매출·RevPAR·수요를 모두 잘 잡은 객실",
+            "적정: 예약수·가동률·ADR·매출이 모두 중간권에서 균형을 이루는 객실",
+            "저평가 가능성: 예약수 또는 가동률은 강한데 ADR·매출·RevPAR이 약해 가격 인상 여지가 있음",
+            "고평가 가능성: ADR은 높은데 가동률·예약이 약해 가격 재검토가 필요함",
+            "저성과 주의: 같은 건물 유사 객실 대비 매출 또는 RevPAR이 낮아 우선 점검 필요",
+            "수요 부족/노출 문제: 가격보다 노출·상품력·전환 문제 가능성이 큼",
+            "장기숙박형/단기회전형: 예약 패턴 차이로 해석이 필요한 객실",
+            "판단 유보: 표본이 적어 성급한 판단을 피해야 함"
+        ])
     );
 
-    const buildingToggles = (coreBuildings || [])
-        .filter((b) => Array.isArray(b.rooms) && b.rooms.length > 0)
-        .map((building) => {
-            const roomRows = [
-                tableRowWithOpts([
-                    { content: "객실", bold: true, color: "gray" },
-                    { content: "매출", bold: true, color: "blue" },
-                    { content: "가동률", bold: true, color: "brown" },
-                    { content: "ADR", bold: true, color: "green" },
-                    { content: "예약수", bold: true, color: "gray" },
-                    { content: "진단", bold: true, color: "purple" },
-                    { content: "이유", bold: true, color: "gray" }
-                ]),
-                ...building.rooms.map((room) => tableRowWithOpts([
-                    { content: room.room },
-                    { content: fmtYen(room.revenue) },
-                    { content: `${room.occupancyPct}%` },
-                    { content: fmtYen(room.adr) },
-                    { content: `${room.reservationCount}건` },
-                    { content: room.diagnosis, color: getDiagnosisColor(room.diagnosis) },
-                    { content: (room.diagnosisReason || "").slice(0, 150) }
-                ]))
-            ];
-            const childBlocks = [
-                callout(
-                    `${building.buildingType} · 객실 ${building.roomCount}개 · 매출 ${fmtYen(building.revenue)} · 가동률 ${building.occupancyPct}% · ADR ${fmtYen(building.adr)}`,
-                    "🏢",
-                    "gray_background"
-                ),
-                { type: "table", table: { table_width: 7, has_column_header: true, has_row_header: false, children: roomRows } }
-            ];
-            return {
-                buildingName: building.building,
-                totalRevenue: building.revenue,
-                occupancyPct: building.occupancyPct,
-                roomCount: building.roomCount,
-                childBlocks
-            };
-        });
+    const buildingToggles = buildBuildingDetailSections(coreBuildings);
 
     const blocksBeforePricing = blocks.slice(0);
     const blocksAfterPricing = [];
 
     blocksAfterPricing.push(
         divider(),
-        { type: "heading_3", heading_3: { rich_text: richTextAnnotated("일반 건물 객실 Top 10", { bold: true, color: "brown" }) } }
+        { type: "heading_3", heading_3: { rich_text: richTextAnnotated("건물 내 상대 성과 Top 10", { bold: true, color: "brown" }) } },
+        callout("같은 건물 안에서만 비교한 상대 성과 자료입니다. 매출 절대값이 아니라 건물 내부 순위와 RevPAR, 가동률, 진단을 함께 봅니다.", "📊", "gray_background")
     );
-    const topRoomRows = [
-        tableRowWithOpts([
-            { content: "순위", bold: true, color: "gray" },
-            { content: "건물", bold: true, color: "gray" },
-            { content: "객실", bold: true, color: "gray" },
-            { content: "매출", bold: true, color: "blue" },
-            { content: "가동률", bold: true, color: "brown" }
-        ]),
-        ...(d.buildingRoomBreakdown || []).slice(0, 10).map(({ building, room, revenue, occupancyPct }, index) =>
-            tableRowWithOpts([
-                { content: `#${index + 1}` },
-                { content: building || "(미지정)" },
-                { content: room || "(미지정)" },
-                { content: fmtYen(revenue) },
-                { content: `${occupancyPct}%` }
+
+    const roomBreakdown = Array.isArray(d.buildingRoomBreakdown) ? d.buildingRoomBreakdown : [];
+    const revenueTop10 = [...roomBreakdown]
+        .sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0))
+        .slice(0, 10);
+    const relativeTop10 = [...roomBreakdown]
+        .sort((a, b) => Number(b.relativePerformanceScore || 0) - Number(a.relativePerformanceScore || 0))
+        .slice(0, 10);
+    const relativeBottom10 = [...roomBreakdown]
+        .sort((a, b) => {
+            const scoreDiff = Number(a.relativePerformanceScore || 0) - Number(b.relativePerformanceScore || 0);
+            if (scoreDiff !== 0) return scoreDiff;
+            const revParDiff = Number(a.revPar || 0) - Number(b.revPar || 0);
+            if (revParDiff !== 0) return revParDiff;
+            return Number(a.revenue || 0) - Number(b.revenue || 0);
+        })
+        .slice(0, 10);
+
+    if (roomBreakdown.length > 0) {
+        blocksAfterPricing.push(
+            { type: "heading_3", heading_3: { rich_text: richTextAnnotated("매출 Top 10", { bold: true, color: "blue" }) } },
+            buildTopRoomTable("매출 Top 10", revenueTop10, [
+                { label: "순위", render: (_, index) => `#${index + 1}` },
+                { label: "건물", render: (row) => row.building || "(미지정)" },
+                { label: "객실", render: (row) => row.room || "(미지정)" },
+                { label: "매출", color: "blue", render: (row) => fmtYen(row.revenue) },
+                { label: "가동률", color: "brown", render: (row) => `${row.occupancyPct}%` }
+            ]),
+            { type: "heading_3", heading_3: { rich_text: richTextAnnotated("상대 성과 Top 10", { bold: true, color: "purple" }) } },
+            buildTopRoomTable("상대 성과 Top 10", relativeTop10, [
+                { label: "순위", render: (_, index) => `#${index + 1}` },
+                { label: "건물", render: (row) => row.building || "(미지정)" },
+                { label: "객실", render: (row) => row.room || "(미지정)" },
+                { label: "상대 성과", color: "purple", render: (row) => `${Number(row.relativePerformanceScore || 0).toFixed(1)}점 · ${row.relativePerformanceLabel || "보통"}` },
+                { label: "진단", color: "green", render: (row) => row.diagnosis || "-", cellColor: (row) => getDiagnosisColor(row.diagnosis) }
+            ]),
+            { type: "heading_3", heading_3: { rich_text: richTextAnnotated("상대 성과 하위 10", { bold: true, color: "red" }) } },
+            buildTopRoomTable("상대 성과 하위 10", relativeBottom10, [
+                { label: "순위", render: (_, index) => `#${index + 1}` },
+                { label: "건물", render: (row) => row.building || "(미지정)" },
+                { label: "객실", render: (row) => row.room || "(미지정)" },
+                { label: "상대 성과", color: "red", render: (row) => `${Number(row.relativePerformanceScore || 0).toFixed(1)}점 · ${row.relativePerformanceLabel || "보통"}` },
+                { label: "RevPAR", color: "green", render: (row) => fmtYen(row.revPar) },
+                { label: "진단", color: "green", render: (row) => row.diagnosis || "-", cellColor: (row) => getDiagnosisColor(row.diagnosis) }
             ])
-        )
-    ];
-    if (topRoomRows.length > 1) {
-        blocksAfterPricing.push({ type: "table", table: { table_width: 5, has_column_header: true, has_row_header: false, children: topRoomRows } });
+        );
     } else {
         blocksAfterPricing.push(callout("일반 건물 객실 데이터 없음", "🚪", "gray_background"));
     }
@@ -1427,6 +1517,12 @@ async function syncNotionSalesDashboard(pageId, { tokyoNow, summaryText, monthly
                 rich_text: richText("경영진 의사결정을 위한 월별 매출·가동률 통합 브리프입니다. 일반 건물, 오쿠보 단독주택, 사노시 참고 매출을 분리해 비교하고, 같은 건물 내 객실 가격 적정성까지 함께 진단합니다.")
             }
         },
+        criteriaCallout([
+            "매출: confirmed 전체 플랫폼 기준(Direct · Expedia · Agoda 포함), 다이쿄초 제외, 숙박일수 overlap 방식으로 월별 배분",
+            "사노시는 reference revenue로 분리 표기하고 운영 포트폴리오 총매출과는 구분",
+            "가동률: 운영 건물(core + 오쿠보A/B/C) 기준, 사노시 제외",
+            "체크인 예약건수: Airbnb · Booking.com만 포함, 사노시 제외"
+        ]),
         callout("Overlap 기준 집계입니다. 사노시는 참고 매출만 별도 표기하고, 오쿠보 A/B/C는 일반 객실형 건물과 분리해 해석합니다.", "📌", "gray_background"),
         updatedAt(tokyoNow),
         tableOfContentsBlock("gray"),

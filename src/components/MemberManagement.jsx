@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   collection, query, where, onSnapshot, addDoc, updateDoc, doc,
-  getDocs, orderBy, serverTimestamp, arrayUnion, getDoc, deleteDoc, limit,
+  getDocs, orderBy, serverTimestamp, arrayUnion, getDoc, limit,
   setDoc
 } from 'firebase/firestore';
 import { db } from '../firebase';

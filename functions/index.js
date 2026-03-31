@@ -121,14 +121,20 @@ const PROPERTIES = [
     { name: "사노시", id: "gDzuVIkyvm5fqtuifdveeIKZO", v2Id: 226546, companyId: DEFAULT_COMPANY_ID }
 ];
 
-const RESERVATION_SYNC_SCHEMA_VERSION = "reservation_sync_v20260310";
+const RESERVATION_SYNC_SCHEMA_VERSION = "reservation_sync_v20260330";
 const RESERVATION_REQUIRED_FIELDS = ["bookId", "status", "building", "room", "arrival", "departure", "companyId"];
-const REPORT_SYNC_MAX_AGE_MINUTES = 90;
+const REPORT_SYNC_MAX_AGE_MINUTES = 1440;
 const REPORT_INVALID_THRESHOLD = 0;
 const RESERVATION_SYNC_STATUS_DOC_ID = "reservations";
 const PRICE_SYNC_STATUS_DOC_ID = "prices";
-const RESERVATION_FULL_RECONCILE_INTERVAL_MINUTES = 60;  // 삭제 감지 지연 최소화 (이전 1시간 주기 유지)
+const RESERVATION_FULL_RECONCILE_INTERVAL_MINUTES = 10080; // 웹훅 메인 운영 기준: 깊은 예약 감사는 주 1회만 수행
 const PRICE_FULL_RECONCILE_INTERVAL_MINUTES = 360;       // 가격은 웹훅+증분이 있어 full은 6시간 간격으로 완충
+const RESERVATION_SYNC_PAST_MONTHS = 6;
+const RESERVATION_SYNC_FUTURE_MONTHS = 12;
+const RESERVATION_INCREMENTAL_BUFFER_MINUTES = 10;
+const BEDS24_REQUEST_SOFT_LIMIT = 120;
+const BEDS24_REQUEST_WINDOW_MS = 5 * 60 * 1000;
+const BEDS24_REQUEST_WINDOW_BUFFER_MS = 5000;
 
 const SYNC_STATUS_DOC_IDS = {
     reservations: RESERVATION_SYNC_STATUS_DOC_ID,
@@ -368,20 +374,21 @@ function collectOutputImpactDates(impacts) {
 
 /**
  * 수집된 outputImpact에 따라 청소/일일 리포트/매출일지를 영향 날짜만 재계산·발송
+ * 슬랙 일일보고서는 중복 방지를 위해 기본적으로 재발송하지 않고,
+ * 전용 스케줄(scheduledSlackDailyReport) 또는 수동 재발송(sendSlackDailyReportManual)만 사용한다.
  * 동기화·웹훅 후 호출해 데이터 일치 유지
  * @param {Array<{ reportKeys?: string[], dateKeys?: string[], domain?: string }>} impacts
  * @param {{ skipSalesLog?: boolean, skipSlack?: boolean }} options
  */
 async function scheduleOutputUpdates(impacts, options = {}) {
     if (!impacts || impacts.length === 0) return;
-    const { skipSalesLog = false, skipSlack = false } = options;
+    const { skipSalesLog = false, skipSlack = true } = options;
     const { dailyReportDates, hasReservationImpact } = collectOutputImpactDates(impacts);
     const tokyoToday = dayjs().tz("Asia/Tokyo").format("YYYY-MM-DD");
     const tokyoYesterday = dayjs().tz("Asia/Tokyo").subtract(1, "day").format("YYYY-MM-DD");
 
     if (!skipSlack) {
-        // ★ 슬랙 청소 리포트는 아침 스케줄 1회만 발송. 웹훅/동기화 기반 재전송은 하지 않음.
-        // ★ 슬랙 일일 리포트는 전날(어제) 데이터가 변경되었을 때만 발송 (어제 최종 → 다음날 아침 보고서 개념)
+        // 명시적으로 허용한 경우에만 슬랙 일일 리포트를 재발송한다.
         const yesterdayOnlyDates = dailyReportDates.filter(d => d === tokyoYesterday);
         for (const dateStr of yesterdayOnlyDates) {
             try {
@@ -597,6 +604,21 @@ function toDateOrNull(value) {
     return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+function getLatestReservationSyncAt(statusData = {}) {
+    const candidates = [
+        statusData.lastSuccessAt,
+        statusData.lastWebhookAt,
+        statusData.lastIncrementalAt,
+        statusData.lastFullReconcileAt,
+        statusData.lastReconciledAt
+    ]
+        .map(toDateOrNull)
+        .filter(Boolean);
+
+    if (candidates.length === 0) return null;
+    return new Date(Math.max(...candidates.map((date) => date.getTime())));
+}
+
 async function getDomainStatus(docId) {
     const snap = await db.collection("sync_status").doc(docId).get();
     return snap.exists ? (snap.data() || {}) : null;
@@ -608,11 +630,57 @@ function getMinutesSince(dateValue, now = new Date()) {
     return (now.getTime() - date.getTime()) / 60000;
 }
 
+function getReservationSyncWindow(base = dayjs().tz("Asia/Tokyo")) {
+    const tokyoBase = dayjs(base).tz("Asia/Tokyo");
+    return {
+        start: tokyoBase.subtract(RESERVATION_SYNC_PAST_MONTHS, "month").format("YYYY-MM-DD"),
+        end: tokyoBase.add(RESERVATION_SYNC_FUTURE_MONTHS, "month").format("YYYY-MM-DD")
+    };
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function createBeds24RequestBudget({
+    softLimit = BEDS24_REQUEST_SOFT_LIMIT,
+    windowMs = BEDS24_REQUEST_WINDOW_MS
+} = {}) {
+    return {
+        softLimit,
+        windowMs,
+        used: 0,
+        windowStartedAt: Date.now()
+    };
+}
+
+async function waitForBeds24RequestBudget(budget, label = "") {
+    if (!budget) return;
+
+    const now = Date.now();
+    if (now - budget.windowStartedAt >= budget.windowMs) {
+        budget.windowStartedAt = now;
+        budget.used = 0;
+    }
+
+    if (budget.used < budget.softLimit) return;
+
+    const waitMs = Math.max(0, budget.windowMs - (now - budget.windowStartedAt)) + BEDS24_REQUEST_WINDOW_BUFFER_MS;
+    console.log(`[Beds24 Budget] 5분 예산 소진 직전 → ${Math.round(waitMs / 1000)}초 대기${label ? ` (${label})` : ""}`);
+    await sleep(waitMs);
+    budget.windowStartedAt = Date.now();
+    budget.used = 0;
+}
+
+function consumeBeds24RequestBudget(budget, cost = 1) {
+    if (!budget) return;
+    budget.used += cost;
+}
+
 function shouldRunFullAudit(statusData, {
     intervalMinutes = 360,
     now = new Date()
 } = {}) {
     if (!statusData) return true;
+    if (String(statusData.lastSyncSchemaVersion || "") !== RESERVATION_SYNC_SCHEMA_VERSION) return true;
     if (String(statusData.lastAuditStatus || "") === "error") return true;
     if (Number(statusData.lastInvalidCriticalCount || 0) > 0) return true;
     if (Number(statusData.lastInvalidReportCount || 0) > 0) return true;
@@ -621,8 +689,7 @@ function shouldRunFullAudit(statusData, {
 
 async function getScheduledReservationReconcileDecision({
     now = new Date(),
-    minIntervalMinutes = 60,
-    webhookStaleMinutes = REPORT_SYNC_MAX_AGE_MINUTES
+    fullAuditIntervalMinutes = RESERVATION_FULL_RECONCILE_INTERVAL_MINUTES
 } = {}) {
     const statusSnap = await db.collection("sync_status").doc(RESERVATION_SYNC_STATUS_DOC_ID).get();
     if (!statusSnap.exists) {
@@ -647,22 +714,35 @@ async function getScheduledReservationReconcileDecision({
     }
 
     const reconcileAgeMinutes = (now.getTime() - lastReconciledAt.getTime()) / 60000;
-    if (reconcileAgeMinutes >= minIntervalMinutes) {
-        return { shouldRun: true, reason: "reconcile_interval_elapsed", data, reconcileAgeMinutes };
+    const webhookAgeMinutes = getMinutesSince(lastWebhookAt, now);
+    const fullAuditDue = shouldRunFullAudit(data, {
+        intervalMinutes: fullAuditIntervalMinutes,
+        now
+    });
+
+    if (fullAuditDue) {
+        return {
+            shouldRun: true,
+            reason: "full_audit_due",
+            data,
+            reconcileAgeMinutes,
+            webhookAgeMinutes
+        };
     }
 
     if (!lastWebhookAt) {
-        return { shouldRun: true, reason: "missing_last_webhook_at", data, reconcileAgeMinutes };
-    }
-
-    const webhookAgeMinutes = (now.getTime() - lastWebhookAt.getTime()) / 60000;
-    if (webhookAgeMinutes >= webhookStaleMinutes) {
-        return { shouldRun: true, reason: "webhook_stale", data, reconcileAgeMinutes, webhookAgeMinutes };
+        return {
+            shouldRun: false,
+            reason: "awaiting_webhook_or_manual_sync",
+            data,
+            reconcileAgeMinutes,
+            webhookAgeMinutes
+        };
     }
 
     return {
         shouldRun: false,
-        reason: "recent_webhook_and_reconcile",
+        reason: "webhook_primary_ok",
         data,
         reconcileAgeMinutes,
         webhookAgeMinutes
@@ -684,14 +764,14 @@ async function assertReservationDataReady(context, {
     }
 
     const data = statusSnap.data();
-    const lastSuccessAt = data.lastSuccessAt?.toDate ? data.lastSuccessAt.toDate() : null;
+    const lastHealthyAt = getLatestReservationSyncAt(data);
     const invalidCriticalCount = Number(data.lastInvalidCriticalCount || 0);
     const errors = [];
 
-    if (!lastSuccessAt) {
-        errors.push("lastSuccessAt 없음");
+    if (!lastHealthyAt) {
+        errors.push("최근 예약 동기화 시각 없음");
     } else {
-        const ageMinutes = (Date.now() - lastSuccessAt.getTime()) / 60000;
+        const ageMinutes = (Date.now() - lastHealthyAt.getTime()) / 60000;
         if (ageMinutes > maxAgeMinutes) {
             errors.push(`최근 성공 동기화가 ${Math.round(ageMinutes)}분 전입니다`);
         }
@@ -946,6 +1026,7 @@ async function fetchAllBookingsFromProperty(prop, dateParams, options = {}) {
     const finalParams = { ...dateParams };
     if (finalParams.arrivalFrom) finalParams.arrivalFrom = toV2Date(finalParams.arrivalFrom);
     if (finalParams.arrivalTo) finalParams.arrivalTo = toV2Date(finalParams.arrivalTo);
+    const requestBudget = options.requestBudget || null;
 
     // ★ 네 번 조회: 1) 일반 예약, 2) 취소된 예약, 3) 문의/요청, 4) 블락(black)
     // Beds24 V2 API 지원 status: confirmed, request, new, cancelled, black, inquiry
@@ -982,6 +1063,8 @@ async function fetchAllBookingsFromProperty(prop, dateParams, options = {}) {
                 }
 
                 // ★ V2 API 호출
+                await waitForBeds24RequestBudget(requestBudget, `${prop.name}:${statusLabel}:page${page}`);
+                consumeBeds24RequestBudget(requestBudget);
                 const token = await getBeds24Token();
                 const res = await axios.get("https://beds24.com/api/v2/bookings", {
                     headers: { "token": token },
@@ -1006,7 +1089,7 @@ async function fetchAllBookingsFromProperty(prop, dateParams, options = {}) {
                 if (pagesInfo && pagesInfo.nextPageExists) {
                     page++;
                     // 페이지네이션 사이 딜레이
-                    await new Promise(resolve => setTimeout(resolve, 1500));
+                    await sleep(1500);
                 } else {
                     break;
                 }
@@ -1023,7 +1106,7 @@ async function fetchAllBookingsFromProperty(prop, dateParams, options = {}) {
                     rateLimitRetry++;
                     const waitSec = rateLimitRetry * 10; // 10s, 20s, 30s, 40s, 50s
                     console.warn(`  ⚠️ Rate Limit(429). ${waitSec}초 대기 후 재시도 (${rateLimitRetry}/5)`);
-                    await new Promise(r => setTimeout(r, waitSec * 1000));
+                    await sleep(waitSec * 1000);
                     continue;
                 }
                 throw err;
@@ -1032,7 +1115,7 @@ async function fetchAllBookingsFromProperty(prop, dateParams, options = {}) {
         }
 
         // 상태 변경 사이 딜레이
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await sleep(1000);
     }
 
     // 취소 예약 카운트 로그
@@ -1042,13 +1125,13 @@ async function fetchAllBookingsFromProperty(prop, dateParams, options = {}) {
     return allBookings;
 }
 
-// 빠른 동기화: 도쿄 시간 기준 6개월 전 ~ 향후 18개월 (서버/로컬 시간차 보정)
-// ★ 서버가 2025년일 경우, 2026년 2월 데이터를 잡기 위해 +1년 이상의 버퍼 필요
-async function fetchFromBeds24Quick() {
-    const tokyoNow = dayjs().utcOffset(9);
-    // ★ 원복: 체크인 날짜(Arrival) 기준 6개월 (동기화는 넓게 가져오고, 필터는 프론트에서)
-    const arrivalFrom = tokyoNow.subtract(6, "month").format("YYYYMMDD");
-    const arrivalTo = tokyoNow.add(6, "month").format("YYYYMMDD");
+// 빠른 동기화: 도쿄 시간 기준 과거 6개월 ~ 향후 12개월
+async function fetchFromBeds24Quick(options = {}) {
+    const tokyoNow = options.now ? dayjs(options.now).utcOffset(9) : dayjs().utcOffset(9);
+    const syncWindow = getReservationSyncWindow(tokyoNow);
+    const arrivalFrom = options.arrivalFrom || syncWindow.start;
+    const arrivalTo = options.arrivalTo || syncWindow.end;
+    const requestBudget = options.requestBudget || null;
 
     console.log(`[Quick Sync] Tokyo: ${tokyoNow.format("YYYY-MM-DD HH:mm")} | Arrival Range: ${arrivalFrom} ~ ${arrivalTo}`);
 
@@ -1061,15 +1144,16 @@ async function fetchFromBeds24Quick() {
             continue;
         }
         console.log(`🔄 Fetching: ${prop.name}...`);
-        // ★ 변경: 다시 Arrival 기준 (사용자 요청: 동기화는 건드리지 마라)
         const bookings = await fetchAllBookingsFromProperty(prop, {
             arrivalFrom: arrivalFrom,
             arrivalTo: arrivalTo
+        }, {
+            requestBudget
         });
         allBookings.push(...bookings);
 
         // API 호출 사이 딜레이 (2초로 증가 - Rate Limit 방지)
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        await sleep(2000);
     }
 
     console.log(`✅ Quick Sync 완료: 총 ${allBookings.length}건`);
@@ -1077,9 +1161,10 @@ async function fetchFromBeds24Quick() {
 }
 
 // 전체 동기화: 2023년 1월부터 향후 2년 (표준)
-async function fetchFromBeds24Full() {
+async function fetchFromBeds24Full(options = {}) {
     const arrivalFrom = "2023-01-01"; // 다시 2023년부터 조회
     const arrivalTo = dayjs().add(24, "month").format("YYYY-MM-DD"); // V2 형식 유지
+    const requestBudget = options.requestBudget || null;
 
     console.log(`[Full Sync] ${arrivalFrom} ~ ${arrivalTo}`);
 
@@ -1096,11 +1181,13 @@ async function fetchFromBeds24Full() {
         const bookings = await fetchAllBookingsFromProperty(prop, {
             arrivalFrom: arrivalFrom,
             arrivalTo: arrivalTo
+        }, {
+            requestBudget
         });
         allBookings.push(...bookings);
 
         // API 호출 사이 딜레이 (2초로 증가 - Rate Limit 방지)
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        await sleep(2000);
     }
 
     console.log(`✅ Full Sync 완료: 총 ${allBookings.length}건`);
@@ -1109,21 +1196,22 @@ async function fetchFromBeds24Full() {
 
 // 증분 동기화: 해당 시각 이후로 수정된 예약만 조회 (Beds24 modifiedFrom 사용)
 // modifiedSince: Date 또는 ISO 문자열 (UTC). 이 시각 이후 수정된 예약만 가져옴.
-async function fetchFromBeds24Incremental(modifiedSince) {
+async function fetchFromBeds24Incremental(modifiedSince, options = {}) {
     const sinceDate = modifiedSince instanceof Date ? modifiedSince : new Date(modifiedSince);
     if (Number.isNaN(sinceDate.getTime())) {
         console.warn("[Incremental Sync] invalid modifiedSince, falling back to full range");
-        return fetchFromBeds24Quick();
+        return fetchFromBeds24Quick({ requestBudget: options.requestBudget });
     }
     const modifiedFrom = sinceDate.toISOString().slice(0, 19) + "Z";
+    const requestBudget = options.requestBudget || null;
     console.log(`[Incremental Sync] modifiedFrom=${modifiedFrom} (변경분만 조회)`);
 
     const allBookings = [];
     for (const prop of PROPERTIES) {
         if (prop.disabled) continue;
-        const bookings = await fetchAllBookingsFromProperty(prop, { modifiedFrom });
+        const bookings = await fetchAllBookingsFromProperty(prop, { modifiedFrom }, { requestBudget });
         allBookings.push(...bookings);
-        await new Promise(resolve => setTimeout(resolve, 1500));
+        await sleep(1500);
     }
     console.log(`✅ Incremental Sync 완료: ${allBookings.length}건 (변경분만)`);
     return allBookings;
@@ -1177,7 +1265,7 @@ async function incrementalReservationSync(list, companyId = DEFAULT_COMPANY_ID, 
     return { cancelledCount: 0, ...upsertResult };
 }
 
-async function fullReservationReconcile(list, syncRangeStart = null, companyId = DEFAULT_COMPANY_ID, syncSource = "beds24_sync") {
+async function fullReservationReconcile(list, syncRangeStart = null, syncRangeEnd = null, companyId = DEFAULT_COMPANY_ID, syncSource = "beds24_sync") {
     const observedAt = new Date();
     const batchLimit = 400;
     let batch = db.batch();
@@ -1192,8 +1280,10 @@ async function fullReservationReconcile(list, syncRangeStart = null, companyId =
     allSyncBuildings.forEach(b => buildingsInList.add(b));
     const buildingsToProcess = [...buildingsInList];
 
-    // ★ 동기화 범위 시작일 (Quick Sync: 6개월 전, Full Sync: 2023-01-01)
-    const rangeStartDate = syncRangeStart ? new Date(syncRangeStart) : null;
+    // ★ 동기화 범위 안에 있는 예약만 누락 취소 처리한다.
+    // 범위 밖 미래 예약은 웹훅으로 들어왔더라도 재대사에서 잘못 cancelled 처리하지 않도록 보호한다.
+    const rangeStartDate = syncRangeStart ? dayjs(syncRangeStart).startOf("day") : null;
+    const rangeEndDate = syncRangeEnd ? dayjs(syncRangeEnd).endOf("day") : null;
 
     for (const building of buildingsToProcess) {
         const existingSnap = await db.collection("reservations")
@@ -1210,9 +1300,17 @@ async function fullReservationReconcile(list, syncRangeStart = null, companyId =
             if (!beds24BookIds.has(docId)) {
                 const activeStatuses = ["confirmed", "blackout"];
                 if (activeStatuses.includes(existingData.status) && existingData.arrival) {
-                    const arrivalDate = new Date(existingData.arrival);
+                    const arrivalDate = dayjs(existingData.arrival);
 
-                    if (rangeStartDate && arrivalDate < rangeStartDate) {
+                    if (!arrivalDate.isValid()) {
+                        continue;
+                    }
+
+                    if (rangeStartDate && arrivalDate.isBefore(rangeStartDate)) {
+                        continue;
+                    }
+
+                    if (rangeEndDate && arrivalDate.isAfter(rangeEndDate)) {
                         continue;
                     }
 
@@ -1257,12 +1355,12 @@ async function fullReservationReconcile(list, syncRangeStart = null, companyId =
 }
 
 // saveBookings: 하위 호환용 래퍼
-async function saveBookings(list, syncRangeStart = null, companyId = DEFAULT_COMPANY_ID, syncSource = "beds24_sync", options = {}) {
+async function saveBookings(list, syncRangeStart = null, syncRangeEnd = null, companyId = DEFAULT_COMPANY_ID, syncSource = "beds24_sync", options = {}) {
     const { upsertOnly = false, mode = null } = options;
     if (upsertOnly || mode === "incremental") {
         return incrementalReservationSync(list, companyId, syncSource);
     }
-    return fullReservationReconcile(list, syncRangeStart, companyId, syncSource);
+    return fullReservationReconcile(list, syncRangeStart, syncRangeEnd, companyId, syncSource);
 }
 
 
@@ -1270,24 +1368,25 @@ async function saveBookings(list, syncRangeStart = null, companyId = DEFAULT_COM
 // 4) EXPORTS
 // ==========================================
 
-// 빠른 동기화 (기본) - 6개월 전 ~ 향후 6개월 (과거 예약 변경도 자동 반영)
+// 빠른 동기화 (기본) - 과거 6개월 ~ 향후 12개월
 // ★ 순차 호출로 변경되어 타임아웃 증가
 exports.syncBeds24 = onRequest({ cors: true, timeoutSeconds: 540, memory: '512MiB' }, async (req, res) => {
     try {
         const companyId = req.body?.companyId || DEFAULT_COMPANY_ID;
         const tokyoNow = dayjs().utcOffset(9);
-        const syncRangeStart = tokyoNow.subtract(6, "month").format("YYYY-MM-DD"); // 6개월 전부터
+        const syncWindow = getReservationSyncWindow(tokyoNow);
+        const requestBudget = createBeds24RequestBudget();
         // 수동 Quick Sync는 사용자 기대(전체 재대사·삭제 반영)에 맞춰 항상 전체 fetch 후 재대사. 증분 미사용.
-        let list = await fetchFromBeds24Quick();
-        const result = await saveBookings(list, syncRangeStart, companyId, "beds24_manual_quick");
+        let list = await fetchFromBeds24Quick({ now: tokyoNow, requestBudget });
+        const result = await saveBookings(list, syncWindow.start, syncWindow.end, companyId, "beds24_manual_quick");
         const syncVariant = "manual_quick";
         await recordReservationSyncAudit({
             syncType: "manual_quick",
             syncVariant,
             syncSource: "beds24_manual_quick",
             companyId,
-            rangeStart: syncRangeStart,
-            rangeEnd: tokyoNow.add(6, "month").format("YYYY-MM-DD"),
+            rangeStart: syncWindow.start,
+            rangeEnd: syncWindow.end,
             fetchedCount: list.length,
             upsertedCount: result.upsertedCount,
             cancelledCount: result.cancelledCount,
@@ -1335,15 +1434,17 @@ exports.syncBeds24Full = onRequest({ cors: true, timeoutSeconds: 900, memory: '1
     try {
         const companyId = req.body?.companyId || DEFAULT_COMPANY_ID;
         const syncRangeStart = "2023-01-01"; // 다시 2023년부터
-        const list = await fetchFromBeds24Full();
-        const result = await saveBookings(list, syncRangeStart, companyId, "beds24_manual_full");
+        const syncRangeEnd = dayjs().add(24, "month").format("YYYY-MM-DD");
+        const requestBudget = createBeds24RequestBudget();
+        const list = await fetchFromBeds24Full({ requestBudget });
+        const result = await saveBookings(list, syncRangeStart, syncRangeEnd, companyId, "beds24_manual_full");
         await recordReservationSyncAudit({
             syncType: "manual_full",
             syncVariant: "manual_full",
             syncSource: "beds24_manual_full",
             companyId,
             rangeStart: syncRangeStart,
-            rangeEnd: dayjs().add(24, "month").format("YYYY-MM-DD"),
+            rangeEnd: syncRangeEnd,
             fetchedCount: list.length,
             upsertedCount: result.upsertedCount,
             cancelledCount: result.cancelledCount,
@@ -1732,119 +1833,160 @@ exports.triggerPriceSync = onRequest({ cors: true, timeoutSeconds: 540 }, async 
     }
 });
 
-// 스케줄러 (자동 동기화) - 15분마다 (비용 최적화)
-// ★ 예약은 웹훅 중심, 재대사는 1시간 간격/웹훅 stale 시만 수행
-// ★ 가격 데이터도 함께 동기화 (Firestore 캐싱)
+async function runScheduledReservationReconcile({ forceFull = false } = {}) {
+    const tokyoNow = dayjs().tz("Asia/Tokyo");
+    const companyId = DEFAULT_COMPANY_ID;
+    const syncWindow = getReservationSyncWindow(tokyoNow);
+    const statusData = await getDomainStatus(RESERVATION_SYNC_STATUS_DOC_ID);
+    const requestBudget = createBeds24RequestBudget();
+
+    const lastReconciledAt = toDateOrNull(statusData?.lastReconciledAt);
+    const lastWebhookAt = toDateOrNull(statusData?.lastWebhookAt);
+    const baseTime = lastReconciledAt || lastWebhookAt || tokyoNow.subtract(1, "day").toDate();
+    const modifiedSince = new Date(baseTime.getTime() - (RESERVATION_INCREMENTAL_BUFFER_MINUTES * 60 * 1000));
+
+    const incrementalList = await fetchFromBeds24Incremental(modifiedSince, { requestBudget });
+    const incrementalResult = await saveBookings(
+        incrementalList,
+        null,
+        null,
+        companyId,
+        "beds24_scheduled_daily_incremental",
+        { mode: "incremental" }
+    );
+
+    await recordReservationSyncAudit({
+        syncType: "scheduled_daily",
+        syncVariant: "incremental",
+        syncSource: "beds24_scheduled_daily_incremental",
+        companyId,
+        rangeStart: modifiedSince.toISOString(),
+        rangeEnd: tokyoNow.toISOString(),
+        fetchedCount: incrementalList.length,
+        upsertedCount: incrementalResult.upsertedCount,
+        cancelledCount: incrementalResult.cancelledCount,
+        invalidCriticalCount: incrementalResult.invalidCriticalCount,
+        invalidReportCount: incrementalResult.invalidReportCount,
+        sampleIds: incrementalResult.sampleIds || [],
+        note: "mode=incremental_backup"
+    });
+
+    let fullList = [];
+    let fullResult = null;
+    const shouldRunDeepAudit = forceFull || shouldRunFullAudit(statusData, {
+        intervalMinutes: RESERVATION_FULL_RECONCILE_INTERVAL_MINUTES,
+        now: tokyoNow.toDate()
+    });
+
+    if (shouldRunDeepAudit) {
+        fullList = await fetchFromBeds24Quick({
+            now: tokyoNow,
+            requestBudget
+        });
+        fullResult = await saveBookings(
+            fullList,
+            syncWindow.start,
+            syncWindow.end,
+            companyId,
+            "beds24_scheduled_daily_window",
+            { mode: "full_reconcile" }
+        );
+
+        await recordReservationSyncAudit({
+            syncType: "scheduled_daily",
+            syncVariant: "full_reconcile",
+            syncSource: "beds24_scheduled_daily_window",
+            companyId,
+            rangeStart: syncWindow.start,
+            rangeEnd: syncWindow.end,
+            fetchedCount: fullList.length,
+            upsertedCount: fullResult.upsertedCount,
+            cancelledCount: fullResult.cancelledCount,
+            invalidCriticalCount: fullResult.invalidCriticalCount,
+            invalidReportCount: fullResult.invalidReportCount,
+            sampleIds: fullResult.sampleIds || [],
+            note: `mode=window_audit, forceFull=${forceFull}`
+        });
+    }
+
+    const fourteenDaysAgo = tokyoNow.subtract(14, "day").format("YYYY-MM-DD");
+    const fourteenDaysLater = tokyoNow.add(14, "day").format("YYYY-MM-DD");
+    const impactMap = new Map();
+    [...incrementalList, ...fullList].forEach((item) => {
+        const d = item.arrival || item.departure || item.bookDate || "";
+        const dt = String(d).slice(0, 10);
+        if (dt < fourteenDaysAgo || dt > fourteenDaysLater) return;
+        const impactKey = String(item.bookId || item.id || `${item.building || ""}_${item.room || ""}_${dt}`);
+        impactMap.set(impactKey, buildReservationOutputImpact(item));
+    });
+
+    try {
+        await scheduleOutputUpdates(Array.from(impactMap.values()));
+    } catch (e) {
+        console.warn("[Scheduled Daily Reservation Reconcile] Output update failed:", e.message);
+    }
+
+    return {
+        companyId,
+        modifiedSince: modifiedSince.toISOString(),
+        syncWindow,
+        incrementalList,
+        incrementalResult,
+        fullList,
+        fullResult,
+        ranFullAudit: shouldRunDeepAudit
+    };
+}
+
+// 예약 자동 재대사: 자정 1회만 실행. 웹훅이 메인이고, 자정 배치는 누락분 백업 + 주기적 깊은 감사 역할만 수행한다.
 exports.scheduledBeds24Sync = onSchedule({
+    schedule: "0 0 * * *",
+    timeZone: "Asia/Tokyo",
+    timeoutSeconds: 540,
+    memory: "1GiB"
+}, async () => {
+    try {
+        const result = await runScheduledReservationReconcile();
+        console.log(
+            `✅ 예약 자정 재대사 완료: incremental=${result.incrementalList.length}건` +
+            `${result.ranFullAudit ? `, full=${result.fullList.length}건` : ", full=skip"}`
+        );
+    } catch (e) {
+        await recordReservationSyncAudit({
+            syncType: "scheduled_daily",
+            status: "error",
+            syncSource: "beds24_scheduled_daily",
+            companyId: DEFAULT_COMPANY_ID,
+            errorMessage: e.message
+        });
+        await sendSyncAlert("scheduledBeds24Sync failed", [
+            `companyId=${DEFAULT_COMPANY_ID}`,
+            e.message
+        ]);
+        throw e;
+    }
+});
+
+// 가격은 예약과 분리해 기존 cadence를 유지한다.
+exports.scheduledBeds24PriceSync = onSchedule({
     schedule: "every 15 minutes",
     timeoutSeconds: 540,
     memory: "1GiB"
 }, async () => {
     const tokyoNow = dayjs().utcOffset(9);
-    const syncRangeStart = tokyoNow.subtract(6, "month").format("YYYY-MM-DD"); // 6개월 전부터
-    const companyId = DEFAULT_COMPANY_ID; // 스케줄러는 기본 회사 ID 사용
-
     try {
-        const decision = await getScheduledReservationReconcileDecision({
-            now: tokyoNow.toDate(),
-            minIntervalMinutes: 60,
-            webhookStaleMinutes: REPORT_SYNC_MAX_AGE_MINUTES
-        });
-
-        if (decision.shouldRun) {
-            const data = decision.data || {};
-            const lastWebhookAt = toDateOrNull(data.lastWebhookAt);
-            const lastReconciledAt = toDateOrNull(data.lastReconciledAt);
-            const baseTime = lastWebhookAt && lastReconciledAt
-                ? (lastWebhookAt.getTime() < lastReconciledAt.getTime() ? lastWebhookAt : lastReconciledAt)
-                : (lastWebhookAt || lastReconciledAt);
-            const forceFullByReason = [
-                "missing_sync_status",
-                "last_audit_error",
-                "integrity_gap_detected",
-                "missing_last_reconciled_at",
-                "missing_last_webhook_at",
-                "webhook_stale"
-            ].includes(decision.reason);
-            const fullAuditDue = shouldRunFullAudit(data, {
-                intervalMinutes: RESERVATION_FULL_RECONCILE_INTERVAL_MINUTES,
-                now: tokyoNow.toDate()
-            });
-            const useIncremental = !!baseTime && !!lastReconciledAt && !fullAuditDue && !forceFullByReason;
-
-            let list;
-            let syncVariant = "full_reconcile";
-            if (useIncremental) {
-                const modifiedSince = new Date(baseTime.getTime() - 60000);
-                list = await fetchFromBeds24Incremental(modifiedSince);
-                syncVariant = "incremental";
-            } else {
-                list = await fetchFromBeds24Quick();
-            }
-            const result = await saveBookings(list, syncRangeStart, companyId, "beds24_scheduled_reconcile", {
-                mode: syncVariant === "incremental" ? "incremental" : "full_reconcile"
-            });
-            await recordReservationSyncAudit({
-                syncType: "scheduled",
-                syncVariant,
-                syncSource: "beds24_scheduled_reconcile",
-                companyId,
-                rangeStart: syncRangeStart,
-                rangeEnd: tokyoNow.add(6, "month").format("YYYY-MM-DD"),
-                fetchedCount: list.length,
-                upsertedCount: result.upsertedCount,
-                cancelledCount: result.cancelledCount,
-                invalidCriticalCount: result.invalidCriticalCount,
-                invalidReportCount: result.invalidReportCount,
-                sampleIds: result.sampleIds || [],
-                note: `reconcile reason=${decision.reason}, mode=${syncVariant}`
-            });
-            console.log(`✅ 예약 동기화 완료: ${list.length}건 (${syncVariant === "incremental" ? "증분" : "전체"}, reason=${decision.reason}, companyId: ${companyId}, ${tokyoNow.format("YYYY-MM-DD HH:mm")})`);
-            const fourteenDaysAgo = tokyoNow.subtract(14, "day").format("YYYY-MM-DD");
-            const fourteenDaysLater = tokyoNow.add(14, "day").format("YYYY-MM-DD");
-            const recentList = list.filter((r) => {
-                const d = r.arrival || r.departure || r.bookDate || "";
-                const dt = String(d).slice(0, 10);
-                return dt >= fourteenDaysAgo && dt <= fourteenDaysLater;
-            });
-            const impacts = recentList.map((item) => buildReservationOutputImpact(item));
-            try {
-                await scheduleOutputUpdates(impacts);
-            } catch (e) {
-                console.warn("[Scheduled Sync] Output update failed:", e.message);
-            }
-        } else {
-            await recordReservationSyncAudit({
-                syncType: "scheduled",
-                status: "skipped",
-                syncSource: "beds24_scheduled_reconcile",
-                companyId,
-                rangeStart: syncRangeStart,
-                rangeEnd: tokyoNow.add(6, "month").format("YYYY-MM-DD"),
-                note: `reservation reconcile skipped: ${decision.reason}`,
-                metadata: {
-                    reconcileAgeMinutes: Math.round(decision.reconcileAgeMinutes || 0),
-                    webhookAgeMinutes: Math.round(decision.webhookAgeMinutes || 0)
-                },
-                updateStatusDoc: false
-            });
-            console.log(`⏭️ 예약 재대사 스킵: reason=${decision.reason}, reconcileAge=${Math.round(decision.reconcileAgeMinutes || 0)}m, webhookAge=${Math.round(decision.webhookAgeMinutes || 0)}m`);
-        }
-
         await syncAllPrices({ reason: "scheduled" });
         console.log(`✅ 가격 동기화 완료 (${tokyoNow.format("YYYY-MM-DD HH:mm")})`);
     } catch (e) {
-        await recordReservationSyncAudit({
+        await recordPriceSyncAudit({
             syncType: "scheduled",
             status: "error",
-            syncSource: "beds24_scheduled_reconcile",
-            companyId,
-            rangeStart: syncRangeStart,
-            rangeEnd: tokyoNow.add(6, "month").format("YYYY-MM-DD"),
+            syncSource: "beds24_scheduled_prices",
+            companyId: DEFAULT_COMPANY_ID,
             errorMessage: e.message
         });
-        await sendSyncAlert("scheduledBeds24Sync failed", [
-            `companyId=${companyId}`,
+        await sendSyncAlert("scheduledBeds24PriceSync failed", [
+            `companyId=${DEFAULT_COMPANY_ID}`,
             e.message
         ]);
         throw e;
@@ -2313,7 +2455,7 @@ const {
     db,
     dayjs,
     DEFAULT_COMPANY_ID,
-    cleanPrice
+    BUILDING_ROOMS
 });
 
 // ==========================================
@@ -3690,46 +3832,6 @@ async function runNotionDashboardSync() {
     const tokyoNow = dayjs().tz("Asia/Tokyo");
     const year = tokyoNow.year();
     const month = tokyoNow.month() + 1;
-    const monthStart = `${year}-${String(month).padStart(2, "0")}-01`;
-    const monthEnd = dayjs(`${year}-${String(month).padStart(2, "0")}-01`).endOf("month").format("YYYY-MM-DD");
-    const daysInMonth = dayjs(monthStart).daysInMonth();
-
-    let totalRevenue = 0;
-    let bookingCount = 0;
-    let occupiedRoomNights = 0;
-
-    const snap = await db.collection("reservations")
-        .where("companyId", "==", DEFAULT_COMPANY_ID)
-        .where("status", "==", "confirmed")
-        .where("stayMonth", "==", `${year}-${String(month).padStart(2, "0")}`)
-        .get();
-
-    const EXCLUDED = new Set(["다이쿄초"]);
-    let totalRooms = 0;
-    for (const [bName, rooms] of Object.entries(BUILDING_ROOMS)) {
-        if (EXCLUDED.has(bName)) continue;
-        totalRooms += rooms.length;
-    }
-    const totalRoomNights = totalRooms * daysInMonth;
-
-    snap.docs.forEach((doc) => {
-        const d = doc.data();
-        const rev = Number(d.totalPrice ?? d.price ?? 0) || 0;
-        totalRevenue += rev;
-        bookingCount += 1;
-        const arrival = d.arrival ? dayjs(d.arrival) : null;
-        const departure = d.departure ? dayjs(d.departure) : null;
-        if (arrival && departure) {
-            const nights = Math.max(0, departure.diff(arrival, "day"));
-            occupiedRoomNights += nights;
-        }
-    });
-
-    const occupancyPct = totalRoomNights > 0 ? ((occupiedRoomNights / totalRoomNights) * 100).toFixed(1) : "0";
-
-    const salesSummary = `당월(${year}-${String(month).padStart(2, "0")}) 예약 ${bookingCount}건 · 누적 매출 ¥${totalRevenue.toLocaleString()}`;
-    const occSummary = `당월 가동률 ${occupancyPct}% (점유 ${occupiedRoomNights} room-nights / 전체 ${totalRoomNights})`;
-
     const monthlyReports = [];
     const startYear = 2026;
     const endYear = tokyoNow.year();
@@ -3759,6 +3861,16 @@ async function runNotionDashboardSync() {
     } catch (e) {
         console.warn("[Notion] Sales dashboard data/chart:", e.message);
     }
+
+    const currentYearMonth = `${year}-${String(month).padStart(2, "0")}`;
+    const currentMonthReport = monthlyReports.find((item) => item.yearMonth === currentYearMonth);
+    const currentSalesData = currentMonthReport?.salesData || null;
+    const salesSummary = currentSalesData
+        ? `당월(${currentYearMonth}) 체크인 예약 ${currentSalesData.checkinReservationCount ?? currentSalesData.stayMonthReservationCount ?? 0}건 · 운영 매출 ¥${Number(currentSalesData.currentMonthRevenue || 0).toLocaleString()}`
+        : `당월(${currentYearMonth}) 시스템 대시보드 기준 데이터가 없습니다.`;
+    const occSummary = currentSalesData
+        ? `당월 가동률 ${Number(currentSalesData.occupancyPct || 0).toFixed(1)}% (점유 ${currentSalesData.occupiedRoomNights || 0} room-nights / 전체 ${currentSalesData.totalRoomNights || 0})`
+        : `당월(${currentYearMonth}) 시스템 대시보드 기준 가동률 데이터가 없습니다.`;
 
     const runReportUrl = process.env.REPORT_BASE_URL ? `${process.env.REPORT_BASE_URL}/runDailyReportNow` : null;
     const appDashboardUrl = process.env.APP_BASE_URL ? `${process.env.APP_BASE_URL.replace(/\/$/, "")}/#/revenue` : null;

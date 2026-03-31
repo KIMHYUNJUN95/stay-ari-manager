@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { collection, getDocs, query, where, addDoc, writeBatch, doc } from "firebase/firestore";
 import { useNavigate } from 'react-router-dom';
 import { db, auth } from '../firebase';
@@ -6,7 +6,7 @@ import { useUser } from '../contexts/UserContext';
 import dayjs from 'dayjs';
 import axios from 'axios';
 
-import { BUILDING_NAMES_EN as _BUILDING_NAMES_EN, BUILDING_ORDER, EXCLUDED_BUILDING_UI, ACTIVE_BUILDING_ORDER } from '../constants/buildingData';
+import { BUILDING_NAMES_EN as _BUILDING_NAMES_EN, EXCLUDED_BUILDING_UI, ACTIVE_BUILDING_ORDER } from '../constants/buildingData';
 
 // 건물·객실 데이터 (캘린더 전용 — 매출 분석용 객실명)
 const BUILDING_DATA = {
@@ -98,7 +98,7 @@ function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose,
     const targetRooms = (selectedRooms && selectedRooms.length > 0) ? selectedRooms : [room];
 
     // 각 날짜별, 첫 번째 roomId(에어비앤비 채널)의 실제 가격
-    return selectedDates.sort().map(dateStr => {
+    return [...selectedDates].sort().map(dateStr => {
       const dateKey = dateStr.replace(/-/g, "");
 
       // 모든 선택 객실의 첫 번째 roomId에서 가격 수집
@@ -178,7 +178,7 @@ function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose,
     const targetRooms = (selectedRooms && selectedRooms.length > 0) ? selectedRooms : [room];
     const rows = [];
 
-    selectedDates.sort().forEach(dateStr => {
+    [...selectedDates].sort().forEach(dateStr => {
       const dateKey = dateStr.replace(/-/g, "");
       targetRooms.forEach(targetRoom => {
         const firstRoomInfo = BUILDING_ROOMS[building]?.find(r => r.name === targetRoom);
@@ -298,7 +298,6 @@ function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose,
       }));
 
       // results 배열에서 성공/실패 여부 확인
-      const successCount = results.filter(r => r.success).length;
       const failCount = results.filter(r => !r.success).length;
       const allSuccess = failCount === 0 && result.success !== false;
 
@@ -310,7 +309,7 @@ function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose,
       }));
 
       // 기간 정보 (정렬된 날짜의 첫 번째와 마지막)
-      const sortedDates = selectedDates.sort();
+      const sortedDates = [...selectedDates].sort();
       const dateFrom = sortedDates[0];
       const dateTo = sortedDates[sortedDates.length - 1];
 
@@ -928,9 +927,6 @@ function ReservationDetailModal({ reservation, onClose, onRefresh, isMobile }) {
   const handleUpdate = async () => {
     setLoading(true);
     try {
-      // 묶인 객실들 찾기
-      const targetRoomInfos = BUILDING_ROOMS[reservation.building]?.filter(r => r.name === reservation.room) || [];
-
       // 현재 예약과 같은 기간/방이름을 가진 다른 계정 예약들도 찾아서 같이 업데이트?
       // 우선 현재 bookId에 대해서는 확실히 업데이트
       const updatePayload = {
@@ -1815,6 +1811,7 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
   );
 }
 
+// eslint-disable-next-line no-unused-vars
 const labelStyle = {
   fontSize: "13px",
   fontWeight: "600",
@@ -1822,6 +1819,7 @@ const labelStyle = {
   marginLeft: "4px"
 };
 
+// eslint-disable-next-line no-unused-vars
 const inputStyle = {
   padding: "12px",
   borderRadius: "10px",
@@ -1831,6 +1829,7 @@ const inputStyle = {
   outline: "none"
 };
 
+// eslint-disable-next-line no-unused-vars
 const saveButtonStyle = {
   padding: "14px",
   background: "#0071E3",
@@ -1842,6 +1841,7 @@ const saveButtonStyle = {
   cursor: "pointer"
 };
 
+// eslint-disable-next-line no-unused-vars
 const cancelButtonStyle = {
   padding: "14px",
   background: "#F2F2F7",
@@ -1936,8 +1936,8 @@ function BuildingCalendar() {
   const [blockData, setBlockData] = useState([]);
   const [blockLoading, setBlockLoading] = useState(false);
   const [blockDeleting, setBlockDeleting] = useState(false);
-  const [selectionStart, setSelectionStart] = useState(null); // { room, date, day }
-  const [hoveredDay, setHoveredDay] = useState(null);
+  const [selectionStart, setSelectionStart] = useState(null); // { room, date }
+  const [hoveredDay, setHoveredDay] = useState(null); // dateStr (YYYY-MM-DD)
   const [hoveredRoom, setHoveredRoom] = useState(null);
   const [dragAction, setDragAction] = useState(null); // 'select' or 'deselect'
 
@@ -1945,6 +1945,8 @@ function BuildingCalendar() {
   const [roomPrices, setRoomPrices] = useState({});
   const [pricesLoading, setPricesLoading] = useState(false);
   const [pricesError, setPricesError] = useState(false);
+  const pricesLoadingRef = useRef(false);
+  const pendingFetchRef = useRef(null); // { building, forceRefresh } — 로딩 중 들어온 다음 요청
   const [priceCache, setPriceCache] = useState({}); // 건물별 캐시: { "아라키초A": {...} }
   const [lastPriceSync, setLastPriceSync] = useState(null); // 마지막 동기화 시간
   const [viewMode, setViewMode] = useState("monthly"); // "monthly" | "rolling"
@@ -1973,7 +1975,7 @@ function BuildingCalendar() {
   const year = currentDate.getFullYear();
   const month = currentDate.getMonth();
   const daysInMonth = getDaysInMonth(year, month);
-  const rooms = BUILDING_DATA[selectedBuilding] || [];
+  const rooms = useMemo(() => BUILDING_DATA[selectedBuilding] || [], [selectedBuilding]);
 
   // 뷰 모드에 따른 표시할 날짜 배열
   const displayDays = useMemo(() => {
@@ -2040,6 +2042,7 @@ function BuildingCalendar() {
     return activeInfos;
   }, [selectedBuilding, getMinStayForRoomIdDate]);
 
+  // eslint-disable-next-line no-unused-vars
   const isReservationActiveOnDate = useCallback((reservation, dateStr) => {
     if (!reservation?.roomId || selectedBuilding === "전체") return true;
     const activeInfos = getActiveUnitInfosForDate(reservation.room, dateStr);
@@ -2063,6 +2066,7 @@ function BuildingCalendar() {
   const handleMonthSelect = (newYear, newMonth) => setCurrentDate(new Date(newYear, newMonth, 1));
 
   // 오늘 기준 +N달 이동 (오늘 날짜가 속한 달 기준)
+  // eslint-disable-next-line no-unused-vars
   const goToTodayPlusMonths = (months) => {
     const today = new Date();
     setCurrentDate(new Date(today.getFullYear(), today.getMonth() + months, 1));
@@ -2204,35 +2208,45 @@ function BuildingCalendar() {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    // ★ Bug #3 Fix: 롤링 뷰일 때는 Rolling View 기준 주차? 
-    // 기획적으로 주간 선택은 "월 표시" 기준이 명확하므로, Rolling View에서도 "현재 월"의 1주~5주를 선택하는 것이 자연스러움.
-    // 하지만 Rolling View에서 "보이는 날짜"만 선택되어야 한다면 displayDays를 참고해야 함.
-    // 여기서는 기존 로직(월 기준)을 유지하되, Rolling View에서 안 보이는 날짜여도 "데이터상" 선택은 되도록 유지하는게 맞음.
-    // 다만, Rolling View는 "보이는 날짜"가 중요하므로, Rolling View일 때는 displayDays에서 해당 "번째" 7일을 선택하거나...
-    // 사용자 경험상 "Week 1" = 1일~7일, "Week 2" = 8일~14일로 고정되어 있음.
-    // 따라서 기존 로직을 유지하되, 월 경계를 넘는 처리가 필요하면 수정. 여기서는 단순 버그 수정이므로 로직 유지.
+    if (viewMode === "rolling") {
+      // Rolling View: displayDays를 7일 단위 블록으로 나눠서 선택
+      const startIdx = (weekIdx - 1) * 7;
+      const endIdx = weekIdx === 5 ? displayDays.length : weekIdx * 7;
 
-    // 단, Bug #1 Fix: 모달 오픈을 위해 selectedRoom 설정은 필수.
+      for (let i = startIdx; i < endIdx && i < displayDays.length; i++) {
+        const d = displayDays[i];
+        if (d.date < today) continue;
 
-    let startDay = (weekIdx - 1) * 7 + 1;
-    let endDay = weekIdx * 7;
-    if (weekIdx === 5) endDay = daysInMonth; // 5주는 말일까지
+        const dayOfWeek = d.date.getDay();
+        let shouldSelect = false;
+        if (filterType === 'all') shouldSelect = true;
+        else if (filterType === 'weekend') shouldSelect = (dayOfWeek === 5 || dayOfWeek === 6 || dayOfWeek === 0);
+        else if (filterType === 'weekday') shouldSelect = (dayOfWeek >= 1 && dayOfWeek <= 4);
 
-    for (let i = startDay; i <= daysInMonth; i++) {
-      if (i > endDay) break;
+        if (shouldSelect) newDates.push(d.dateStr);
+      }
+    } else {
+      // Monthly View: 기존 월 기준 로직
+      let startDay = (weekIdx - 1) * 7 + 1;
+      let endDay = weekIdx * 7;
+      if (weekIdx === 5) endDay = daysInMonth;
 
-      const date = new Date(year, month, i);
-      if (date < today) continue;
+      for (let i = startDay; i <= daysInMonth; i++) {
+        if (i > endDay) break;
 
-      const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(i).padStart(2, '0')}`;
-      const dayOfWeek = date.getDay();
+        const date = new Date(year, month, i);
+        if (date < today) continue;
 
-      let shouldSelect = false;
-      if (filterType === 'all') shouldSelect = true;
-      else if (filterType === 'weekend') shouldSelect = (dayOfWeek === 5 || dayOfWeek === 6 || dayOfWeek === 0);
-      else if (filterType === 'weekday') shouldSelect = (dayOfWeek >= 1 && dayOfWeek <= 4);
+        const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(i).padStart(2, '0')}`;
+        const dayOfWeek = date.getDay();
 
-      if (shouldSelect) newDates.push(dateStr);
+        let shouldSelect = false;
+        if (filterType === 'all') shouldSelect = true;
+        else if (filterType === 'weekend') shouldSelect = (dayOfWeek === 5 || dayOfWeek === 6 || dayOfWeek === 0);
+        else if (filterType === 'weekday') shouldSelect = (dayOfWeek >= 1 && dayOfWeek <= 4);
+
+        if (shouldSelect) newDates.push(dateStr);
+      }
     }
 
     // ★ 선택된 방들 × 새 날짜들로 셀 추가 (누적)
@@ -2247,20 +2261,18 @@ function BuildingCalendar() {
     });
     setSelectedCells(prev => [...prev, ...newCells]);
 
-    // ★ Bug #1 Fix
     if (roomsToUse.length > 0) {
       setSelectedRoom(roomsToUse[0]);
     }
   };
 
   // 날짜 셀 클릭 핸들러
-  const handleDateCellClick = (room, day) => {
-    const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-    const clickedDate = new Date(year, month, day);
+  const handleDateCellClick = (room, dateStr) => {
+    const clickedDate = dayjs(dateStr).toDate();
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    // 과거 날짜는 무시 (가격 설정 모드 아닐 때만? 아니면 공통으로?)
+    // 과거 날짜는 무시
     if (clickedDate < today) return;
 
     // 가격 설정 모드 또는 Gap 수정 모드일 때 (단일 클릭 시)
@@ -2269,7 +2281,6 @@ function BuildingCalendar() {
       if (!roomInfo) return;
 
       // ★ 셀 단위 선택 (토글)
-      const cellKey = `${room}|${dateStr}`;
       const existingIndex = selectedCells.findIndex(c => c.room === room && c.date === dateStr);
 
       if (existingIndex >= 0) {
@@ -2287,12 +2298,12 @@ function BuildingCalendar() {
     // 일반 모드 (수기 예약 퀵 등록)
     if (!selectionStart) {
       // 첫 번째 클릭: 시작점 설정
-      setSelectionStart({ room, date: dateStr, day });
+      setSelectionStart({ room, date: dateStr });
     } else {
       // 두 번째 클릭
       if (selectionStart.room !== room) {
         // 다른 방을 클릭하면 selection 초기화하고 다시 시작
-        setSelectionStart({ room, date: dateStr, day });
+        setSelectionStart({ room, date: dateStr });
         return;
       }
 
@@ -2332,8 +2343,14 @@ function BuildingCalendar() {
 
   // 가격 데이터 조회 (Firestore 캐시에서 읽기 - API 직접 호출 없음)
   const fetchPrices = useCallback(async (forceRefresh = false) => {
-    if (pricesLoading) return;
     if (selectedBuilding === "전체") return; // 전체 보기에서는 가격 조회 안함
+
+    // 로딩 중이면 pending으로 큐잉 (마지막 요청만 유지)
+    if (pricesLoadingRef.current) {
+      pendingFetchRef.current = { building: selectedBuilding, forceRefresh };
+      return;
+    }
+
     setPricesError(false);
 
     // 프론트엔드 캐시 확인 (강제 새로고침이 아닐 때만)
@@ -2342,19 +2359,21 @@ function BuildingCalendar() {
       return;
     }
 
+    pricesLoadingRef.current = true;
     setPricesLoading(true);
+    const fetchBuilding = selectedBuilding;
     try {
       // Firestore 캐시에서 읽기 (Beds24 API 호출 없음)
       const response = await fetch(`${API_BASE_URL}/getCachedPrices`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ companyId, building: selectedBuilding })
+        body: JSON.stringify({ companyId, building: fetchBuilding })
       });
 
       const data = await response.json();
       if (data.success && data.priceData) {
         // 프론트엔드 캐시에 저장
-        setPriceCache(prev => ({ ...prev, [selectedBuilding]: data.priceData }));
+        setPriceCache(prev => ({ ...prev, [fetchBuilding]: data.priceData }));
         // 현재 가격 데이터에 병합
         setRoomPrices(prev => ({ ...prev, ...data.priceData }));
         // 마지막 동기화 시간 저장
@@ -2368,10 +2387,19 @@ function BuildingCalendar() {
       console.error("Price fetch error:", err);
       setPricesError(true);
     } finally {
+      pricesLoadingRef.current = false;
       setPricesLoading(false);
+
+      // pending 요청이 있으면 즉시 실행
+      const pending = pendingFetchRef.current;
+      if (pending) {
+        pendingFetchRef.current = null;
+        // pending 건물이 현재 선택과 같을 때만 실행 (건물 다시 바뀌었으면 effect가 처리)
+        fetchPrices(pending.forceRefresh);
+      }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedBuilding, pricesLoading, companyId]);
+  }, [selectedBuilding, companyId]);
 
   // 일반 모드/가격 모드 모두 날짜별 활성 roomId 판정을 위해 캐시 로드
   useEffect(() => {
@@ -2560,7 +2588,7 @@ function BuildingCalendar() {
     } finally {
       setLoading(false);
     }
-  }, [selectedBuilding, year, month, daysInMonth, showCancelled, viewMode, rollingStartDate]);
+  }, [companyId, selectedBuilding, year, month, daysInMonth, showCancelled, viewMode, rollingStartDate]);
 
   // 데이터 페칭
   useEffect(() => {
@@ -2706,7 +2734,7 @@ function BuildingCalendar() {
         const dateKey = `${year}${String(month + 1).padStart(2, '0')}${String(d).padStart(2, '0')}`;
         const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
 
-        rooms.forEach(roomName => {
+        for (const roomName of rooms) {
           const isReserved = reservations.some(r =>
             r.room === roomName &&
             r.arrival <= dateStr &&
@@ -2724,7 +2752,7 @@ function BuildingCalendar() {
               if (airbnb > maxPrice) maxPrice = airbnb;
             }
           }
-        });
+        }
       }
     }
     return { minPrice: minPrice === Infinity ? 0 : minPrice, maxPrice };
@@ -5205,7 +5233,6 @@ function BuildingCalendar() {
                         let airbnbPrice = 0;
                         let bookingPrice = 0;
                         let minStay = 0;  // 0은 "아직 값 없음" 의미
-                        let maxStay = 0;
                         let hasError = false;
                         let errorMsg = "";
 
@@ -5222,11 +5249,9 @@ function BuildingCalendar() {
                             const bp = parseFloat(priceInfo.p2) || 0;  // Booking 가격 (p2)
                             // Beds24에서 빈값 = 1박 가능이므로 빈값/0은 1로 해석
                             const ms = parseInt(priceInfo.m) || 1;     // 최소 숙박일수 (빈값=1)
-                            const mx = parseInt(priceInfo.mx) || 0;    // 최대 숙박일수
                             if (ap > 0) airbnbPrice = ap;
                             if (bp > 0) bookingPrice = bp;
                             if (ms >= 1 && ms < INACTIVE_MINSTAY_THRESHOLD && (minStay === 0 || ms < minStay)) minStay = ms;  // 비활성(INACTIVE_MINSTAY_THRESHOLD+) 제외, 최소값 선택
-                            if (mx > 0 && mx < 50) maxStay = mx;  // 비활성(50+) 제외한 활성 어카운트만
                           }
                         });
 
@@ -5242,13 +5267,13 @@ function BuildingCalendar() {
 
                         // 선택 가능한지 (예약 없고, 과거 아님)
                         const canSelect = !hasReservation && !isPastDate;
-                        const isSelectionStart = selectionStart && selectionStart.room === room && selectionStart.day === day;
-                        // 퀵 예약 범위 하이라이트 계산
+                        const isSelectionStart = selectionStart && selectionStart.room === room && selectionStart.date === dateStr;
+                        // 퀵 예약 범위 하이라이트 계산 (dateStr 비교로 월 경계 지원)
                         let isInQuickSelectionRange = false;
                         if (!priceMode && selectionStart && selectionStart.room === room && hoveredDay && hoveredRoom === room) {
-                          const start = Math.min(selectionStart.day, hoveredDay);
-                          const end = Math.max(selectionStart.day, hoveredDay);
-                          if (day >= start && day <= end) {
+                          const startD = selectionStart.date <= hoveredDay ? selectionStart.date : hoveredDay;
+                          const endD = selectionStart.date <= hoveredDay ? hoveredDay : selectionStart.date;
+                          if (dateStr >= startD && dateStr <= endD) {
                             isInQuickSelectionRange = true;
                           }
                         }
@@ -5259,7 +5284,7 @@ function BuildingCalendar() {
                             onClick={(e) => {
                               if (canSelect && !priceMode) {
                                 e.stopPropagation();
-                                handleDateCellClick(room, day);
+                                handleDateCellClick(room, dateStr);
                               }
                             }}
                             onMouseDown={(e) => {
@@ -5322,7 +5347,7 @@ function BuildingCalendar() {
                             }}
                             onMouseEnter={(e) => {
                               if (canSelect) {
-                                setHoveredDay(day);
+                                setHoveredDay(dateStr);
                                 setHoveredRoom(room);
 
                                 // 드래그 중이면 선택/해제 처리 (priceMode 또는 gapEditMode)

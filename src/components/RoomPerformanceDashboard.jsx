@@ -532,8 +532,8 @@ const RoomPerformanceDashboard = () => {
       const totalPrevRevenue = calculateRevenue(allReservations, previousRange.start, previousRange.end);
 
       // 건물별 가동률/매출 계산 (사노시 제외 - 가동률 계산용)
-      let currentOccupied = 0, currentAvailable = 0, currentRevenue = 0;
-      let prevOccupied = 0, prevAvailable = 0, prevRevenue = 0;
+      let currentOccupied = 0, currentAvailable = 0;
+      let prevOccupied = 0, prevAvailable = 0;
 
       const buildingStats = [];
       const roomStats = {};
@@ -618,10 +618,8 @@ const RoomPerformanceDashboard = () => {
 
         currentOccupied += bldgCurrentOcc;
         currentAvailable += bldgAvailable;
-        currentRevenue += bldgCurrentRev;
         prevOccupied += bldgPrevOcc;
         prevAvailable += rooms.length * previousRange.days;
-        prevRevenue += bldgPrevRev;
       });
 
       // 정렬

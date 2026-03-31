@@ -40,3 +40,6 @@ serviceAccountKey.json
 # Firebase Functions params (웹훅 URL 등)
 functions/.env
 functions/.env.*
+
+# npm cache
+.npm-cache/

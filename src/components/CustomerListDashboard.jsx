@@ -81,10 +81,7 @@ const CustomerListDashboard = () => {
         ...doc.data()
       }));
 
-      const filteredData = data.filter(res => {
-        const bookDate = res.bookDate || res.arrival;
-        return res.building !== EXCLUDED_BUILDING_UI;
-      });
+      const filteredData = data.filter(res => res.building !== EXCLUDED_BUILDING_UI);
       setReservations(filteredData);
     } catch (error) {
       console.error("Failed to load customer data:", error);

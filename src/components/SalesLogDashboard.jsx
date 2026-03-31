@@ -1,6 +1,6 @@
 // src/components/SalesLogDashboard.jsx
 // Revenue Analytics Dashboard - Historical Data & Forecasting
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { collection, getDocs, query, where, doc, getDoc, setDoc } from "firebase/firestore";
 import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
@@ -83,7 +83,7 @@ const SalesLogDashboard = () => {
   const [viewMode, setViewMode] = useState("monthly");
 
   // Selected date
-  const today = new Date();
+  const today = useMemo(() => new Date(), []);
   const [selectedYear, setSelectedYear] = useState(today.getFullYear());
   const [selectedMonth, setSelectedMonth] = useState(today.getMonth() + 1);
   const [selectedDay, setSelectedDay] = useState(today.getDate());
@@ -132,11 +132,7 @@ const SalesLogDashboard = () => {
   };
 
   // Load memo
-  useEffect(() => {
-    loadMemo();
-  }, [selectedYear, selectedMonth, selectedDay, viewMode]);
-
-  const loadMemo = async () => {
+  const loadMemo = useCallback(async () => {
     if (!companyId) return;
     try {
       const memoKey = viewMode === "daily"
@@ -154,7 +150,11 @@ const SalesLogDashboard = () => {
     } catch (error) {
       console.error("Failed to load memo:", error);
     }
-  };
+  }, [companyId, selectedDay, selectedMonth, selectedYear, viewMode]);
+
+  useEffect(() => {
+    loadMemo();
+  }, [loadMemo]);
 
   // Save memo
   const handleSaveMemo = async () => {
@@ -454,7 +454,7 @@ const SalesLogDashboard = () => {
       predictions,
       currentRooms: CURRENT_TOTAL_ROOMS
     };
-  }, [allReservations]);
+  }, [allReservations, today]);
 
   // Generate daily calendar
   const generateDailyCalendar = () => {

@@ -628,7 +628,7 @@ const InfoRow = ({ label, value, icon, field, isEditing, editData, setEditData }
 
 // Reservation Detail Modal Component
 const ReservationDetailModal = ({ reservation, onClose }) => {
-  const [isEditing, setIsEditing] = useState(false);
+  const [isEditing] = useState(false);
   const [editData, setEditData] = useState({
     ...reservation,
     totalPrice: reservation.totalPrice ?? reservation.price ?? ""

@@ -28,18 +28,18 @@ function ToastItem({ toast, onClose, onClick }) {
   const timerRef = useRef(null);
   const c = TOAST_COLORS[toast.type] || TOAST_COLORS.dm;
 
+  const dismiss = useCallback(() => {
+    setLeaving(true);
+    setTimeout(() => onClose(toast.id), 350);
+  }, [toast.id, onClose]);
+
   useEffect(() => {
     // Slide in
     requestAnimationFrame(() => setVisible(true));
     // Auto dismiss
     timerRef.current = setTimeout(() => dismiss(), 5000);
     return () => clearTimeout(timerRef.current);
-  }, []);
-
-  const dismiss = useCallback(() => {
-    setLeaving(true);
-    setTimeout(() => onClose(toast.id), 350);
-  }, [toast.id, onClose]);
+  }, [dismiss]);
 
   const handleClick = () => {
     dismiss();
@@ -118,7 +118,7 @@ function ToastItem({ toast, onClose, onClick }) {
 // Toast Container + Logic
 // ─────────────────────────────────────────────
 export default function TeamToast() {
-  const { user, userData, companyId } = useUser();
+  const { user, companyId } = useUser();
   const [toasts, setToasts] = useState([]);
   const navigate = useNavigate();
   const readyRef = useRef(false);

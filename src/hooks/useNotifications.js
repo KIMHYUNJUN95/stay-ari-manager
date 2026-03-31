@@ -404,7 +404,7 @@ export const useNotifications = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [companyId, fetchReservations, compareAndNotify, notifications, compressReservations]);
+  }, [companyId, fetchReservations, compareAndNotify, notifications, compressReservations, generateMessage]);
 
   // Set up 15-minute polling interval
   useEffect(() => {

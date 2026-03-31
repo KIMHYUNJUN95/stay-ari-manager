@@ -60,7 +60,6 @@ const getScoreBg = (score, max = 10) => {
   return "rgba(239,68,68,0.12)";
 };
 
-const formatScore = (score, decimals = 1) => score > 0 ? score.toFixed(decimals) : "—";
 const formatScoreAuto = (score, max = 10) => score > 0 ? score.toFixed(max === 5 ? 2 : 1) : "—";
 
 const formatDate = (dateStr) => {
@@ -405,6 +404,7 @@ function ScoreBadge({ score, max = 10, size = "md" }) {
   );
 }
 
+// eslint-disable-next-line no-unused-vars
 function StarDisplay({ score, max = 5 }) {
   const filled = Math.round((score / 10) * max);
   return (
@@ -730,9 +730,6 @@ function InsightsTab({ weaknesses, buildingStats, channel }) {
   });
 
   const radarData = radarChannel === "booking" ? bookingRadarData : airbnbRadarData;
-
-  const highWeaknesses = weaknesses.filter(w => w.gap > 1.5);
-  const lowWeaknesses = weaknesses.filter(w => w.gap <= 1.5);
 
   return (
     <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
@@ -1274,6 +1271,8 @@ function ReviewSyncModal({ isOpen, onClose, onDone, companyId }) {
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
 
+  // eslint-disable-next-line no-unused-vars
+  // eslint-disable-next-line no-unused-vars
   const handleSync = async () => {
     setSyncing(true); setResult(null); setError(null);
     try {
@@ -1404,6 +1403,7 @@ export default function ReviewsDashboard() {
   useEffect(() => { loadReviews(); }, [loadReviews]);
 
   // Manual sync
+  // eslint-disable-next-line no-unused-vars
   const handleSync = async () => {
     if (syncing || !companyId) return;
     setSyncing(true);

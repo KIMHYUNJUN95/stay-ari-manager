@@ -145,7 +145,7 @@ export default function RoomLinksDashboard() {
   const [platform, setPlatform] = useState("airbnb"); // airbnb, booking
   const [selectedBuilding, setSelectedBuilding] = useState("");
   const [roomFilter, setRoomFilter] = useState("");
-  const [loadFromFirestoreDone, setLoadFromFirestoreDone] = useState(false);
+  const [, setLoadFromFirestoreDone] = useState(false);
 
   // Modal States
   const [showAddBuilding, setShowAddBuilding] = useState(false);

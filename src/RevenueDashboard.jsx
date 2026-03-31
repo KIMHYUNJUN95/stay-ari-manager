@@ -3,7 +3,6 @@ import { collection, getDocs, query, where } from "firebase/firestore";
 import { db } from './firebase';
 import { useUser } from './contexts/UserContext';
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
-import DatePicker from 'react-datepicker';
 import 'react-datepicker/dist/react-datepicker.css';
 import { getMonth, getYear } from 'date-fns';
 import { BUILDING_ORDER, EXCLUDED_BUILDING_UI, ACTIVE_BUILDING_ORDER, BUILDING_NAMES_EN as _BUILDING_NAMES_EN } from './constants/buildingData';
@@ -12,6 +11,7 @@ import { BUILDING_ORDER, EXCLUDED_BUILDING_UI, ACTIVE_BUILDING_ORDER, BUILDING_N
 const MONTHS_EN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const years = Array.from({ length: 20 }, (_, i) => 2020 + i); // 2020-2039
 
+// eslint-disable-next-line no-unused-vars
 const CustomDatePickerHeader = ({
   date,
   changeYear,
@@ -65,8 +65,6 @@ const FISCAL_PERIODS = [
 // 현재 날짜 기준으로 현재 기수 찾기
 const getCurrentPeriod = () => {
   const now = new Date();
-  const year = now.getFullYear();
-  const month = now.getMonth() + 1; // 1-12
 
   for (const fp of FISCAL_PERIODS) {
     // 시작일과 종료일 체크
@@ -88,8 +86,6 @@ const getPeriodInfo = (periodNum) => {
 const getActiveBuildingOrder = () => ACTIVE_BUILDING_ORDER;
 
 
-
-const MONTH_NAMES_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 // ★ 날짜 문자열을 로컬 시간대로 파싱 (시간대 문제 해결)
 const parseLocalDate = (dateStr) => {
@@ -234,7 +230,7 @@ const RevenueDashboard = () => {
 
   // 데이터 상태
   const [monthlyData, setMonthlyData] = useState([]);
-  const [buildingData, setBuildingData] = useState([]);
+  const [, setBuildingData] = useState([]);
   const [buildingCompareData, setBuildingCompareData] = useState([]); // 건물별 비교 데이터
   const [roomData, setRoomData] = useState({});
   const [roomCompareData, setRoomCompareData] = useState({}); // 객실별 비교 데이터
@@ -472,19 +468,12 @@ const RevenueDashboard = () => {
         const rangeStart = parseLocalDate(range.startDate);
         const rangeEnd = parseLocalDate(range.endDate);
 
-        // 디버깅용
-        let debugCount = 0;
-        const isDebugTarget = (doc, bName, rName) => {
-          return bName === "아라키초A" && rName === "201호" && doc.arrival >= range.startDate && doc.arrival <= range.endDate;
-        };
-
         docs.forEach(doc => {
           if (!doc.arrival || !doc.departure) return;
 
           const totalPrice = Number(doc.totalPrice || doc.price) || 0;
           const bName = doc.building || "Unknown";
           const rName = doc.room || "Unknown";
-          const bookDate = doc.bookDate || doc.arrival;
 
           if (bName === EXCLUDED_BUILDING_UI) return;
 
@@ -625,67 +614,6 @@ const RevenueDashboard = () => {
           if (verifiedConfig.target.building !== ALL_BUILDINGS && verifiedConfig.target.rooms.length > 0 && !verifiedConfig.target.rooms.includes(d.room)) return false;
           return true;
         });
-
-        const customMapper = (date) => {
-          // Important: Mapper needs to normalize dates to the X-axis keys (which are typically based on Target Range)
-          // If comparing 2024 (Target) vs 2023 (Compare), 2023-01 should map to 2024-01 key.
-          // However, simple month based mapping (01, 02...) is better for Comparison.
-          if (dateMode === DATE_MODES.YEAR || dateMode === DATE_MODES.PERIOD) {
-            return String(date.getMonth() + 1).padStart(2, '0');
-          }
-          if (dateMode === DATE_MODES.MONTH) {
-            // Single month view - key is just the month?? No, usually we show day distribution or just single bar.
-            // If month mode showing daily breakdown:
-            // Actually, getMonthLabels returns keys like "YYYY-MM".
-            // We need to map compare date to target date's key.
-            return "MONTH_TOTAL"; // Simplified for Month Total Comparison if needed, but existing logic uses specific keys.
-          }
-          return String(date.getMonth() + 1).padStart(2, '0');
-        };
-
-        // For Year/Period mode, we show Monthly trend.
-        // We need X-axis to be 01~12 (or Jul~Jun).
-        // Let's force X-axis labels to be strictly Month Names or period index for alignment.
-        // Existing logic uses `monthLabels` based on GLOBAL date mode/selection.
-        // We should GENERATE monthLabels based on TARGET range.
-
-        // Override global monthLabels logic essentially for this request.
-        // But to keep it simple: Let's assume keys are "MM".
-        // Update: processRevenue keys.
-
-        // We need a uniform key mapper for comparison. 
-        // Let's use `monthIndex` (0-11) relative to start of period.
-        const getRelativeKey = (date, startStr) => {
-          const start = parseLocalDate(startStr);
-          // Simple month diff?
-          const diff = (date.getFullYear() - start.getFullYear()) * 12 + (date.getMonth() - start.getMonth());
-          return diff;
-        };
-
-        // Standardized Mapper for Custom Compare (Align by relative month/day offset)
-        // If Year Mode: Align Jan to Jan.
-        // If Period Mode: Align Jul to Jul.
-        const alignMapper = (date, rangeStart) => {
-          const d = new Date(date);
-          const start = parseLocalDate(rangeStart);
-          let key = "";
-
-          if (verifiedConfig.dateMode === DATE_MODES.YEAR) {
-            key = String(d.getMonth() + 1).padStart(2, '0'); // 01, 02...
-          } else if (verifiedConfig.dateMode === DATE_MODES.PERIOD) {
-            const m = d.getMonth() + 1; // 1-12
-            // Period 7 (Jul start): Jul->01, Aug->02 ... Jun->12
-            // But existing monthLabels for Period returns 07, 08... 06.
-            // Just use MM string as key. 
-            key = String(m).padStart(2, '0');
-          } else if (verifiedConfig.dateMode === DATE_MODES.MONTH) {
-            // Daily distribution?
-            // Existing logic for Month mode returns single bar usually or breakdown?
-            // Existing `getMonthLabels` for MONTH mode returns single item.
-            key = `${String(d.getMonth() + 1).padStart(2, '0')}`;
-          }
-          return key;
-        }
 
         // We need to Re-generate monthLabels based on Target Range to ensure X-axis is correct for Target
         // But `monthLabels` var is derived from global state outside. 

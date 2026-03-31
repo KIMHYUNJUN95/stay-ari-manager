@@ -1,7 +1,7 @@
 // src/components/DesignPreview.jsx
 // Finova 스타일 대시보드 - 대기업 수준 퀄리티
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { collection, getDocs, query, where } from "firebase/firestore";
 import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
@@ -25,11 +25,7 @@ const DesignPreview = () => {
   const [platformStats, setPlatformStats] = useState({ airbnb: 0, booking: 0 });
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    fetchData();
-  }, [companyId]);
-
-  const fetchData = async () => {
+  const fetchData = useCallback(async () => {
     try {
       if (!companyId) {
         console.warn('⚠️ No companyId for DesignPreview');
@@ -109,20 +105,17 @@ const DesignPreview = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [companyId]);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
 
   const formatPrice = (price) => `¥${Math.round(price).toLocaleString()}`;
   
   const getChangePercent = (current, previous) => {
     if (previous === 0) return current > 0 ? 100 : 0;
     return Math.round(((current - previous) / previous) * 100);
-  };
-
-  const getGreeting = () => {
-    const hour = new Date().getHours();
-    if (hour < 12) return 'Good Morning';
-    if (hour < 18) return 'Good Afternoon';
-    return 'Good Evening';
   };
 
   if (loading) {

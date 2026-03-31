@@ -1,16 +1,15 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { HashRouter as Router, Routes, Route, useNavigate, useLocation } from 'react-router-dom';
-import { collection, getDocs, query, where, doc, getDoc } from "firebase/firestore";
-import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut } from "firebase/auth";
+import { collection, getDocs, query, where } from "firebase/firestore";
+import { signOut } from "firebase/auth";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
-import { Haptics, ImpactStyle } from '@capacitor/haptics';
 import { StatusBar, Style } from '@capacitor/status-bar';
 import { Capacitor } from '@capacitor/core';
 
 // ★ 핵심: firebase.js 에서 db, auth 가져오기
 import { db, auth } from './firebase';
 import { UserProvider, useUser } from './contexts/UserContext';
-import { BUILDING_NAMES_EN as _BUILDING_NAMES_EN_CENTRAL, BUILDING_ORDER as _BUILDING_ORDER_CENTRAL, EXCLUDED_BUILDING_UI, ACTIVE_BUILDING_ORDER as _ACTIVE_BUILDING_ORDER } from './constants/buildingData';
+import { BUILDING_NAMES_EN as _BUILDING_NAMES_EN_CENTRAL, EXCLUDED_BUILDING_UI, ACTIVE_BUILDING_ORDER as _ACTIVE_BUILDING_ORDER } from './constants/buildingData';
 import RevenueDashboard from './RevenueDashboard.jsx';
 import CleaningDashboard from './components/CleaningDashboard.jsx';
 import OccupancyRateDashboard from './components/OccupancyRateDashboard.jsx';
@@ -27,10 +26,6 @@ import SalesLogDashboard from './components/SalesLogDashboard.jsx';
 import DesignPreview from './components/DesignPreview.jsx';
 import NewLayout from './components/NewLayout.jsx';
 import ArrivalsAndDeparturesDashboard from './components/ArrivalsAndDeparturesDashboard.jsx';
-import SignUpForm from './components/SignUpForm.jsx';
-import GoogleSignUpForm from './components/GoogleSignUpForm.jsx';
-import PhoneSignIn from './components/PhoneSignIn.jsx';
-import InviteCodeManager from './components/InviteCodeManager.jsx';
 import MemberManagement from './components/MemberManagement.jsx';
 import TeamToast from './components/TeamToast.jsx';
 import ReviewsDashboard from './components/ReviewsDashboard.jsx';
@@ -40,8 +35,6 @@ import LoginScreen from './components/LoginScreen.jsx';
 
 // ★★★ 서버 주소 ★★★
 const GET_ARRIVALS_URL = "https://us-central1-my-booking-app-3f0e7.cloudfunctions.net/getTodayArrivals";
-const SYNC_BEDS24_URL = "https://us-central1-my-booking-app-3f0e7.cloudfunctions.net/syncBeds24";
-const SYNC_BEDS24_FULL_URL = "https://us-central1-my-booking-app-3f0e7.cloudfunctions.net/syncBeds24Full";
 
 // --- [1] 디자인 (Apple Style CSS) ---
 // --- [1] 디자인 (Haru Studio Enterprise Theme) ---
@@ -541,6 +534,7 @@ const MENU_ITEMS = [
 // ==============================
 // 모바일 헤더 컴포넌트
 // ==============================
+// eslint-disable-next-line no-unused-vars
 function MobileHeader({ onMenuClick, currentPath }) {
   const currentMenu = MENU_ITEMS.find(m => m.path === currentPath);
 
@@ -564,6 +558,7 @@ function MobileHeader({ onMenuClick, currentPath }) {
 // ==============================
 // 모바일 슬라이드 메뉴 컴포넌트
 // ==============================
+// eslint-disable-next-line no-unused-vars
 function MobileMenu({ isOpen, onClose, onSync, currentPath }) {
   const navigate = useNavigate();
 
@@ -631,6 +626,7 @@ function MobileMenu({ isOpen, onClose, onSync, currentPath }) {
 // ==============================
 // Sidebar 컴포넌트 (PC 전용)
 // ==============================
+// eslint-disable-next-line no-unused-vars
 function Sidebar({ onSync, syncing }) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -2285,6 +2281,7 @@ const sortByBuildingOrder = (list) => {
   });
 };
 
+// eslint-disable-next-line no-unused-vars
 function DeprecatedArrivalsDashboard() {
   const { companyId } = useUser();
   const [selectedDate, setSelectedDate] = useState(new Date().toISOString().slice(0, 10));
@@ -2342,7 +2339,7 @@ function DeprecatedArrivalsDashboard() {
   }, [selectedDate]);
 
   // 고객 이름 검색 함수 (1글자부터 자동 검색)
-  const searchGuests = async (queryText) => {
+  const searchGuests = useCallback(async (queryText) => {
     if (!queryText || queryText.trim().length < 1) {
       setSearchResults([]);
       setShowSearchResults(false);
@@ -2383,7 +2380,7 @@ function DeprecatedArrivalsDashboard() {
       console.error("검색 오류:", err);
       setSearchResults([]);
     }
-  };
+  }, [companyId]);
 
   // 검색어 변경 시 디바운스 적용
   useEffect(() => {
@@ -2391,7 +2388,7 @@ function DeprecatedArrivalsDashboard() {
       searchGuests(searchQuery);
     }, 300);
     return () => clearTimeout(timer);
-  }, [searchQuery]);
+  }, [searchGuests, searchQuery]);
 
   // 선택한 날짜의 입실/퇴실 필터링 후 건물 순서대로 정렬
   const todayArrivals = sortByBuildingOrder(guestList.filter(guest => guest.arrival === selectedDate));
@@ -2904,7 +2901,7 @@ function AppContent({ handleSync, syncing, globalMonth, setGlobalMonth, mobileMe
 function App() {
   const { user, userData, companyId, loading } = useUser();
   const [globalMonth, setGlobalMonth] = useState(new Date().toISOString().slice(0, 7));
-  const [syncing, setSyncing] = useState(false);
+  const [syncing] = useState(false);
   const [syncModalOpen, setSyncModalOpen] = useState(false);
   const [showInstallPrompt, setShowInstallPrompt] = useState(true);
   const [deferredPrompt, setDeferredPrompt] = useState(null);

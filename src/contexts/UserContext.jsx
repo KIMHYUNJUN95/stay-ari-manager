@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
 import { doc, getDoc, updateDoc, serverTimestamp } from 'firebase/firestore';
 import { auth, db } from '../firebase';
@@ -38,33 +38,33 @@ export function UserProvider({ children }) {
   const heartbeatRef = useRef(null);
   const uidRef = useRef(null);
 
-  const setOnline = async (uid) => {
+  const setOnline = useCallback(async (uid) => {
     try {
       await updateDoc(doc(db, 'users', uid), {
         isOnline: true,
         lastSeen: serverTimestamp(),
       });
     } catch (e) {}
-  };
+  }, []);
 
-  const setOffline = async (uid) => {
+  const setOffline = useCallback(async (uid) => {
     try {
       await updateDoc(doc(db, 'users', uid), { isOnline: false });
     } catch (e) {}
-  };
+  }, []);
 
-  const stopHeartbeat = () => {
+  const stopHeartbeat = useCallback(() => {
     if (heartbeatRef.current) {
       clearInterval(heartbeatRef.current);
       heartbeatRef.current = null;
     }
-  };
+  }, []);
 
-  const startHeartbeat = (uid) => {
+  const startHeartbeat = useCallback((uid) => {
     stopHeartbeat(); // 기존 interval 정리 후 새로 시작 (중복 방지)
     setOnline(uid);
     heartbeatRef.current = setInterval(() => setOnline(uid), 60 * 1000);
-  };
+  }, [setOnline, stopHeartbeat]);
 
   // beforeunload / visibilitychange handlers
   useEffect(() => {
@@ -88,7 +88,7 @@ export function UserProvider({ children }) {
       window.removeEventListener('beforeunload', handleBeforeUnload);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, []);
+  }, [setOffline, startHeartbeat, stopHeartbeat]);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (authUser) => {
@@ -135,7 +135,7 @@ export function UserProvider({ children }) {
       unsubscribe();
       stopHeartbeat();
     };
-  }, []);
+  }, [setOffline, startHeartbeat, stopHeartbeat]);
 
   const value = { user, userData, companyId, loading };
 

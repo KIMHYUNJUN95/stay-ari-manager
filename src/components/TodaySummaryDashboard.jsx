@@ -54,6 +54,42 @@ const parseLocalDate = (dateStr) => {
   return new Date(y, m - 1, d);
 };
 
+const PLATFORM_REVENUE_KEYS = {
+  airbnb: 'airbnb',
+  booking: 'booking',
+  direct: 'direct',
+  other: 'other'
+};
+
+const getPlatformRevenueKey = (reservation) => {
+  const sourceText = [
+    reservation?.platform,
+    reservation?.referer,
+    reservation?.referrer,
+    reservation?.apiSource,
+    reservation?.subSource,
+    reservation?.source,
+    reservation?.channel
+  ]
+    .filter(Boolean)
+    .map(value => String(value).toLowerCase())
+    .join(' ');
+
+  if (!sourceText) return PLATFORM_REVENUE_KEYS.other;
+  if (
+    sourceText.includes('direct') ||
+    sourceText.includes('manual') ||
+    sourceText.includes('phone') ||
+    sourceText.includes('walk') ||
+    sourceText.includes('수기')
+  ) {
+    return PLATFORM_REVENUE_KEYS.direct;
+  }
+  if (sourceText.includes('booking')) return PLATFORM_REVENUE_KEYS.booking;
+  if (sourceText.includes('airbnb')) return PLATFORM_REVENUE_KEYS.airbnb;
+  return PLATFORM_REVENUE_KEYS.other;
+};
+
 const TodaySummaryDashboard = () => {
   const { companyId } = useUser();
   const [loading, setLoading] = useState(true);
@@ -71,7 +107,7 @@ const TodaySummaryDashboard = () => {
     lastMonthTotal: 0,    // 지난 달 예약 접수 건수
     buildings: [],        // 건물별 예약 수
     platforms: { airbnb: 0, booking: 0 },
-    platformRevenue: { airbnb: 0, booking: 0 }
+    platformRevenue: { airbnb: 0, booking: 0, direct: 0 }
   });
 
   // ===== 숙박 현황 데이터 (Occupancy Dashboard와 동일) =====
@@ -131,7 +167,6 @@ const TodaySummaryDashboard = () => {
     const today = `${year}-${String(month + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
     
     // 총 객실 수
-    const TOTAL_ROOMS = 57;
     const daysInCurrentMonth = new Date(year, month + 1, 0).getDate();
     const daysInLastMonth = new Date(lastMonthYear, lastMonthNum, 0).getDate();
 
@@ -159,8 +194,11 @@ const TodaySummaryDashboard = () => {
       // ========================================
       let currentMonthRevenue = 0;
       let lastMonthRevenue = 0;
-      let platformRevenueAirbnb = 0;
-      let platformRevenueBooking = 0;
+      const platformRevenue = {
+        airbnb: 0,
+        booking: 0,
+        direct: 0
+      };
 
       const currentStart = parseLocalDate(currentMonthStart);
       const currentEnd = parseLocalDate(currentMonthEnd);
@@ -181,7 +219,7 @@ const TodaySummaryDashboard = () => {
         if (totalNights <= 0) return;
 
         const pricePerNight = totalPrice / totalNights;
-        const platformName = (doc.platform || '').toLowerCase();
+        const platformRevenueKey = getPlatformRevenueKey(doc);
 
         // 현재 월 overlap 매출 계산
         if (departureDate > currentStart && arrivalDate <= currentEnd) {
@@ -196,10 +234,12 @@ const TodaySummaryDashboard = () => {
             currentMonthRevenue += monthlyRevenue;
             
             // ★ 플랫폼별 매출 동시 집계
-            if (platformName.includes('booking')) {
-              platformRevenueBooking += monthlyRevenue;
-            } else {
-              platformRevenueAirbnb += monthlyRevenue;
+            if (platformRevenueKey === PLATFORM_REVENUE_KEYS.airbnb) {
+              platformRevenue.airbnb += monthlyRevenue;
+            } else if (platformRevenueKey === PLATFORM_REVENUE_KEYS.booking) {
+              platformRevenue.booking += monthlyRevenue;
+            } else if (platformRevenueKey === PLATFORM_REVENUE_KEYS.direct) {
+              platformRevenue.direct += monthlyRevenue;
             }
           }
         }
@@ -219,10 +259,10 @@ const TodaySummaryDashboard = () => {
       });
 
       // ★ 플랫폼별 매출 반올림 (Monthly Revenue와 합계 일치하도록)
-      const totalPlatformRevenue = platformRevenueAirbnb + platformRevenueBooking;
       const roundedTotal = Math.round(currentMonthRevenue);
-      const roundedAirbnb = Math.round(platformRevenueAirbnb);
-      const roundedBooking = roundedTotal - roundedAirbnb; // 차이 보정
+      const roundedAirbnb = Math.round(platformRevenue.airbnb);
+      const roundedBooking = Math.round(platformRevenue.booking);
+      const roundedDirect = Math.round(platformRevenue.direct);
 
       setRevenueData({
         currentMonth: roundedTotal,
@@ -232,7 +272,8 @@ const TodaySummaryDashboard = () => {
       // performanceData에 platformRevenue 저장 (나중에 사용)
       const calculatedPlatformRevenue = { 
         airbnb: roundedAirbnb, 
-        booking: roundedBooking 
+        booking: roundedBooking,
+        direct: roundedDirect
       };
 
       // ========================================
@@ -319,7 +360,6 @@ const TodaySummaryDashboard = () => {
           // 현재 월 가동률 계산
           // ★ 다이쿄초: bookDate가 1/26 이후인 예약만 제외 (1/25 이전 예약은 모두 포함)
           const currentRoomReservations = allReservations.filter(r => {
-            const bookDate = r.bookDate || r.arrival;
             return r.building === building &&
               r.room === room &&
               r.arrival <= currentMonthEnd &&
@@ -332,7 +372,6 @@ const TodaySummaryDashboard = () => {
           // 지난 월 가동률 계산
           // ★ 다이쿄초: bookDate가 1/26 이후인 예약만 제외 (1/25 이전 예약은 모두 포함)
           const lastRoomReservations = allReservations.filter(r => {
-            const bookDate = r.bookDate || r.arrival;
             return r.building === building &&
               r.room === room &&
               r.arrival <= lastMonthEnd &&
@@ -372,7 +411,6 @@ const TodaySummaryDashboard = () => {
       // ========================================
       // 이번 달 체크인 + 사노시 제외 + 다이쿄초 bookDate 1/26 이후 제외 + 0엔 수기예약 제외
       const thisMonthCheckins = allReservations.filter(r => {
-        const bookDate = r.bookDate || r.arrival;
         return r.arrival &&
           r.arrival.startsWith(currentMonthStr) &&
           r.building !== "사노시" &&
@@ -382,7 +420,6 @@ const TodaySummaryDashboard = () => {
 
       // 지난 달 체크인 + 사노시 제외 + 다이쿄초 bookDate 1/26 이후 제외 + 0엔 수기예약 제외
       const lastMonthCheckins = allReservations.filter(r => {
-        const bookDate = r.bookDate || r.arrival;
         return r.arrival &&
           r.arrival.startsWith(lastMonthStr) &&
           r.building !== "사노시" &&
@@ -764,6 +801,17 @@ const TodaySummaryDashboard = () => {
                 <div style={styles.platformRevenueInfo}>
                   <span style={styles.platformRevenueName}>Booking.com</span>
                   <span style={styles.platformRevenueValue}>{formatPrice(performanceData.platformRevenue.booking)}</span>
+                </div>
+              </div>
+              <div style={styles.platformRevenueItem}>
+                <div style={styles.platformRevenueIcon}>
+                  <div style={{width: '32px', height: '32px', borderRadius: '8px', backgroundColor: '#8B5CF6', display: 'flex', alignItems: 'center', justifyContent: 'center'}}>
+                    <span style={{color: 'white', fontWeight: '700', fontSize: '10px'}}>Direct</span>
+                  </div>
+                </div>
+                <div style={styles.platformRevenueInfo}>
+                  <span style={styles.platformRevenueName}>Direct Booking</span>
+                  <span style={styles.platformRevenueValue}>{formatPrice(performanceData.platformRevenue.direct)}</span>
                 </div>
               </div>
             </div>

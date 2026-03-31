@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { collection, getDocs, query, where, doc, getDoc, setDoc, deleteDoc } from "firebase/firestore";
+import React, { useState, useEffect, useCallback } from 'react';
+import { collection, getDocs, query, where, doc, setDoc, deleteDoc } from "firebase/firestore";
 import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
 
@@ -340,7 +340,7 @@ export default function SalesLog() {
     // ==========================================
     // 1. Data Fetching
     // ==========================================
-    const fetchLogs = async () => {
+    const fetchLogs = useCallback(async () => {
         console.log('🔍 SalesLog - fetchLogs called, companyId:', companyId);
 
         if (!companyId) {
@@ -388,10 +388,10 @@ export default function SalesLog() {
         } finally {
             setLoading(false);
         }
-    };
+    }, [companyId, selectedMonthStr]);
 
     // Fetch memos for the selected month
-    const fetchMemos = async () => {
+    const fetchMemos = useCallback(async () => {
         if (!companyId) {
             console.warn('⚠️ No companyId - skipping memos fetch');
             return;
@@ -421,14 +421,14 @@ export default function SalesLog() {
         } catch (error) {
             console.error("Error fetching memos:", error);
         }
-    };
+    }, [companyId, selectedMonthStr]);
 
     useEffect(() => {
         if (companyId) {
             fetchLogs();
             fetchMemos();
         }
-    }, [selectedMonthStr, companyId]);
+    }, [companyId, fetchLogs, fetchMemos]);
 
     // ==========================================
     // 2. Identify Target Months (Columns)

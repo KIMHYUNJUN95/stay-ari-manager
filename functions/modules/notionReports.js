@@ -1,4 +1,5 @@
 const { Client: NotionClient } = require("@notionhq/client");
+const { computeRevenueDashboardData } = require("./revenueDashboardData");
 
 function createNotionReportModule({
     onSchedule,
@@ -7,7 +8,7 @@ function createNotionReportModule({
     db,
     dayjs,
     DEFAULT_COMPANY_ID,
-    cleanPrice
+    BUILDING_ROOMS
 }) {
     function getNotionClient() {
         const token = process.env.NOTION_API_SECRET || process.env.NOTION_TOKEN;
@@ -17,86 +18,97 @@ function createNotionReportModule({
         return new NotionClient({ auth: token });
     }
 
+    function formatYen(value) {
+        return `¥${Math.round(Number(value || 0)).toLocaleString()}`;
+    }
+
     async function aggregateMonthlyStats(yearMonth, companyId) {
-        const salesLogDoc = await db.doc(`salesLogs/${yearMonth}`).get();
-        let monthlyStats = {};
-        if (salesLogDoc.exists && salesLogDoc.data().monthlyStats) {
-            monthlyStats = salesLogDoc.data().monthlyStats;
-        }
-
-        const resSnap = await db.collection("reservations")
-            .where("companyId", "==", companyId)
-            .where("status", "==", "confirmed")
-            .where("stayMonth", "==", yearMonth)
-            .get();
-
-        const reservations = resSnap.docs.map((d) => d.data());
-
-        const byBuilding = {};
-        const byPlatform = {};
-        let totalRevenue = 0;
-        let totalNights = 0;
-
-        reservations.forEach((r) => {
-            const building = r.building || "기타";
-            const platform = r.platform || "기타";
-            const revenue = cleanPrice(r.price || r.totalPrice || 0);
-            const nights = r.nights || (r.arrival && r.departure
-                ? dayjs(r.departure).diff(dayjs(r.arrival), "day")
-                : 0);
-
-            if (!byBuilding[building]) byBuilding[building] = { revenue: 0, nights: 0, bookings: 0 };
-            byBuilding[building].revenue += revenue;
-            byBuilding[building].nights += nights;
-            byBuilding[building].bookings += 1;
-
-            if (!byPlatform[platform]) byPlatform[platform] = { revenue: 0, bookings: 0 };
-            byPlatform[platform].revenue += revenue;
-            byPlatform[platform].bookings += 1;
-
-            totalRevenue += revenue;
-            totalNights += nights;
+        const salesData = await computeRevenueDashboardData(db, {
+            companyId,
+            BUILDING_ROOMS,
+            forYearMonth: yearMonth
         });
 
-        return { byBuilding, byPlatform, totalRevenue, totalNights, bookingCount: reservations.length, monthlyStats };
+        if (!salesData) {
+            return null;
+        }
+
+        const coreRevenue = Number(salesData.currentMonthRevenue) || 0;
+        const referenceRevenue = Number(salesData.referenceRevenue) || 0;
+        const totalRevenueWithReference = Number(salesData.totalRevenueWithReference || (coreRevenue + referenceRevenue)) || 0;
+        const adr = salesData.occupiedRoomNights > 0
+            ? Math.round(coreRevenue / salesData.occupiedRoomNights)
+            : 0;
+
+        const byBuilding = [
+            ...(Array.isArray(salesData.coreBuildingStats) ? salesData.coreBuildingStats : []),
+            ...(Array.isArray(salesData.okuboHomeStats) ? salesData.okuboHomeStats : []),
+            ...(Array.isArray(salesData.referenceBuildingStats) ? salesData.referenceBuildingStats : [])
+        ].sort((a, b) => b.revenue - a.revenue);
+
+        const rawPlatformRows = Array.isArray(salesData.platformBreakdown) && salesData.platformBreakdown.length > 0
+            ? salesData.platformBreakdown
+            : [
+                { key: "airbnb", name: "Airbnb", revenue: Number(salesData.platformAirbnb) || 0 },
+                { key: "booking", name: "Booking.com", revenue: Number(salesData.platformBooking) || 0 },
+                { key: "expedia", name: "Expedia", revenue: Number(salesData.platformExpedia) || 0 },
+                { key: "agoda", name: "Agoda", revenue: Number(salesData.platformAgoda) || 0 },
+                { key: "direct", name: "Direct(수기)", revenue: Number(salesData.platformDirect) || 0 },
+                { key: "other", name: "Other", revenue: Number(salesData.platformOther) || 0 }
+            ];
+
+        const byPlatform = rawPlatformRows
+            .filter((row) => row && (row.key !== "other" || Number(row.revenue) > 0))
+            .map((row) => ({
+                ...row,
+                revenue: Number(row.revenue) || 0,
+                sharePct: coreRevenue > 0 ? Number((((Number(row.revenue) || 0) / coreRevenue) * 100).toFixed(1)) : 0
+            }));
+
+        return {
+            salesData,
+            coreRevenue,
+            referenceRevenue,
+            totalRevenueWithReference,
+            adr,
+            byBuilding,
+            byPlatform
+        };
     }
 
     async function createMonthlyNotionReport(notion, parentPageId, yearMonth, companyId) {
         const stats = await aggregateMonthlyStats(yearMonth, companyId);
+        if (!stats) {
+            throw new Error("월간 매출·가동률 데이터를 생성할 수 없습니다.");
+        }
         const title = `📊 ${yearMonth} 월간 매출·가동률 리포트`;
 
-        const buildingRows = Object.entries(stats.byBuilding)
-            .sort((a, b) => b[1].revenue - a[1].revenue)
-            .map(([name, s]) => ({
+        const changePct = Number(stats.salesData.changePct) || 0;
+        const buildingRows = stats.byBuilding
+            .map((item) => ({
                 type: "table_row",
                 table_row: {
                     cells: [
-                        [{ type: "text", text: { content: name } }],
-                        [{ type: "text", text: { content: `¥${s.revenue.toLocaleString()}` } }],
-                        [{ type: "text", text: { content: `${s.bookings}건` } }],
-                        [{ type: "text", text: { content: `${s.nights}박` } }]
+                        [{ type: "text", text: { content: item.building } }],
+                        [{ type: "text", text: { content: item.buildingType || "기타" } }],
+                        [{ type: "text", text: { content: `${item.roomCount || 0}개` } }],
+                        [{ type: "text", text: { content: formatYen(item.revenue) } }],
+                        [{ type: "text", text: { content: `${Number(item.occupancyPct || 0).toFixed(1)}%` } }],
+                        [{ type: "text", text: { content: formatYen(item.adr) } }]
                     ]
                 }
             }));
 
-        const platformRows = Object.entries(stats.byPlatform)
-            .sort((a, b) => b[1].revenue - a[1].revenue)
-            .map(([name, s]) => {
-                const ratio = stats.totalRevenue > 0
-                    ? ((s.revenue / stats.totalRevenue) * 100).toFixed(1)
-                    : "0.0";
-                return {
-                    type: "table_row",
-                    table_row: {
-                        cells: [
-                            [{ type: "text", text: { content: name } }],
-                            [{ type: "text", text: { content: `¥${s.revenue.toLocaleString()}` } }],
-                            [{ type: "text", text: { content: `${s.bookings}건` } }],
-                            [{ type: "text", text: { content: `${ratio}%` } }]
-                        ]
-                    }
-                };
-            });
+        const platformRows = stats.byPlatform.map((item) => ({
+            type: "table_row",
+            table_row: {
+                cells: [
+                    [{ type: "text", text: { content: item.name } }],
+                    [{ type: "text", text: { content: formatYen(item.revenue) } }],
+                    [{ type: "text", text: { content: `${item.sharePct.toFixed(1)}%` } }]
+                ]
+            }
+        }));
 
         const children = [
             {
@@ -107,21 +119,68 @@ function createNotionReportModule({
                 type: "callout",
                 callout: {
                     rich_text: [
-                        { type: "text", text: { content: `총 매출: ¥${stats.totalRevenue.toLocaleString()}  |  예약 건수: ${stats.bookingCount}건  |  총 박수: ${stats.totalNights}박` } }
+                        {
+                            type: "text",
+                            text: {
+                                content: `운영 객실: ${stats.salesData.totalRooms || 0}개  |  점유 객실박: ${stats.salesData.occupiedRoomNights || 0}/${stats.salesData.totalRoomNights || 0}  |  월 기준: ${yearMonth}`
+                            }
+                        }
                     ],
                     icon: { type: "emoji", emoji: "💰" },
                     color: "blue_background"
                 }
             },
+            {
+                type: "paragraph",
+                paragraph: {
+                    rich_text: [{
+                        type: "text",
+                        text: {
+                            content: `시스템 Revenue / Occupancy Dashboard 기준 집계입니다. 매출은 날짜 overlap 배분, 가동률은 객실별 점유일 중복 제거 기준으로 계산합니다.`
+                        },
+                        annotations: { color: "gray", italic: true }
+                    }]
+                }
+            },
+            {
+                type: "callout",
+                callout: {
+                    rich_text: [
+                        {
+                            type: "text",
+                            text: {
+                                content: `운영 매출: ${formatYen(stats.coreRevenue)}  |  참고 매출: ${formatYen(stats.referenceRevenue)}  |  전체 노출 매출: ${formatYen(stats.totalRevenueWithReference)}`
+                            }
+                        }
+                    ],
+                    icon: { type: "emoji", emoji: "🏢" },
+                    color: "green_background"
+                }
+            },
+            {
+                type: "callout",
+                callout: {
+                    rich_text: [
+                        {
+                            type: "text",
+                            text: {
+                                content: `가동률: ${Number(stats.salesData.occupancyPct || 0).toFixed(1)}%  |  ADR: ${formatYen(stats.adr)}  |  체크인 예약 건수: ${stats.salesData.checkinReservationCount ?? stats.salesData.stayMonthReservationCount ?? 0}건  |  생성 예약 건수(bookDate 기준): ${stats.salesData.bookingCreatedCount || stats.salesData.bookingCount || 0}건  |  전월 대비: ${changePct >= 0 ? "+" : ""}${changePct}%`
+                            }
+                        }
+                    ],
+                    icon: { type: "emoji", emoji: changePct >= 0 ? "📈" : "📉" },
+                    color: changePct >= 0 ? "blue_background" : "yellow_background"
+                }
+            },
             { type: "divider", divider: {} },
             {
                 type: "heading_2",
-                heading_2: { rich_text: [{ type: "text", text: { content: "🏢 건물별 매출" } }] }
+                heading_2: { rich_text: [{ type: "text", text: { content: "🏢 건물별 운영 현황" } }] }
             },
             ...(buildingRows.length > 0 ? [{
                 type: "table",
                 table: {
-                    table_width: 4,
+                    table_width: 6,
                     has_column_header: true,
                     has_row_header: false,
                     children: [
@@ -130,9 +189,11 @@ function createNotionReportModule({
                             table_row: {
                                 cells: [
                                     [{ type: "text", text: { content: "건물" } }],
+                                    [{ type: "text", text: { content: "유형" } }],
+                                    [{ type: "text", text: { content: "객실수" } }],
                                     [{ type: "text", text: { content: "매출" } }],
-                                    [{ type: "text", text: { content: "예약" } }],
-                                    [{ type: "text", text: { content: "박수" } }]
+                                    [{ type: "text", text: { content: "가동률" } }],
+                                    [{ type: "text", text: { content: "ADR" } }]
                                 ]
                             }
                         },
@@ -151,7 +212,7 @@ function createNotionReportModule({
             ...(platformRows.length > 0 ? [{
                 type: "table",
                 table: {
-                    table_width: 4,
+                    table_width: 3,
                     has_column_header: true,
                     has_row_header: false,
                     children: [
@@ -161,7 +222,6 @@ function createNotionReportModule({
                                 cells: [
                                     [{ type: "text", text: { content: "플랫폼" } }],
                                     [{ type: "text", text: { content: "매출" } }],
-                                    [{ type: "text", text: { content: "예약" } }],
                                     [{ type: "text", text: { content: "비율" } }]
                                 ]
                             }

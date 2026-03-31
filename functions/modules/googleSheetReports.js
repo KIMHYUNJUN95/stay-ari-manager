@@ -2,6 +2,7 @@ const { google } = require("googleapis");
 const serviceAccount = require("../serviceAccountKey.json");
 const { runPaxOccupancyReport } = require("./paxOccupancyReport");
 const { NOTION_PAGES, syncNotionDailyLog, syncNotionCancelLog, syncNotionSalesLog, syncNotionPlatformAnalysis, syncNotionPaxOccupancy } = require("./notionReportSync");
+const { updateFutureTargetGoalsSheet } = require("./targetGoalsSheet");
 
 // ── 브리핑 시트 디자인 요청 빌더 ────────────────────────────────────────────
 function buildBriefingDesignRequests(sheetId, titleText, subtitleText, buttons) {
@@ -73,6 +74,14 @@ function createGoogleSheetReportModule({
             if (source.includes("airbnb")) return "Airbnb";
             if (source.includes("booking")) return "Booking.com";
             return "기타";
+        };
+        const isInflowRatioExcludedBuilding = (buildingName, roomCount) => {
+            if (Number(roomCount) !== 1) return false;
+            const normalized = String(buildingName || "").replace(/\s+/g, "").toLowerCase();
+            return normalized.includes("오쿠보a")
+                || normalized.includes("오쿠보b")
+                || normalized.includes("오쿠보c")
+                || normalized.includes("사노");
         };
         const percent = (part, total) => (total > 0 ? (part / total) * 100 : 0);
         const PLATFORM_STYLE_LOCK = Object.freeze({
@@ -190,6 +199,7 @@ function createGoogleSheetReportModule({
 
         activeBuildings.forEach((building, buildingIdx) => {
             const rooms = roomNamesByBuilding[building] || [];
+            const suppressInflowRatio = isInflowRatioExcludedBuilding(building, rooms.length);
             const occBuildingTotal = rooms.reduce((sum, room) => sum + stats[building][room].occAirbnb + stats[building][room].occBooking, 0);
             const revBuildingTotal = rooms.reduce((sum, room) => sum + stats[building][room].revenueAirbnb + stats[building][room].revenueBooking, 0);
             const revBuildingAirbnb = rooms.reduce((sum, room) => sum + stats[building][room].revenueAirbnb, 0);
@@ -241,7 +251,7 @@ function createGoogleSheetReportModule({
                 values.push([
                     building,
                     room,
-                    sharePct / 100,
+                    suppressInflowRatio ? "" : sharePct / 100,
                     occTotal,
                     occA,
                     occB,
@@ -629,6 +639,7 @@ function createGoogleSheetReportModule({
         }
 
         const totalMonthly = {};
+        const totalMonthlyRevenue = {};
         companyDocs.forEach((data) => {
             if (!isIncludedReportDoc(data)) return;
             if (data.status === "confirmed" &&
@@ -637,9 +648,11 @@ function createGoogleSheetReportModule({
                 getBookingAmount(data) > 0) {
                 const key = data.arrival ? dayjs(data.arrival).tz("Asia/Tokyo").format("M월") : "미정";
                 totalMonthly[key] = (totalMonthly[key] || 0) + 1;
+                totalMonthlyRevenue[key] = (totalMonthlyRevenue[key] || 0) + getBookingAmount(data);
             }
         });
         const totalMonthlyCount = Object.values(totalMonthly).reduce((s, c) => s + c, 0);
+        const totalMonthlyRevenueAmount = Object.values(totalMonthlyRevenue).reduce((s, v) => s + (Number(v) || 0), 0);
         const observedMonthNums = Object.keys(totalMonthly)
             .filter((k) => /^\d+월$/.test(k))
             .map((k) => parseInt(k, 10))
@@ -655,8 +668,11 @@ function createGoogleSheetReportModule({
         }
         if (totalMonthly["미정"]) normalizedMonthly["미정"] = totalMonthly["미정"];
         const monthlySummaryRows = Object.entries(normalizedMonthly).map(([m, cnt]) => [m, cnt, totalMonthlyCount > 0 ? cnt / totalMonthlyCount : 0]);
+        const monthlyRevenueSummaryRows = Object.keys(normalizedMonthly).map((monthLabel) => [monthLabel, Number(totalMonthlyRevenue[monthLabel] || 0)]);
         if (monthlySummaryRows.length === 0) monthlySummaryRows.push(["-", 0, 0]);
+        if (monthlyRevenueSummaryRows.length === 0) monthlyRevenueSummaryRows.push(["-", 0]);
         monthlySummaryRows.push(["합계", totalMonthlyCount, totalMonthlyCount > 0 ? 1.0 : 0]);
+        monthlyRevenueSummaryRows.push(["합계", totalMonthlyRevenueAmount]);
 
         const totalCancelCount = cancelRows.reduce((s, r) => s + r[1], 0);
         const cancelObservedMonthNums = Object.keys(totalCancelByArrivalMonth)
@@ -765,6 +781,7 @@ function createGoogleSheetReportModule({
             rows,
             cancelRows,
             monthlySummaryRows,
+            monthlyRevenueSummaryRows,
             cancelSummaryRows,
             mtdNew,
             mtdCancel,
@@ -1515,6 +1532,7 @@ function createGoogleSheetReportModule({
                 rows,
                 cancelRows,
                 monthlySummaryRows,
+                monthlyRevenueSummaryRows,
                 cancelSummaryRows,
                 mtdNew,
                 mtdCancel,
@@ -1548,7 +1566,7 @@ function createGoogleSheetReportModule({
                 mtdRevenue
             });
             if (NOTION_PAGES.dailyLog) {
-                await syncNotionDailyLog(NOTION_PAGES.dailyLog, { rows, monthlySummaryRows, mtdNew, mtdCancel, mtdRevenue, year, month, tokyoNow });
+                await syncNotionDailyLog(NOTION_PAGES.dailyLog, { rows, monthlySummaryRows, monthlyRevenueSummaryRows, mtdNew, mtdCancel, mtdRevenue, year, month, tokyoNow });
             }
 
             await updateCancelLogSheet({
@@ -1596,6 +1614,17 @@ function createGoogleSheetReportModule({
                     projectionMonths: salesLogResult?.projectionMonths ?? []
                 });
             }
+
+            await updateFutureTargetGoalsSheet({
+                sheets,
+                spreadsheetId,
+                meta,
+                tokyoNow,
+                dayjs,
+                db: admin.firestore(),
+                companyId: DEFAULT_COMPANY_ID,
+                BUILDING_ROOMS
+            });
 
             try {
                 const platformMonthStart = reportTarget.startOf("month").format("YYYY-MM-DD");
