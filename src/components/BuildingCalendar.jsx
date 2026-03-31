@@ -1500,14 +1500,85 @@ function MonthPickerModal({ year, month, onSelect, onClose }) {
 }
 
 // Manual Booking Modal - Premium Design
-function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClose, onSave, companyId }) {
+function ManualBookingModal({ initialBuilding, initialRoom, initialDates, initialCheckOut, roomPrices, onClose, onSave, companyId }) {
   const [loading, setLoading] = useState(false);
   const [building, setBuilding] = useState(initialBuilding || "아라키초A");
   const [room, setRoom] = useState(initialRoom || "");
   const [arrival, setArrival] = useState(initialDates && initialDates[0] ? initialDates[0] : dayjs().format("YYYY-MM-DD"));
-  const [departure, setDeparture] = useState(initialDates && initialDates.length > 0 ? dayjs(initialDates[initialDates.length - 1]).add(1, 'day').format("YYYY-MM-DD") : dayjs().add(1, 'day').format("YYYY-MM-DD"));
+  // initialCheckOut이 있으면 그것을 departure로 사용 (캘린더 2클릭 체크아웃 날짜)
+  // 없으면 기존 방식: 마지막 숙박일 + 1일
+  const [departure, setDeparture] = useState(
+    initialCheckOut
+      ? initialCheckOut
+      : (initialDates && initialDates.length > 0 ? dayjs(initialDates[initialDates.length - 1]).add(1, 'day').format("YYYY-MM-DD") : dayjs().add(1, 'day').format("YYYY-MM-DD"))
+  );
+
+  // Beds24 기준 가격 참고 데이터 (Airbnb p1, Booking.com p2)
+  // dual roomId 환경에서도 메인 캘린더와 동일한 active room 기준을 사용
+  const stayPriceData = useMemo(() => {
+    if (!room || !building || !arrival || !departure) return null;
+    const unitInfos = BUILDING_ROOMS[building]?.filter(r => r.name === room) || [];
+    if (unitInfos.length === 0) return null;
+
+    const stayDates = [];
+    let cur = dayjs(arrival);
+    const dep = dayjs(departure);
+    if (!cur.isBefore(dep)) return null;
+    while (cur.isBefore(dep)) {
+      stayDates.push(cur.format('YYYY-MM-DD'));
+      cur = cur.add(1, 'day');
+    }
+
+    const resolvedRoomIdsByDate = [];
+    const rows = stayDates.map(dateStr => {
+      const dateKey = dateStr.replace(/-/g, '');
+      const activeInfos = unitInfos.length <= 1
+        ? unitInfos
+        : unitInfos.filter(info => {
+            const priceInfo = roomPrices?.[String(info.roomId)]?.dates?.[dateKey];
+            const ms = parseInt(priceInfo?.m, 10);
+            return Number.isFinite(ms) && ms >= 1 && ms < INACTIVE_MINSTAY_THRESHOLD;
+          });
+
+      const resolvedInfo = activeInfos[0] || null;
+      resolvedRoomIdsByDate.push(resolvedInfo ? String(resolvedInfo.roomId) : "");
+
+      const priceData = resolvedInfo
+        ? roomPrices?.[String(resolvedInfo.roomId)]?.dates?.[dateKey]
+        : null;
+
+      return {
+        date: dateStr,
+        airbnb: priceData ? (parseFloat(priceData.p1) || 0) : null,
+        booking: priceData ? (parseFloat(priceData.p2) || 0) : null,
+      };
+    });
+
+    const unresolvedDates = rows
+      .filter((_, index) => !resolvedRoomIdsByDate[index])
+      .map(row => row.date);
+    const resolvedRoomIds = [...new Set(resolvedRoomIdsByDate.filter(Boolean))];
+    const hasAnyPrice = rows.some(r => r.airbnb !== null);
+    const totalAirbnb = rows.reduce((s, r) => s + (r.airbnb || 0), 0);
+    const totalBooking = rows.reduce((s, r) => s + (r.booking || 0), 0);
+
+    return {
+      rows,
+      totalAirbnb,
+      totalBooking,
+      hasAnyPrice,
+      stayDates,
+      resolvedRoomIds,
+      unresolvedDates,
+      selectedRoomId: unresolvedDates.length === 0 && resolvedRoomIds.length === 1 ? resolvedRoomIds[0] : ""
+    };
+  }, [roomPrices, room, building, arrival, departure]);
+
   const [guestName, setGuestName] = useState("");
   const [price, setPrice] = useState("");
+  // 가격 조정 기능: basePrice = { value, label } | null, priceAdjustPct = 정수 퍼센트
+  const [basePrice, setBasePrice] = useState(null);
+  const [priceAdjustPct, setPriceAdjustPct] = useState(0);
   const [numAdult, setNumAdult] = useState(1);
   const [numChild, setNumChild] = useState(0);
   const [guestEmail, setGuestEmail] = useState("");
@@ -1515,6 +1586,14 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
   const [guestComments, setGuestComments] = useState("");
 
   const rooms = BUILDING_ROOMS[building] || [];
+
+  // 퍼센트 조정 적용: basePrice 기준으로 계산 후 price 업데이트
+  const applyAdjustment = (pct) => {
+    if (!basePrice) return;
+    const adjusted = Math.round(basePrice.value * (1 + pct / 100));
+    setPriceAdjustPct(pct);
+    setPrice(String(adjusted));
+  };
 
   const handleSave = async () => {
     if (!room) { alert("Please select a room."); return; }
@@ -1524,8 +1603,22 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
     const targetRoomInfos = rooms.filter(r => r.name === room);
     if (targetRoomInfos.length === 0) { alert("Room information not found."); return; }
 
-    // ★ 첫 번째 roomId(메인 계정)에만 예약 생성 - Beds24 내부에서 자동 연동됨
-    const mainRoomInfo = targetRoomInfos[0];
+    // active roomId 결정: stay 전체가 동일한 active unit으로 해석될 때만 저장
+    let mainRoomInfo = targetRoomInfos[0];
+    if (targetRoomInfos.length > 1) {
+      const resolvedRoomId = stayPriceData?.selectedRoomId || "";
+      if (!resolvedRoomId) {
+        alert("Selected stay spans multiple active Beds24 units or the active unit could not be determined. Please split the stay or refresh prices and try again.");
+        return;
+      }
+      const resolvedInfo = targetRoomInfos.find(info => String(info.roomId) === String(resolvedRoomId));
+      if (!resolvedInfo) {
+        alert("Active room information not found.");
+        return;
+      }
+      mainRoomInfo = resolvedInfo;
+    }
+
     const isBlackout = guestName.includes("점검") || guestName.toLowerCase().includes("blackout");
 
     setLoading(true);
@@ -1541,6 +1634,8 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
         price: isBlackout ? "0" : price,
         numAdult,
         numChild,
+        guestEmail: isBlackout ? "" : guestEmail,
+        guestPhone: isBlackout ? "" : guestPhone,
         comments: isBlackout ? "System Block" : guestComments,
         source: "Direct"
       };
@@ -1676,6 +1771,128 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
               />
             </div>
           </div>
+
+          {/* Price Reference Panel */}
+          {stayPriceData && stayPriceData.hasAnyPrice && (
+            <div style={{ marginBottom: "20px", background: "#F8FAFC", borderRadius: "12px", border: "1px solid #E5E7EB", overflow: "hidden" }}>
+              <div style={{ padding: "10px 16px", borderBottom: "1px solid #E5E7EB", display: "flex", justifyContent: "space-between", alignItems: "center", background: "#F1F5F9" }}>
+                <span style={{ fontSize: "13px", fontWeight: "700", color: "#374151" }}>Price Reference</span>
+                <span style={{ fontSize: "11px", color: "#9CA3AF", fontWeight: "500" }}>Beds24 base rate · read-only</span>
+              </div>
+              {/* Column header */}
+              <div style={{ display: "grid", gridTemplateColumns: "90px 1fr 1fr", padding: "6px 16px", gap: "8px", borderBottom: "1px solid #F3F4F6" }}>
+                <span style={{ fontSize: "11px", color: "#9CA3AF", fontWeight: "600", textTransform: "uppercase", letterSpacing: "0.05em" }}>Date</span>
+                <span style={{ fontSize: "11px", color: "#F97316", fontWeight: "600", textAlign: "right", textTransform: "uppercase", letterSpacing: "0.05em" }}>Airbnb</span>
+                <span style={{ fontSize: "11px", color: "#003580", fontWeight: "600", textAlign: "right", textTransform: "uppercase", letterSpacing: "0.05em" }}>Booking.com</span>
+              </div>
+              {/* Per-night rows */}
+              <div style={{ maxHeight: "160px", overflowY: "auto" }}>
+                {stayPriceData.rows.map((row, idx) => (
+                  <div key={row.date} style={{ display: "grid", gridTemplateColumns: "90px 1fr 1fr", padding: "5px 16px", gap: "8px", background: idx % 2 === 0 ? "white" : "#FAFAFA" }}>
+                    <span style={{ fontSize: "13px", color: "#6B7280" }}>{dayjs(row.date).format("MM/DD (ddd)")}</span>
+                    <span style={{ fontSize: "13px", color: row.airbnb ? "#111827" : "#D1D5DB", fontWeight: row.airbnb ? "600" : "400", textAlign: "right" }}>
+                      {row.airbnb ? `¥${row.airbnb.toLocaleString()}` : '—'}
+                    </span>
+                    <span style={{ fontSize: "13px", color: row.booking ? "#374151" : "#D1D5DB", textAlign: "right" }}>
+                      {row.booking ? `¥${row.booking.toLocaleString()}` : '—'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              {/* Total row */}
+              <div style={{ display: "grid", gridTemplateColumns: "90px 1fr 1fr", padding: "8px 16px", gap: "8px", borderTop: "1px solid #E5E7EB", background: "#EFF6FF" }}>
+                <span style={{ fontSize: "13px", color: "#374151", fontWeight: "700" }}>Total</span>
+                <span style={{ fontSize: "14px", color: "#1D4ED8", fontWeight: "700", textAlign: "right" }}>¥{stayPriceData.totalAirbnb.toLocaleString()}</span>
+                <span style={{ fontSize: "13px", color: "#374151", fontWeight: "600", textAlign: "right" }}>¥{stayPriceData.totalBooking.toLocaleString()}</span>
+              </div>
+              {/* Quick-fill buttons */}
+              <div style={{ display: "flex", gap: "8px", padding: "10px 16px", borderTop: "1px solid #E5E7EB" }}>
+                <button
+                  onClick={() => {
+                    const val = stayPriceData.totalAirbnb;
+                    setBasePrice({ value: val, label: "Airbnb" });
+                    setPriceAdjustPct(0);
+                    setPrice(String(val));
+                  }}
+                  style={{ flex: 1, padding: "7px 10px", background: basePrice?.label === "Airbnb" ? "#FED7AA" : "#FFF7ED", color: "#C2410C", border: basePrice?.label === "Airbnb" ? "2px solid #F97316" : "1px solid #FDBA74", borderRadius: "8px", fontSize: "12px", fontWeight: "600", cursor: "pointer", transition: "all 0.15s" }}
+                >
+                  Use Airbnb ¥{stayPriceData.totalAirbnb.toLocaleString()}
+                </button>
+                <button
+                  onClick={() => {
+                    const val = stayPriceData.totalBooking;
+                    setBasePrice({ value: val, label: "Booking" });
+                    setPriceAdjustPct(0);
+                    setPrice(String(val));
+                  }}
+                  style={{ flex: 1, padding: "7px 10px", background: basePrice?.label === "Booking" ? "#BFDBFE" : "#EFF6FF", color: "#1D4ED8", border: basePrice?.label === "Booking" ? "2px solid #3B82F6" : "1px solid #BFDBFE", borderRadius: "8px", fontSize: "12px", fontWeight: "600", cursor: "pointer", transition: "all 0.15s" }}
+                >
+                  Use Booking ¥{stayPriceData.totalBooking.toLocaleString()}
+                </button>
+              </div>
+
+              {/* Percentage Adjustment Panel — Use 버튼 클릭 후 표시 */}
+              {basePrice && (
+                <div style={{ padding: "12px 16px", borderTop: "1px solid #E5E7EB", background: "#F8FAFF" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px" }}>
+                    <span style={{ fontSize: "12px", fontWeight: "700", color: "#374151" }}>Price Adjustment</span>
+                    <span style={{ fontSize: "11px", color: "#9CA3AF" }}>
+                      Base ¥{basePrice.value.toLocaleString()} · {basePrice.label}
+                    </span>
+                  </div>
+
+                  {/* Preset chips */}
+                  <div style={{ display: "flex", gap: "6px", marginBottom: "10px", flexWrap: "wrap" }}>
+                    {[-10, -5, 0, 5, 10].map(pct => (
+                      <button
+                        key={pct}
+                        onClick={() => applyAdjustment(pct)}
+                        style={{
+                          padding: "4px 12px",
+                          borderRadius: "20px",
+                          fontSize: "12px",
+                          fontWeight: "600",
+                          cursor: "pointer",
+                          border: priceAdjustPct === pct ? "2px solid #4F46E5" : "1px solid #E5E7EB",
+                          background: priceAdjustPct === pct ? "#EEF2FF" : "white",
+                          color: pct < 0 ? "#DC2626" : pct > 0 ? "#16A34A" : "#374151",
+                          transition: "all 0.15s"
+                        }}
+                      >
+                        {pct > 0 ? `+${pct}%` : `${pct}%`}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Custom percentage input */}
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <button
+                      onClick={() => applyAdjustment(priceAdjustPct - 1)}
+                      style={{ width: "30px", height: "30px", borderRadius: "8px", border: "1px solid #E5E7EB", background: "white", fontSize: "16px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: "#DC2626", fontWeight: "700", flexShrink: 0 }}
+                    >−</button>
+                    <div style={{ display: "flex", alignItems: "center", border: "1px solid #C7D2FE", borderRadius: "8px", overflow: "hidden", background: "white" }}>
+                      <input
+                        type="number"
+                        value={priceAdjustPct}
+                        onChange={(e) => applyAdjustment(Number(e.target.value))}
+                        style={{ width: "56px", padding: "5px 8px", border: "none", outline: "none", fontSize: "14px", fontWeight: "700", textAlign: "center", color: priceAdjustPct < 0 ? "#DC2626" : priceAdjustPct > 0 ? "#16A34A" : "#374151" }}
+                      />
+                      <span style={{ paddingRight: "8px", fontSize: "13px", color: "#6B7280", fontWeight: "600" }}>%</span>
+                    </div>
+                    <button
+                      onClick={() => applyAdjustment(priceAdjustPct + 1)}
+                      style={{ width: "30px", height: "30px", borderRadius: "8px", border: "1px solid #E5E7EB", background: "white", fontSize: "16px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: "#16A34A", fontWeight: "700", flexShrink: 0 }}
+                    >+</button>
+                    {priceAdjustPct !== 0 && (
+                      <span style={{ fontSize: "13px", fontWeight: "700", color: priceAdjustPct < 0 ? "#DC2626" : "#16A34A", marginLeft: "4px" }}>
+                        → ¥{Math.round(basePrice.value * (1 + priceAdjustPct / 100)).toLocaleString()}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
 
           <div style={{ marginBottom: "20px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
@@ -1925,6 +2142,7 @@ function BuildingCalendar() {
   const selectedDates = useMemo(() => [...new Set(selectedCells.map(c => c.date))], [selectedCells]);
   const [showPriceModal, setShowPriceModal] = useState(false);
   const [showManualBookingModal, setShowManualBookingModal] = useState(false);
+  const [manualBookingCheckOut, setManualBookingCheckOut] = useState(null); // 수기 예약 체크아웃 날짜 (departure)
   const [gapEditMode, setGapEditMode] = useState(false); // Gap 수정 모드
   const [showGapEditModal, setShowGapEditModal] = useState(false); // Gap 수정 모달
   const [gapEditMinStay, setGapEditMinStay] = useState(1); // 1박 또는 2박
@@ -2307,26 +2525,48 @@ function BuildingCalendar() {
         return;
       }
 
-      // 같은 방 클릭: 범위 계산 및 모달 오픈
-      // ★ Bug #4 Fix: dayjs를 사용하여 월 경계(Rolling View)에서도 올바른 날짜 범위 생성
-      const startDate = dayjs(selectionStart.date);
-      const endDate = dayjs(dateStr);
+      // 같은 방 클릭: 체크인/체크아웃 정규화
+      // 두 번째 클릭 = check-out 날짜 (departure). 숙박일은 check-in 이상 check-out 미만.
+      const clickedA = dayjs(selectionStart.date);
+      const clickedB = dayjs(dateStr);
 
-      const [from, to] = startDate.isBefore(endDate) ? [startDate, endDate] : [endDate, startDate];
+      // 같은 날 클릭 = 0박 → 무시
+      if (clickedA.isSame(clickedB)) {
+        setSelectionStart(null);
+        return;
+      }
 
-      const range = [];
-      let current = from;
-      while (current.isSameOrBefore(to)) {
-        range.push(current.format('YYYY-MM-DD'));
+      const checkIn = clickedA.isBefore(clickedB) ? clickedA : clickedB;
+      const checkOut = clickedA.isBefore(clickedB) ? clickedB : clickedA;
+
+      // 숙박 점유일: checkIn 이상 checkOut 미만 (departure 날짜 제외)
+      const stayDates = [];
+      let current = checkIn;
+      while (current.isBefore(checkOut)) {
+        stayDates.push(current.format('YYYY-MM-DD'));
         current = current.add(1, 'day');
       }
 
+      // 중간 날짜 예약 충돌 체크: 구간 내 확정/블락 예약이 있으면 모달 차단
+      const hasConflict = stayDates.some(dateStr =>
+        reservations.some(r =>
+          r.room === room &&
+          r.status !== 'cancelled' &&
+          r.arrival <= dateStr &&
+          r.departure > dateStr
+        )
+      );
+      if (hasConflict) {
+        alert("선택한 구간에 이미 예약된 날짜가 있습니다.");
+        setSelectionStart(null);
+        return;
+      }
+
       setSelectedRoom(room);
-      // 수기 예약용: range를 셀로 변환
-      const rangeCells = range.map(date => ({ room, date }));
-      setSelectedCells(rangeCells);
+      setSelectedCells(stayDates.map(date => ({ room, date })));
+      setManualBookingCheckOut(checkOut.format('YYYY-MM-DD'));
       setShowManualBookingModal(true);
-      setSelectionStart(null); // 초기화
+      setSelectionStart(null);
       setHoveredDay(null);
       setHoveredRoom(null);
     }
@@ -3318,6 +3558,8 @@ function BuildingCalendar() {
             initialBuilding={selectedBuilding !== "전체" ? selectedBuilding : ""}
             initialRoom={selectedRoom || ""}
             initialDates={selectedDates}
+            initialCheckOut={manualBookingCheckOut}
+            roomPrices={roomPrices}
             onClose={() => {
               setShowManualBookingModal(false);
               setSelectedCells([]);
@@ -3325,6 +3567,7 @@ function BuildingCalendar() {
               setSelectionStart(null);
               setHoveredDay(null);
               setHoveredRoom(null);
+              setManualBookingCheckOut(null);
             }}
             onSave={() => {
               setShowManualBookingModal(false);
@@ -3333,6 +3576,7 @@ function BuildingCalendar() {
               setSelectionStart(null);
               setHoveredDay(null);
               setHoveredRoom(null);
+              setManualBookingCheckOut(null);
               // 예약 목록 다시 불러오기 (페이지 새로고침 없이)
               fetchReservations();
             }}
@@ -5271,9 +5515,10 @@ function BuildingCalendar() {
                         // 퀵 예약 범위 하이라이트 계산 (dateStr 비교로 월 경계 지원)
                         let isInQuickSelectionRange = false;
                         if (!priceMode && selectionStart && selectionStart.room === room && hoveredDay && hoveredRoom === room) {
+                          // hover 범위: checkIn 이상 checkOut(hover날짜) 미만 — departure 날짜는 하이라이트 제외
                           const startD = selectionStart.date <= hoveredDay ? selectionStart.date : hoveredDay;
                           const endD = selectionStart.date <= hoveredDay ? hoveredDay : selectionStart.date;
-                          if (dateStr >= startD && dateStr <= endD) {
+                          if (dateStr >= startD && dateStr < endD) {
                             isInQuickSelectionRange = true;
                           }
                         }

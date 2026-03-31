@@ -442,6 +442,10 @@ function enrichReservationDocument(data, {
         enriched.cancelTime = sourceLastModified;
     }
 
+    if (!enriched.guestComments && enriched.comments) {
+        enriched.guestComments = enriched.comments;
+    }
+
     enriched.outputImpact = buildReservationOutputImpact(enriched);
     enriched.integrity = buildReservationIntegrityInfo(enriched);
     return enriched;
@@ -578,7 +582,10 @@ async function recordPriceSyncAudit({
     ...rest
 }) {
     const statusMarkers = {};
-    if (syncVariant === "webhook") statusMarkers.lastWebhookAt = true;
+    if (syncVariant === "webhook" || syncVariant === "immediate" ||
+        syncVariant === "queued" || syncVariant === "failed" || syncVariant === "skipped") {
+        statusMarkers.lastWebhookAt = true;
+    }
     if (syncVariant === "incremental") {
         statusMarkers.lastIncrementalAt = true;
         statusMarkers.lastReconciledAt = true;
@@ -1483,28 +1490,57 @@ exports.syncBeds24Full = onRequest({ cors: true, timeoutSeconds: 900, memory: '1
 // 가격 데이터 동기화 서포트 함수 (Lock & Retry)
 // ==========================================
 
+const PRICE_SYNC_LOCK_TTL_MS = 15 * 60 * 1000;
+async function acquirePriceSyncLock(lockedBy = "syncAllPrices") {
+    const lockRef = db.collection("sync_status").doc("price_sync_lock");
+    try {
+        let acquired = false;
+        let ageMinutes = null;
+        await db.runTransaction(async (tx) => {
+            const snap = await tx.get(lockRef);
+            if (snap.exists) {
+                const lockTime = snap.data()?.lockedAt?.toDate() || new Date(0);
+                const diffMs = Date.now() - lockTime.getTime();
+                if (diffMs < PRICE_SYNC_LOCK_TTL_MS) {
+                    ageMinutes = diffMs / (1000 * 60);
+                    acquired = false;
+                    return;
+                }
+            }
+            tx.set(lockRef, {
+                lockedAt: admin.firestore.FieldValue.serverTimestamp(),
+                status: 'running',
+                lockedBy
+            });
+            acquired = true;
+        });
+        return { acquired, ageMinutes };
+    } catch (e) {
+        console.error(`[PriceSyncLock] acquire failed (${lockedBy}):`, e.message);
+        return { acquired: false, ageMinutes: null, error: e };
+    }
+}
+async function releasePriceSyncLock() {
+    try {
+        await db.collection("sync_status").doc("price_sync_lock").delete();
+    } catch (e) {
+        console.warn("[PriceSyncLock] release failed:", e.message);
+    }
+}
+
 // 동기화 잠금 관리
 async function useSyncLock(action = 'check') {
-    const lockRef = db.collection("sync_status").doc("price_sync_lock");
-    const now = new Date();
-
     if (action === 'acquire') {
-        const snap = await lockRef.get();
-        if (snap.exists) {
-            const data = snap.data();
-            const lockTime = data.lockedAt?.toDate() || new Date(0);
-            const diffMinutes = (now - lockTime) / (1000 * 60);
-
-            // 15분이 지났으면 고착된 락으로 간주하고 강제 점유
-            if (diffMinutes < 15) {
-                console.log(`[Sync Lock] 이미 실행 중입니다 (시작: ${Math.round(diffMinutes)}분 전)`);
-                return false;
+        const { acquired, ageMinutes } = await acquirePriceSyncLock("syncAllPrices");
+        if (!acquired) {
+            if (typeof ageMinutes === "number") {
+                console.log(`[PriceSyncLock] 이미 실행 중 (${ageMinutes.toFixed(1)}분 경과)`);
             }
+            return false;
         }
-        await lockRef.set({ lockedAt: admin.firestore.FieldValue.serverTimestamp(), status: 'running' });
         return true;
     } else if (action === 'release') {
-        await lockRef.delete();
+        await releasePriceSyncLock();
         return true;
     }
     return false;
@@ -2863,6 +2899,62 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, 
     }
 });
 
+async function tryAcquireWebhookPriceSyncLock() {
+    const result = await acquirePriceSyncLock("priceWebhook");
+    return result.acquired;
+}
+async function releaseWebhookPriceSyncLock() {
+    await releasePriceSyncLock();
+}
+
+async function syncSingleRoomPriceCache(building, roomId, roomName, { reason = "webhook", companyId } = {}) {
+    const tokyoNow = dayjs().utcOffset(9);
+    const fromDate = tokyoNow.format("YYYY-MM-DD");
+    const toDate = tokyoNow.add(6, "month").format("YYYY-MM-DD");
+
+    const response = await beds24GetV2WithRetry("/inventory/rooms/calendar", {
+        roomId: parseInt(roomId),
+        startDate: fromDate,
+        endDate: toDate,
+        includePrices: true,
+        includeLinkedPrices: true,
+        includeMinStay: true,
+        includeMaxStay: true
+    });
+
+    const roomData = response.data?.data?.[0];
+    if (!roomData || !Array.isArray(roomData.calendar)) {
+        return { success: false, skipped: true };
+    }
+
+    const datesObj = {};
+    roomData.calendar.forEach(entry => {
+        const entryFromDate = dayjs(entry.from);
+        const entryToDate = dayjs(entry.to);
+        for (let d = entryFromDate; d.isBefore(entryToDate) || d.isSame(entryToDate, 'day'); d = d.add(1, 'day')) {
+            const dateKey = d.format('YYYYMMDD');
+            datesObj[dateKey] = {
+                p1: String(entry.price1 || ""),
+                p2: String(entry.price2 || ""),
+                p3: String(entry.price3 || ""),
+                m: String(entry.minStay || ""),
+                mx: String(entry.maxStay || "")
+            };
+        }
+    });
+
+    const roomDocRef = db.collection("price_sync").doc(building).collection("rooms").doc(String(roomId));
+    await roomDocRef.set({
+        roomName,
+        roomId: String(roomId),
+        dates: datesObj,
+        outputImpact: buildPriceOutputImpact({ building, roomName, roomId: String(roomId), fromDate, toDate }),
+        lastSyncRoom: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    return { success: true };
+}
+
 // ==========================================
 // 가격/재고 변경 웹훅: Beds24에서 발생한 변경 사항 감지
 // ==========================================
@@ -2926,7 +3018,9 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
                 notes: `Beds24에서 객실(${roomName})의 가격 또는 재고 변경이 감지되었습니다.`
             });
 
-            // price_sync 캐시 무효화 (다음 syncAllPrices 시 해당 룸만 재동기화; 카운트는 sync 완료 시 정확히 덮어씀)
+            const companyId = (PROPERTIES.find((prop) => prop.name === building)?.companyId) || DEFAULT_COMPANY_ID;
+
+            // price_sync 캐시 무효화 (기본 — 즉시 sync 성공 시 제거됨)
             const priceSyncDoc = db.collection("price_sync").doc(building);
             const snap = await priceSyncDoc.get();
             const existingIds = new Set((snap.data()?.invalidatedRoomIds || []).map(String));
@@ -2944,21 +3038,70 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
             }, { merge: true });
             console.log(`[Cache Invalidated] ${building} price_sync marked for refresh due to external webhook.`);
 
-            await recordPriceSyncAudit({
-                syncType: "webhook",
-                syncVariant: "webhook",
-                syncSource: "beds24_price_webhook",
-                companyId: (PROPERTIES.find((prop) => prop.name === building)?.companyId) || DEFAULT_COMPANY_ID,
-                fetchedCount: 1,
-                upsertedCount: 1,
-                note: `room invalidated: ${building} ${roomName} (${roomId})`,
-                metadata: {
-                    building,
-                    roomName,
-                    roomId: String(roomId),
-                    action: action || "UNKNOWN"
+            const lockAcquired = await tryAcquireWebhookPriceSyncLock();
+            let syncResult = null;
+            let syncError = null;
+            let skipReason = null;
+
+            if (lockAcquired) {
+                try {
+                    syncResult = await syncSingleRoomPriceCache(building, roomId, roomName, { reason: "webhook", companyId });
+                } catch (syncErr) {
+                    syncError = syncErr;
+                    console.error(`[priceWebhook] 즉시 동기화 실패, invalidation fallback: ${syncErr.message}`);
                 }
-            });
+            } else {
+                skipReason = "sync lock 사용 중 (scheduled/webhook 실행 중)";
+                console.log(`[priceWebhook] 즉시 sync 불가 (${skipReason}) → invalidation fallback`);
+            }
+
+            try {
+                if (syncResult?.success) {
+                    await db.collection("price_sync").doc(building).update({
+                        invalidatedRoomIds: admin.firestore.FieldValue.arrayRemove(roomId),
+                        lastWebhookAt: admin.firestore.FieldValue.serverTimestamp(),
+                        lastSyncAt: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                    await recordPriceSyncAudit({
+                        syncType: "webhook",
+                        syncVariant: "immediate",
+                        syncSource: "beds24_price_webhook",
+                        companyId,
+                        fetchedCount: 1,
+                        upsertedCount: 1,
+                        note: `immediate sync: ${building} ${roomName} (${roomId})`,
+                        metadata: {
+                            building,
+                            roomName,
+                            roomId: String(roomId),
+                            action: action || "UNKNOWN"
+                        }
+                    });
+                } else {
+                    const fallbackVariant = skipReason ? "skipped" : (syncResult?.skipped ? "skipped" : (syncError ? "failed" : "queued"));
+                    await db.collection("price_sync").doc(building).update({
+                        invalidatedRoomIds: admin.firestore.FieldValue.arrayUnion(roomId),
+                        lastWebhookAt: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                    await recordPriceSyncAudit({
+                        syncType: "webhook",
+                        syncVariant: fallbackVariant,
+                        syncSource: "beds24_price_webhook",
+                        companyId,
+                        fetchedCount: 0,
+                        upsertedCount: 0,
+                        note: `${fallbackVariant}: ${building} ${roomName} (${roomId})${skipReason ? ` - ${skipReason}` : ""}`,
+                        metadata: {
+                            building,
+                            roomName,
+                            roomId: String(roomId),
+                            action: action || "UNKNOWN"
+                        }
+                    });
+                }
+            } finally {
+                if (lockAcquired) await releaseWebhookPriceSyncLock();
+            }
         }
         res.status(200).send("OK");
     } catch (e) {
@@ -3198,6 +3341,9 @@ exports.createBooking = onRequest({ cors: true }, async (req, res) => {
             room: roomName,
             roomId: String(roomId),
             guestName: guestName || "Guest",
+            guestEmail: guestEmail || "",
+            guestPhone: guestPhone || "",
+            comments: comments || "",
             arrival: arrival,
             departure: departure,
             status: isBlock ? "blackout" : "confirmed",
