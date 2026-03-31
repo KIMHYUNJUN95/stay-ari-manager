@@ -1495,8 +1495,8 @@ function buildSheetRows(reportData) {
         rows.push(padRow([`건물별 목표 시나리오 · ${monthSummary.monthLabel}`]));
         headerRows.push(rows.length + 1);
         rows.push(padRow([
-            "건물명", "시나리오", "현재 매출", "현재 가동률", "",
-            "현재 ADR", "목표 매출", "목표 가동률", "목표 ADR", "",
+            "건물명", "시나리오", "현재 매출", "현재 가동률", "현재 ADR",
+            "", "목표 매출", "목표 가동률", "목표 ADR", "",
             "추가 매출", "ADR 증감", "가동률 증감", ""
         ]));
         const scenarioRangeStart = rows.length + 1;
@@ -1514,8 +1514,8 @@ function buildSheetRows(reportData) {
                     scenario.label,
                     formatCurrency(goal.onBooksRevenue),
                     asPlainText(formatPct(goal.onBooksOccupancyPct)),
-                    "",
                     formatCurrency(goal.onBooksAdr),
+                    "",
                     formatCurrency(scenario.revenue),
                     asPlainText(formatPct(scenario.occupancyPct)),
                     formatCurrency(scenario.adr),
@@ -1976,8 +1976,8 @@ function buildSheetRowsExpanded(reportData) {
         rows.push(padRow([`건물별 목표 시나리오 · ${monthSummary.monthLabel}`]));
         headerRows.push(rows.length + 1);
         rows.push(padRow([
-            "건물명", "시나리오", "현재 매출", "현재 가동률", "",
-            "현재 ADR", "목표 매출", "목표 가동률", "목표 ADR", "",
+            "건물명", "시나리오", "현재 매출", "현재 가동률", "현재 ADR",
+            "", "목표 매출", "목표 가동률", "목표 ADR", "",
             "추가 매출", "ADR 증감", "가동률 증감", ""
         ]));
         const scenarioRangeStart = rows.length + 1;
@@ -1995,8 +1995,8 @@ function buildSheetRowsExpanded(reportData) {
                     scenario.label,
                     formatCurrency(goal.onBooksRevenue),
                     asPlainText(formatPct(goal.onBooksOccupancyPct)),
-                    "",
                     formatCurrency(goal.onBooksAdr),
+                    "",
                     formatCurrency(scenario.revenue),
                     asPlainText(formatPct(scenario.occupancyPct)),
                     formatCurrency(scenario.adr),
