@@ -4,7 +4,7 @@
 
 | 변수 | 용도 | 비고 |
 |------|------|------|
-| `SLACK_DAILY_REPORT_WEBHOOK_URL` | 일일 운영 리포트 | 필수. 08:50 JST + 변동 시 재전송 |
+| `SLACK_DAILY_REPORT_WEBHOOK_URL` | 일일 운영 리포트 | 필수. 08:00 JST + 변동 시 재전송 |
 | `SLACK_CLEANING_REPORT_WEBHOOK_URL` | 청소/셋팅 알림 | 08:50 JST, 당일 기준 |
 | `SLACK_SAME_DAY_BOOKING_WEBHOOK_URL` | 당일 예약 알람 | Beds24 웹훅 → 당일 예약 시 1건씩 |
 | `SLACK_CANCEL_ALERT_WEBHOOK_URL` | 당일 취소 알람 | 에어/부킹만, 입실일 ±6개월 |
@@ -13,7 +13,7 @@
 ## 발송 경로
 
 1. **일일 리포트** (`slackReports.js`)
-   - **스케줄**: `50 8 * * *` (08:50 JST) → `buildAndSendSlackDailyReport()` (어제 기준)
+   - **스케줄**: `0 8 * * *` (08:00 JST) → `buildAndSendSlackDailyReport()` (어제 기준)
    - **변동 재전송**: 웹훅/동기화 후 `scheduleOutputUpdates()` → 어제 데이터 포함 시 `buildAndSendSlackDailyReport(false, dateStr, true)` (변동 없으면 생략)
    - **수동**: `sendSlackDailyReportManual` GET (쿼리 `?target=today` 시 오늘 기준)
 

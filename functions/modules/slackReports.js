@@ -1,6 +1,6 @@
 /**
  * 슬랙 일일/청소 리포트 + 동기화 알람
- * - SLACK_DAILY_REPORT_WEBHOOK_URL: 일일 운영 리포트 (08:50 JST + 변동 시 재전송)
+ * - SLACK_DAILY_REPORT_WEBHOOK_URL: 일일 운영 리포트 (08:00 JST + 변동 시 재전송)
  * - SLACK_CLEANING_REPORT_WEBHOOK_URL: 청소/셋팅 알림 (08:50 JST, 당일 기준)
  * - SLACK_SYNC_ALERT_WEBHOOK_URL: 동기화/리포트 실패 알람 (미설정 시 일일→청소 순으로 fallback)
  */
@@ -407,13 +407,13 @@ ${buildingLinesClean}
     }
 
     const scheduledSlackDailyReport = onSchedule({
-        schedule: "50 8 * * *",
+        schedule: "0 8 * * *",
         timeZone: "Asia/Tokyo",
         timeoutSeconds: 120,
         memory: "256MiB"
     }, async () => {
         try {
-            // 아침 08:50 JST: 전날(어제) 기준 일일 리포트 1회 발송. 변동 재전송은 scheduleOutputUpdates에서 처리.
+            // 아침 08:00 JST: 전날(어제) 기준 일일 리포트 1회 발송. 변동 재전송은 scheduleOutputUpdates에서 처리.
             await buildAndSendSlackDailyReport();
         } catch (e) {
             console.error("❌ [Slack Daily] scheduledSlackDailyReport 실패:", e.stack || e.message);

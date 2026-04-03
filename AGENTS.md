@@ -148,3 +148,9 @@ Airbnb, Booking.com, Expedia, Agoda, Direct(수기)
 - **카드/컨테이너**: 미묘한 그림자(`box-shadow`), 적절한 border-radius, backdrop-blur 활용
 - **색상**: 단색 금지 — gradient, opacity 변화로 깊이감 표현
 - **반응형**: 모바일에서도 동일한 퀄리티 유지
+# Beds24 Official Docs Rule
+- For any Beds24-related API, webhook, pricing, inventory, booking, minStay, or sync task, always consult `docs/rules/BEDS24_OFFICIAL_DOCS.md` first and prefer official Beds24 documentation over memory or third-party sources.
+- This is mandatory for every agent and every AI working in this repository.
+- Do not answer Beds24 behavior questions from memory alone when the official docs can confirm them.
+- If the official docs and repository behavior differ, state the mismatch clearly.
+- If the docs are unclear, say the answer is uncertain instead of guessing.
