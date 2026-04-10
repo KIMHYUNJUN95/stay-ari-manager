@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useDeferredValue } from 'react';
 import { collection, query, where, orderBy, limit, getDocs } from "firebase/firestore";
 import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
@@ -11,6 +11,52 @@ function PriceChangeHistory() {
     const [expandedId, setExpandedId] = useState(null);
     const [buildingFilter, setBuildingFilter] = useState("all");
     const [originFilter, setOriginFilter] = useState("all");
+    const [groupBy, setGroupBy] = useState("date");
+    const [dateFromFilter, setDateFromFilter] = useState("");
+    const [dateToFilter, setDateToFilter] = useState("");
+    const deferredDateFromFilter = useDeferredValue(dateFromFilter);
+    const deferredDateToFilter = useDeferredValue(dateToFilter);
+
+    const getTokyoDateKey = (ts) => {
+        if (!ts) return "Unknown";
+        const date = ts.toDate ? ts.toDate() : new Date(ts);
+        const parts = new Intl.DateTimeFormat("en-CA", {
+            timeZone: "Asia/Tokyo",
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit"
+        }).formatToParts(date);
+        const year = parts.find((part) => part.type === "year")?.value;
+        const month = parts.find((part) => part.type === "month")?.value;
+        const day = parts.find((part) => part.type === "day")?.value;
+        return year && month && day ? `${year}-${month}-${day}` : "Unknown";
+    };
+
+    const normalizeDateInput = (value) => {
+        const digits = String(value || "").replace(/\D/g, "").slice(0, 8);
+        if (digits.length <= 4) return digits;
+        if (digits.length <= 6) return `${digits.slice(0, 4)}-${digits.slice(4)}`;
+        return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6)}`;
+    };
+
+    const isFullDateValue = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
+
+    const getValidatedDateFilter = (value) => {
+        const normalized = String(value || "").trim();
+        if (!isFullDateValue(normalized)) return null;
+        const [year, month, day] = normalized.split("-").map(Number);
+        const date = new Date(Date.UTC(year, month - 1, day));
+        if (
+            date.getUTCFullYear() !== year ||
+            date.getUTCMonth() !== month - 1 ||
+            date.getUTCDate() !== day
+        ) {
+            return null;
+        }
+        return normalized;
+    };
+
+    const getTokyoTodayKey = () => getTokyoDateKey(new Date());
 
     useEffect(() => {
         if (!companyId) return;
@@ -39,6 +85,8 @@ function PriceChangeHistory() {
 
     const filteredLogs = useMemo(() => {
         let result = logs;
+        const validDateFrom = getValidatedDateFilter(deferredDateFromFilter);
+        const validDateTo = getValidatedDateFilter(deferredDateToFilter);
         if (buildingFilter !== "all") {
             result = result.filter(log => log.building === buildingFilter);
         }
@@ -49,29 +97,61 @@ function PriceChangeHistory() {
                 result = result.filter(log => log.origin === "관리자 대시보드" || log.origin === "queue_worker");
             }
         }
+        if (validDateFrom || validDateTo) {
+            result = result.filter((log) => {
+                const logDateKey = getTokyoDateKey(log.timestamp);
+                if (!logDateKey || logDateKey === "Unknown") return false;
+                if (validDateFrom && logDateKey < validDateFrom) return false;
+                if (validDateTo && logDateKey > validDateTo) return false;
+                return true;
+            });
+        }
         return result;
-    }, [logs, buildingFilter, originFilter]);
+    }, [logs, buildingFilter, originFilter, deferredDateFromFilter, deferredDateToFilter]);
 
     // Group logs by date (YYYY-MM-DD)
     const groupedLogs = useMemo(() => {
         const groups = {};
         filteredLogs.forEach(log => {
-            const ts = log.timestamp;
-            let dateKey = "Unknown";
-            if (ts) {
-                const date = ts.toDate ? ts.toDate() : new Date(ts);
-                dateKey = date.toISOString().slice(0, 10);
-            }
+            const dateKey = getTokyoDateKey(log.timestamp);
             if (!groups[dateKey]) groups[dateKey] = [];
             groups[dateKey].push(log);
         });
         return Object.entries(groups).sort(([a], [b]) => b.localeCompare(a));
     }, [filteredLogs]);
 
+    const groupedByBuilding = useMemo(() => {
+        const groups = {};
+        filteredLogs.forEach(log => {
+            const key = log.building || "Unknown";
+            if (!groups[key]) groups[key] = [];
+            groups[key].push(log);
+        });
+        return Object.entries(groups).sort(([a], [b]) => a.localeCompare(b));
+    }, [filteredLogs]);
+
+    const groupedByBuildingDate = useMemo(() => {
+        const buildings = {};
+        filteredLogs.forEach(log => {
+            const building = log.building || "Unknown";
+            const dateKey = getTokyoDateKey(log.timestamp);
+            if (!buildings[building]) buildings[building] = {};
+            if (!buildings[building][dateKey]) buildings[building][dateKey] = [];
+            buildings[building][dateKey].push(log);
+        });
+        return Object.entries(buildings)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([building, dateGroups]) => [
+                building,
+                Object.entries(dateGroups).sort(([a], [b]) => b.localeCompare(a))
+            ]);
+    }, [filteredLogs]);
+
     const formatTimestamp = (ts) => {
         if (!ts) return "-";
         const date = ts.toDate ? ts.toDate() : new Date(ts);
         return date.toLocaleString('en-US', {
+            timeZone: 'Asia/Tokyo',
             hour: '2-digit',
             minute: '2-digit',
             hour12: false
@@ -80,8 +160,7 @@ function PriceChangeHistory() {
 
     const formatDateFull = (dateStr) => {
         if (!dateStr || dateStr === "Unknown") return "Unknown";
-        const d = new Date(dateStr + "T00:00:00");
-        return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+        return String(dateStr).replace(/-/g, " - ");
     };
 
     const formatDateRange = (dateFrom, dateTo) => {
@@ -114,7 +193,69 @@ function PriceChangeHistory() {
     };
 
     const getBuildingName = (building) => BUILDING_NAMES_EN[building] || building;
-    const getRoomName = (room) => room ? String(room).replace("호", "") : "-";
+    const getRoomName = (room) => {
+        if (!room) return "-";
+        const roomName = String(room);
+        if (roomName.endsWith("호")) {
+            return `Room ${roomName.replace("호", "")}`;
+        }
+        const specialRooms = {
+            "오쿠보A": "Okubo A",
+            "오쿠보B": "Okubo B",
+            "오쿠보C": "Okubo C",
+            "사노": "Sano"
+        };
+        return specialRooms[roomName] || roomName;
+    };
+    const getChangeTypeLabel = (log) => {
+        const isBeds24 = log.origin?.includes("Beds24") || log.origin?.includes("외부");
+        if (isBeds24) return { label: "Beds24 External", bg: "#FFF7ED", color: "#EA580C" };
+        if (log.adjustMode === "percent" && log.percentValue != null) {
+            const sign = Number(log.percentValue) > 0 ? "+" : "";
+            return { label: `Percent ${sign}${log.percentValue}%`, bg: Number(log.percentValue) >= 0 ? "#FEF2F2" : "#ECFDF5", color: Number(log.percentValue) >= 0 ? "#EF4444" : "#10B981" };
+        }
+        return { label: "Fixed Price", bg: "#EFF6FF", color: "#2563EB" };
+    };
+
+    const getScopeSummary = (log, period) => {
+        const roomCount = Array.isArray(log.rooms) ? log.rooms.length : (log.room ? 1 : 0);
+        const parts = [];
+        if (period.totalDays > 0) parts.push(`${period.totalDays} date${period.totalDays !== 1 ? "s" : ""}`);
+        if (roomCount > 1) parts.push(`${roomCount} rooms`);
+        return parts.join(" · ");
+    };
+
+    const getRoomTitle = (log) => {
+        if (Array.isArray(log.rooms) && log.rooms.length > 0) {
+            const names = log.rooms.map(getRoomName);
+            if (names.length <= 2) return names.join(", ");
+            return `${names.slice(0, 2).join(", ")} +${names.length - 2}`;
+        }
+        return getRoomName(log.room);
+    };
+
+    const getBeds24Note = (log) => {
+        const roomLabel = Array.isArray(log.rooms) && log.rooms.length > 0
+            ? log.rooms.map(getRoomName).join(", ")
+            : getRoomName(log.room);
+        return `Beds24 detected a price or inventory change for ${roomLabel}.`;
+    };
+
+    const getUniquePriceSnapshot = (log) => {
+        const snapshots = Array.isArray(log?.priceSnapshot) ? log.priceSnapshot : [];
+        const seen = new Set();
+        return snapshots.filter((snap) => {
+            const key = [
+                snap?.date || "",
+                snap?.room || "",
+                snap?.oldPrice ?? "",
+                snap?.newPrice ?? ""
+            ].join("|");
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    };
 
     const getOriginLabel = (log) => {
         if (log.origin?.includes("외부 수정") || log.origin?.includes("Beds24")) return "Beds24";
@@ -148,47 +289,189 @@ function PriceChangeHistory() {
         return { total, beds24, admin };
     }, [filteredLogs]);
 
-    return (
-        <div style={{
-            padding: '32px',
-            background: '#FFFFFF',
-            minHeight: '100vh',
-            fontFamily: 'Inter, system-ui, -apple-system, sans-serif'
-        }}>
-            {/* Header */}
-            <div style={{ marginBottom: '28px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                    <div style={{
-                        fontSize: '28px',
-                        background: 'linear-gradient(135deg, #EEF2FF 0%, #E0E7FF 100%)',
-                        width: '48px', height: '48px',
-                        display: 'flex', justifyContent: 'center', alignItems: 'center',
-                        borderRadius: '14px'
-                    }}>
-                        💰
+    const COL = '72px 54px minmax(110px,140px) minmax(80px,110px) 126px 118px 1fr';
+
+    const colHeaderStyle = {
+        fontSize: '11px', fontWeight: '600', color: '#8E8E93',
+        textTransform: 'uppercase', letterSpacing: '0.04em', userSelect: 'none'
+    };
+
+    const segBtn = (mode, label) => (
+        <button key={mode} onClick={() => setGroupBy(mode)} style={{
+            padding: '5px 13px', borderRadius: '8px', border: 'none', cursor: 'pointer',
+            background: groupBy === mode ? '#FFFFFF' : 'transparent',
+            color: groupBy === mode ? '#1D1D1F' : '#6E6E73',
+            fontSize: '12px', fontWeight: groupBy === mode ? '600' : '400',
+            boxShadow: groupBy === mode ? '0 1px 4px rgba(0,0,0,0.14)' : 'none',
+            transition: 'all 0.15s', whiteSpace: 'nowrap'
+        }}>{label}</button>
+    );
+
+    const renderRows = (rows) => rows.map((log, idx) => {
+        const period = extractPeriodFromDates(log);
+        const isExpanded = expandedId === log.id;
+        const uniquePriceSnapshot = getUniquePriceSnapshot(log);
+        const hasSnapshot = uniquePriceSnapshot.length > 0;
+        const isBeds24 = log.origin?.includes("Beds24") || log.origin?.includes("외부");
+        const ct = getChangeTypeLabel(log);
+        const errorMsg = log.errorMessage || log.error;
+        const priceDelta = log.oldPrice > 0 && log.newPrice != null
+            ? Math.round((log.newPrice - log.oldPrice) / log.oldPrice * 100) : null;
+
+        return (
+            <React.Fragment key={log.id}>
+                <div
+                    onClick={() => hasSnapshot && setExpandedId(isExpanded ? null : log.id)}
+                    onMouseEnter={e => { if (!isExpanded) e.currentTarget.style.background = '#F9F9F9'; }}
+                    onMouseLeave={e => { if (!isExpanded) e.currentTarget.style.background = 'transparent'; }}
+                    style={{
+                        display: 'grid', gridTemplateColumns: COL, alignItems: 'center',
+                        padding: '10px 20px', gap: '0 8px',
+                        borderTop: idx > 0 ? '1px solid #F2F2F7' : 'none',
+                        borderLeft: `3px solid ${isBeds24 ? '#FF9F0A' : 'transparent'}`,
+                        cursor: hasSnapshot ? 'pointer' : 'default',
+                        background: isExpanded ? '#F5F5F7' : 'transparent',
+                        transition: 'background 0.12s'
+                    }}
+                >
+                    <span style={{ fontSize: '12px', color: '#8E8E93', fontVariantNumeric: 'tabular-nums' }}>
+                        {formatTimestamp(log.timestamp)}
+                    </span>
+                    <span>
+                        {log.success !== false
+                            ? <span style={{ fontSize: '10px', fontWeight: '700', color: '#34C759', background: '#F0FFF4', padding: '2px 7px', borderRadius: '20px' }}>OK</span>
+                            : <span style={{ fontSize: '10px', fontWeight: '700', color: '#FF3B30', background: '#FFF2F0', padding: '2px 7px', borderRadius: '20px' }} title={errorMsg}>FAIL</span>
+                        }
+                    </span>
+                    <span style={{ fontSize: '13px', fontWeight: '500', color: '#1D1D1F', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {getBuildingName(log.building)}
+                    </span>
+                    <span style={{ fontSize: '12px', color: '#3C3C43', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {getRoomTitle(log)}
+                    </span>
+                    <div style={{ fontSize: '12px', color: '#0071E3', fontWeight: '500', fontVariantNumeric: 'tabular-nums' }}>
+                        {formatDateRange(period.dateFrom, period.dateTo)}
+                        {period.totalDays > 0 && <span style={{ color: '#AEAEB2', fontWeight: '400', marginLeft: '3px' }}>{period.totalDays}d</span>}
                     </div>
-                    <div>
-                        <h1 style={{ fontSize: '24px', fontWeight: '700', color: '#0F172A', margin: 0, letterSpacing: '-0.5px' }}>
-                            Price Change History
-                        </h1>
-                        <p style={{ fontSize: '14px', color: '#64748B', marginTop: '4px', fontWeight: '500' }}>
-                            {stats.total} records · {stats.admin} admin · {stats.beds24} Beds24
-                        </p>
+                    <span style={{ fontSize: '11px', fontWeight: '500', color: ct.color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {ct.label}
+                    </span>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '7px' }}>
+                        {log.oldPrice != null && log.newPrice != null ? (
+                            <>
+                                <span style={{ fontSize: '12px', color: '#AEAEB2', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums' }}>
+                                    {formatPrice(log.oldPrice)}
+                                </span>
+                                <span style={{ color: '#D1D1D6', fontSize: '11px' }}>→</span>
+                                <span style={{
+                                    fontSize: '14px', fontWeight: '700', fontVariantNumeric: 'tabular-nums',
+                                    color: log.newPrice > log.oldPrice ? '#FF3B30' : log.newPrice < log.oldPrice ? '#34C759' : '#1D1D1F'
+                                }}>
+                                    {formatPrice(log.newPrice)}
+                                </span>
+                                {priceDelta !== null && priceDelta !== 0 && (
+                                    <span style={{
+                                        fontSize: '11px', fontWeight: '600',
+                                        color: priceDelta > 0 ? '#FF3B30' : '#34C759',
+                                        background: priceDelta > 0 ? '#FFF2F0' : '#F0FFF4',
+                                        padding: '2px 6px', borderRadius: '20px'
+                                    }}>
+                                        {priceDelta > 0 ? '▲' : '▼'}{Math.abs(priceDelta)}%
+                                    </span>
+                                )}
+                                {hasSnapshot && (
+                                    <span style={{
+                                        color: '#C7C7CC', fontSize: '14px', marginLeft: '2px',
+                                        display: 'inline-block', transition: 'transform 0.18s',
+                                        transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)'
+                                    }}>›</span>
+                                )}
+                            </>
+                        ) : (
+                            <span style={{ fontSize: '13px', color: '#D1D1D6' }}>—</span>
+                        )}
                     </div>
                 </div>
+
+                {/* Error */}
+                {log.success === false && errorMsg && (
+                    <div style={{ padding: '6px 20px 8px', fontSize: '12px', color: '#FF3B30', background: '#FFF2F0', borderTop: '1px solid #FFE5E5' }}>
+                        {errorMsg}
+                    </div>
+                )}
+
+                {/* Expanded Snapshot */}
+                {isExpanded && hasSnapshot && (
+                    <div style={{ padding: '16px 20px 20px', background: '#F5F5F7', borderTop: '1px solid #E5E5EA' }}>
+                        <div style={{ fontSize: '11px', fontWeight: '600', color: '#8E8E93', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            {isBeds24 ? 'Detected Changes' : 'Price Snapshot by Date'}
+                            {log.adjustMode === 'percent' && log.percentValue && (
+                                <span style={{ background: Number(log.percentValue) > 0 ? '#FFF2F0' : '#F0FFF4', color: Number(log.percentValue) > 0 ? '#FF3B30' : '#34C759', padding: '2px 8px', borderRadius: '4px', fontSize: '11px', fontWeight: '600' }}>
+                                    {Number(log.percentValue) > 0 ? '+' : ''}{log.percentValue}%
+                                </span>
+                            )}
+                            <span style={{ marginLeft: 'auto', fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
+                                by {getWorkerDisplay(log)}{log.workerEmail ? ` · ${log.workerEmail}` : ''}
+                            </span>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(148px, 1fr))', gap: '8px' }}>
+                            {uniquePriceSnapshot.map((snap, sidx) => (
+                                <div key={sidx} style={{ background: '#FFFFFF', borderRadius: '10px', padding: '10px 12px', border: '1px solid #E5E5EA' }}>
+                                    <div style={{ fontSize: '11px', fontWeight: '600', color: '#0071E3', marginBottom: '5px', display: 'flex', justifyContent: 'space-between' }}>
+                                        <span>{snap.date ? snap.date.slice(5).replace('-', '/') : '-'}</span>
+                                        {snap.room && <span style={{ color: '#AEAEB2', fontWeight: '400' }}>{getRoomName(snap.room)}</span>}
+                                    </div>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                                        <span style={{ fontSize: '12px', color: '#AEAEB2', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums' }}>{formatPrice(snap.oldPrice)}</span>
+                                        <span style={{ color: '#D1D1D6', fontSize: '10px' }}>→</span>
+                                        <span style={{ fontSize: '13px', fontWeight: '700', fontVariantNumeric: 'tabular-nums', color: snap.newPrice > snap.oldPrice ? '#FF3B30' : snap.newPrice < snap.oldPrice ? '#34C759' : '#1D1D1F' }}>{formatPrice(snap.newPrice)}</span>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
+            </React.Fragment>
+        );
+    });
+
+    const groupHeaderStyle = (sub = false) => ({
+        padding: sub ? '6px 20px' : '8px 20px',
+        background: sub ? '#F9F9F9' : '#F2F2F7',
+        borderTop: '1px solid #E5E5EA',
+        borderBottom: '1px solid #E5E5EA',
+        display: 'flex', alignItems: 'center', gap: '8px'
+    });
+
+    return (
+        <div style={{
+            padding: '28px 32px',
+            background: '#F5F5F7',
+            minHeight: '100vh',
+            fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif'
+        }}>
+            {/* Header */}
+            <div style={{ marginBottom: '24px' }}>
+                <h1 style={{ fontSize: '26px', fontWeight: '700', color: '#1D1D1F', margin: '0 0 4px', letterSpacing: '-0.5px' }}>
+                    Price History
+                </h1>
+                <p style={{ fontSize: '13px', color: '#8E8E93', margin: 0, fontWeight: '400' }}>
+                    {stats.total} records&nbsp;&nbsp;·&nbsp;&nbsp;{stats.admin} admin&nbsp;&nbsp;·&nbsp;&nbsp;{stats.beds24} Beds24
+                </p>
             </div>
 
-            {/* Filters */}
-            <div style={{
-                display: "flex", gap: "12px", marginBottom: "20px", flexWrap: "wrap", alignItems: "center"
-            }}>
+            {/* Controls */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>
                 <select
                     value={buildingFilter}
-                    onChange={(e) => setBuildingFilter(e.target.value)}
+                    onChange={e => setBuildingFilter(e.target.value)}
                     style={{
-                        padding: "8px 14px", borderRadius: "10px",
-                        border: "1px solid #E2E8F0", fontSize: "13px", fontWeight: "500",
-                        color: "#334155", background: "white", cursor: "pointer", outline: "none"
+                        padding: '7px 12px', borderRadius: '9px',
+                        border: '1px solid #D1D1D6', fontSize: '13px',
+                        color: '#1D1D1F', background: '#FFFFFF', cursor: 'pointer', outline: 'none',
+                        WebkitAppearance: 'none', appearance: 'none', paddingRight: '28px',
+                        backgroundImage: 'url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'10\' height=\'6\'%3E%3Cpath d=\'M0 0l5 6 5-6z\' fill=\'%238E8E93\'/%3E%3C/svg%3E")',
+                        backgroundRepeat: 'no-repeat', backgroundPosition: 'right 10px center'
                     }}
                 >
                     <option value="all">All Properties</option>
@@ -199,283 +482,215 @@ function PriceChangeHistory() {
 
                 <select
                     value={originFilter}
-                    onChange={(e) => setOriginFilter(e.target.value)}
+                    onChange={e => setOriginFilter(e.target.value)}
                     style={{
-                        padding: "8px 14px", borderRadius: "10px",
-                        border: "1px solid #E2E8F0", fontSize: "13px", fontWeight: "500",
-                        color: "#334155", background: "white", cursor: "pointer", outline: "none"
+                        padding: '7px 12px', borderRadius: '9px',
+                        border: '1px solid #D1D1D6', fontSize: '13px',
+                        color: '#1D1D1F', background: '#FFFFFF', cursor: 'pointer', outline: 'none',
+                        WebkitAppearance: 'none', appearance: 'none', paddingRight: '28px',
+                        backgroundImage: 'url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'10\' height=\'6\'%3E%3Cpath d=\'M0 0l5 6 5-6z\' fill=\'%238E8E93\'/%3E%3C/svg%3E")',
+                        backgroundRepeat: 'no-repeat', backgroundPosition: 'right 10px center'
                     }}
                 >
                     <option value="all">All Sources</option>
-                    <option value="admin">Admin Dashboard</option>
-                    <option value="beds24">Beds24 External</option>
+                    <option value="admin">Admin</option>
+                    <option value="beds24">Beds24</option>
                 </select>
 
-                <span style={{ fontSize: "12px", color: "#94A3B8", marginLeft: "4px" }}>
-                    Showing {filteredLogs.length} of {logs.length}
+                <div style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    padding: '6px 10px',
+                    borderRadius: '10px',
+                    background: '#FFFFFF',
+                    border: '1px solid #E5E5EA',
+                    flexWrap: 'wrap'
+                }}>
+                    <input
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={10}
+                        value={dateFromFilter}
+                        onChange={e => setDateFromFilter(normalizeDateInput(e.target.value))}
+                        placeholder="From YYYY-MM-DD"
+                        style={{
+                            width: '132px',
+                            padding: '7px 10px',
+                            borderRadius: '8px',
+                            border: '1px solid #D1D1D6',
+                            fontSize: '12px',
+                            color: '#1D1D1F',
+                            background: '#FFFFFF',
+                            outline: 'none',
+                            fontVariantNumeric: 'tabular-nums'
+                        }}
+                    />
+                    <span style={{ fontSize: '12px', color: '#AEAEB2' }}>~</span>
+                    <input
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={10}
+                        value={dateToFilter}
+                        onChange={e => setDateToFilter(normalizeDateInput(e.target.value))}
+                        placeholder="To YYYY-MM-DD"
+                        style={{
+                            width: '124px',
+                            padding: '7px 10px',
+                            borderRadius: '8px',
+                            border: '1px solid #D1D1D6',
+                            fontSize: '12px',
+                            color: '#1D1D1F',
+                            background: '#FFFFFF',
+                            outline: 'none',
+                            fontVariantNumeric: 'tabular-nums'
+                        }}
+                    />
+                    <button
+                        onClick={() => {
+                            const todayKey = getTokyoTodayKey();
+                            setDateFromFilter(todayKey);
+                            setDateToFilter(todayKey);
+                        }}
+                        style={{
+                            padding: '6px 10px',
+                            borderRadius: '8px',
+                            border: '1px solid #D1D1D6',
+                            background: '#F8FAFC',
+                            color: '#334155',
+                            fontSize: '12px',
+                            fontWeight: '600',
+                            cursor: 'pointer'
+                        }}
+                    >
+                        Today
+                    </button>
+                    <button
+                        onClick={() => {
+                            setDateFromFilter("");
+                            setDateToFilter("");
+                        }}
+                        style={{
+                            padding: '6px 10px',
+                            borderRadius: '8px',
+                            border: '1px solid #D1D1D6',
+                            background: '#FFFFFF',
+                            color: '#6B7280',
+                            fontSize: '12px',
+                            fontWeight: '600',
+                            cursor: 'pointer'
+                        }}
+                    >
+                        Clear
+                    </button>
+                </div>
+
+                <span style={{ fontSize: '12px', color: '#AEAEB2' }}>
+                    {filteredLogs.length} of {logs.length}
                 </span>
+
+                {/* Group By segment control — pushed right */}
+                <div style={{
+                    marginLeft: 'auto',
+                    display: 'inline-flex', alignItems: 'center',
+                    background: '#E5E5EA', borderRadius: '10px', padding: '3px', gap: '2px'
+                }}>
+                    {segBtn('date', 'By Date')}
+                    {segBtn('building', 'By Building')}
+                    {segBtn('building+date', 'Building + Date')}
+                </div>
             </div>
 
-            {/* Content */}
+            {/* Table */}
             {loading ? (
-                <div style={{ padding: "80px", textAlign: "center", color: "#94A3B8" }}>
-                    <div style={{ fontSize: "32px", marginBottom: "16px", animation: "pulse 1.5s infinite" }}>⏳</div>
-                    Loading history...
+                <div style={{ padding: '80px', textAlign: 'center', color: '#AEAEB2', fontSize: '14px' }}>
+                    Loading...
                 </div>
             ) : filteredLogs.length === 0 ? (
-                <div style={{ padding: "80px", textAlign: "center", color: "#64748B" }}>
-                    <div style={{ fontSize: "40px", marginBottom: "16px" }}>🦕</div>
-                    <div style={{ fontSize: "16px", fontWeight: "600" }}>No price change history found</div>
-                    <div style={{ fontSize: "13px", color: "#94A3B8", marginTop: "8px" }}>
-                        {buildingFilter !== "all" || originFilter !== "all"
-                            ? "Try adjusting filters"
-                            : "Changes will appear here after price updates"}
+                <div style={{ padding: '80px', textAlign: 'center' }}>
+                    <div style={{ fontSize: '15px', fontWeight: '600', color: '#1D1D1F', marginBottom: '6px' }}>No records found</div>
+                    <div style={{ fontSize: '13px', color: '#AEAEB2' }}>
+                        {buildingFilter !== 'all' || originFilter !== 'all' || dateFromFilter || dateToFilter ? 'Try adjusting filters' : 'Price changes will appear here'}
                     </div>
                 </div>
             ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: "24px" }}>
-                    {groupedLogs.map(([dateKey, dateLogs]) => (
-                        <div key={dateKey}>
-                            {/* Date Group Header */}
-                            <div style={{
-                                display: "flex", alignItems: "center", gap: "12px",
-                                marginBottom: "12px", padding: "0 4px"
-                            }}>
-                                <div style={{
-                                    fontSize: "14px", fontWeight: "700", color: "#1E293B",
-                                    background: "linear-gradient(135deg, #F1F5F9 0%, #E2E8F0 100%)",
-                                    padding: "6px 14px", borderRadius: "8px"
-                                }}>
+                <div style={{
+                    background: '#FFFFFF',
+                    borderRadius: '14px',
+                    boxShadow: '0 1px 4px rgba(0,0,0,0.06), 0 0 0 0.5px rgba(0,0,0,0.06)',
+                    overflow: 'hidden'
+                }}>
+                    {/* Column headers */}
+                    <div style={{
+                        display: 'grid', gridTemplateColumns: COL,
+                        padding: '9px 20px', gap: '0 8px',
+                        borderBottom: '1px solid #E5E5EA',
+                        background: '#FAFAFA'
+                    }}>
+                        <span style={colHeaderStyle}>Time</span>
+                        <span style={colHeaderStyle}>Status</span>
+                        <span style={colHeaderStyle}>Building</span>
+                        <span style={colHeaderStyle}>Room</span>
+                        <span style={colHeaderStyle}>Period</span>
+                        <span style={colHeaderStyle}>Type</span>
+                        <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Price Change</span>
+                    </div>
+
+                    {/* Rows — By Date */}
+                    {groupBy === 'date' && groupedLogs.map(([dateKey, dateLogs]) => (
+                        <React.Fragment key={dateKey}>
+                            <div style={groupHeaderStyle()}>
+                                <span style={{ fontSize: '12px', fontWeight: '600', color: '#3C3C43' }}>
                                     {formatDateFull(dateKey)}
-                                </div>
-                                <div style={{ flex: 1, height: "1px", background: "#E2E8F0" }} />
-                                <span style={{ fontSize: "12px", color: "#94A3B8", fontWeight: "500" }}>
-                                    {dateLogs.length} change{dateLogs.length !== 1 ? "s" : ""}
+                                </span>
+                                <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
+                                    {dateLogs.length} change{dateLogs.length !== 1 ? 's' : ''}
                                 </span>
                             </div>
+                            {renderRows(dateLogs)}
+                        </React.Fragment>
+                    ))}
 
-                            {/* Log Cards */}
-                            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                                {dateLogs.map(log => {
-                                    const period = extractPeriodFromDates(log);
-                                    const isExpanded = expandedId === log.id;
-                                    const hasSnapshot = log.priceSnapshot && log.priceSnapshot.length > 0;
-                                    const isBeds24 = log.origin?.includes("Beds24") || log.origin?.includes("외부");
-                                    const errorMsg = log.errorMessage || log.error;
-
-                                    return (
-                                        <div key={log.id} style={{
-                                            background: "white",
-                                            borderRadius: "14px",
-                                            border: `1px solid ${isBeds24 ? "#FED7AA" : "#E2E8F0"}`,
-                                            overflow: "hidden",
-                                            transition: "box-shadow 0.2s",
-                                            boxShadow: isExpanded ? "0 4px 12px rgba(0,0,0,0.08)" : "0 1px 3px rgba(0,0,0,0.04)"
-                                        }}>
-                                            {/* Main Row */}
-                                            <div
-                                                onClick={() => hasSnapshot && setExpandedId(isExpanded ? null : log.id)}
-                                                style={{
-                                                    padding: "14px 18px",
-                                                    display: "flex", alignItems: "center", gap: "14px",
-                                                    cursor: hasSnapshot ? "pointer" : "default",
-                                                    flexWrap: "wrap"
-                                                }}
-                                            >
-                                                {/* Time */}
-                                                <div style={{ minWidth: "48px", fontSize: "13px", fontWeight: "600", color: "#475569" }}>
-                                                    {formatTimestamp(log.timestamp)}
-                                                </div>
-
-                                                {/* Status */}
-                                                <div style={{ minWidth: "60px" }}>
-                                                    {log.success !== false ? (
-                                                        <span style={{
-                                                            background: '#ECFDF5', color: '#10B981',
-                                                            padding: '3px 8px', borderRadius: '6px',
-                                                            fontSize: '11px', fontWeight: '600'
-                                                        }}>OK</span>
-                                                    ) : (
-                                                        <span style={{
-                                                            background: '#FEF2F2', color: '#EF4444',
-                                                            padding: '3px 8px', borderRadius: '6px',
-                                                            fontSize: '11px', fontWeight: '600'
-                                                        }} title={errorMsg}>FAIL</span>
-                                                    )}
-                                                </div>
-
-                                                {/* Origin Badge */}
-                                                <span style={getOriginStyle(log)}>
-                                                    {getOriginLabel(log)}
-                                                </span>
-
-                                                {/* Worker */}
-                                                <div style={{
-                                                    fontSize: "13px", color: "#475569", minWidth: "100px",
-                                                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"
-                                                }} title={log.workerEmail || log.worker || ""}>
-                                                    {getWorkerDisplay(log)}
-                                                </div>
-
-                                                {/* Building */}
-                                                <div style={{
-                                                    fontSize: "13px", fontWeight: "600", color: "#1E293B", minWidth: "90px"
-                                                }}>
-                                                    {getBuildingName(log.building)}
-                                                </div>
-
-                                                {/* Rooms */}
-                                                <div style={{
-                                                    fontSize: "12px", color: "#64748B", minWidth: "80px",
-                                                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"
-                                                }} title={Array.isArray(log.rooms) ? log.rooms.map(getRoomName).join(", ") : ""}>
-                                                    {Array.isArray(log.rooms)
-                                                        ? (log.rooms.length > 2
-                                                            ? `${log.rooms.slice(0, 2).map(getRoomName).join(", ")} +${log.rooms.length - 2}`
-                                                            : log.rooms.map(getRoomName).join(", "))
-                                                        : getRoomName(log.room)}
-                                                </div>
-
-                                                {/* Target Dates */}
-                                                <div style={{ fontSize: "12px", minWidth: "100px" }}>
-                                                    <span style={{ color: "#2563EB", fontWeight: "600" }}>
-                                                        {formatDateRange(period.dateFrom, period.dateTo)}
-                                                    </span>
-                                                    {period.totalDays > 0 && (
-                                                        <span style={{ color: "#94A3B8", fontSize: "11px", marginLeft: "4px" }}>
-                                                            ({period.totalDays}d)
-                                                        </span>
-                                                    )}
-                                                </div>
-
-                                                {/* Price Change */}
-                                                <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "6px", fontSize: "13px" }}>
-                                                    {log.oldPrice != null && log.newPrice != null ? (
-                                                        <>
-                                                            <span style={{ color: "#94A3B8", textDecoration: "line-through", fontSize: "12px" }}>
-                                                                {formatPrice(log.oldPrice)}
-                                                            </span>
-                                                            <span style={{ color: "#CBD5E1", fontSize: "10px" }}>→</span>
-                                                            <span style={{
-                                                                fontWeight: "700",
-                                                                color: log.newPrice > log.oldPrice ? "#EF4444" : log.newPrice < log.oldPrice ? "#10B981" : "#334155"
-                                                            }}>
-                                                                {formatPrice(log.newPrice)}
-                                                            </span>
-                                                            {log.oldPrice > 0 && (
-                                                                <span style={{
-                                                                    fontSize: "11px", fontWeight: "600",
-                                                                    color: log.newPrice > log.oldPrice ? "#EF4444" : "#10B981"
-                                                                }}>
-                                                                    {log.newPrice > log.oldPrice ? "▲" : "▼"}{Math.abs(Math.round((log.newPrice - log.oldPrice) / log.oldPrice * 100))}%
-                                                                </span>
-                                                            )}
-                                                        </>
-                                                    ) : (
-                                                        <span style={{ color: "#CBD5E1", fontSize: "12px" }}>—</span>
-                                                    )}
-                                                </div>
-
-                                                {/* Expand Arrow */}
-                                                {hasSnapshot && (
-                                                    <span style={{
-                                                        display: "inline-block",
-                                                        transition: "transform 0.2s",
-                                                        transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
-                                                        color: "#94A3B8", fontSize: "11px", marginLeft: "4px"
-                                                    }}>▶</span>
-                                                )}
-                                            </div>
-
-                                            {/* Error Message */}
-                                            {log.success === false && errorMsg && (
-                                                <div style={{
-                                                    padding: "8px 18px 12px",
-                                                    fontSize: "12px", color: "#EF4444",
-                                                    borderTop: "1px solid #FEE2E2",
-                                                    background: "#FEF2F2"
-                                                }}>
-                                                    {errorMsg}
-                                                </div>
-                                            )}
-
-                                            {/* Notes (Beds24) */}
-                                            {isBeds24 && log.notes && !hasSnapshot && (
-                                                <div style={{
-                                                    padding: "8px 18px 12px",
-                                                    fontSize: "12px", color: "#92400E",
-                                                    borderTop: "1px solid #FED7AA",
-                                                    background: "#FFFBEB"
-                                                }}>
-                                                    {log.notes}
-                                                </div>
-                                            )}
-
-                                            {/* Expanded Snapshot */}
-                                            {isExpanded && hasSnapshot && (
-                                                <div style={{
-                                                    padding: "16px 18px 20px",
-                                                    borderTop: "1px solid #E2E8F0",
-                                                    background: "#F8FAFC"
-                                                }}>
-                                                    <div style={{
-                                                        fontSize: "12px", fontWeight: "600", color: "#64748B",
-                                                        marginBottom: "12px", display: "flex", alignItems: "center", gap: "8px"
-                                                    }}>
-                                                        📋 {isBeds24 ? "DETECTED PRICE CHANGES" : "PRICE SNAPSHOT BY DATE"}
-                                                        {log.adjustMode === "percent" && log.percentValue && (
-                                                            <span style={{
-                                                                background: log.percentValue > 0 ? "#FEF2F2" : "#ECFDF5",
-                                                                color: log.percentValue > 0 ? "#EF4444" : "#10B981",
-                                                                padding: "2px 8px", borderRadius: "4px", fontSize: "11px"
-                                                            }}>
-                                                                {log.percentValue > 0 ? "+" : ""}{log.percentValue}%
-                                                            </span>
-                                                        )}
-                                                    </div>
-                                                    <div style={{
-                                                        display: "grid",
-                                                        gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))",
-                                                        gap: "10px"
-                                                    }}>
-                                                        {log.priceSnapshot.map((snap, idx) => (
-                                                            <div key={idx} style={{
-                                                                background: "white",
-                                                                borderRadius: "10px",
-                                                                padding: "10px 12px",
-                                                                border: "1px solid #E2E8F0",
-                                                                boxShadow: "0 1px 2px rgba(0,0,0,0.04)"
-                                                            }}>
-                                                                <div style={{
-                                                                    fontSize: "11px", fontWeight: "700",
-                                                                    color: "#4F46E5", marginBottom: "4px",
-                                                                    display: "flex", justifyContent: "space-between"
-                                                                }}>
-                                                                    <span>{snap.date ? snap.date.slice(5).replace("-", "/") : "-"}</span>
-                                                                    {snap.room && <span style={{ color: "#94A3B8", fontWeight: "500" }}>{getRoomName(snap.room)}</span>}
-                                                                </div>
-                                                                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "4px" }}>
-                                                                    <span style={{ fontSize: "12px", color: "#94A3B8", textDecoration: "line-through" }}>
-                                                                        {formatPrice(snap.oldPrice)}
-                                                                    </span>
-                                                                    <span style={{ color: "#CBD5E1", fontSize: "10px" }}>→</span>
-                                                                    <span style={{
-                                                                        fontSize: "13px", fontWeight: "700",
-                                                                        color: snap.newPrice > snap.oldPrice ? "#EF4444" : snap.newPrice < snap.oldPrice ? "#10B981" : "#1E293B"
-                                                                    }}>
-                                                                        {formatPrice(snap.newPrice)}
-                                                                    </span>
-                                                                </div>
-                                                            </div>
-                                                        ))}
-                                                    </div>
-                                                </div>
-                                            )}
-                                        </div>
-                                    );
-                                })}
+                    {/* Rows — By Building */}
+                    {groupBy === 'building' && groupedByBuilding.map(([building, buildingLogs]) => (
+                        <React.Fragment key={building}>
+                            <div style={groupHeaderStyle()}>
+                                <span style={{ fontSize: '12px', fontWeight: '600', color: '#3C3C43' }}>
+                                    {getBuildingName(building)}
+                                </span>
+                                <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
+                                    {buildingLogs.length} record{buildingLogs.length !== 1 ? 's' : ''}
+                                </span>
                             </div>
-                        </div>
+                            {renderRows(buildingLogs)}
+                        </React.Fragment>
+                    ))}
+
+                    {/* Rows — Building + Date */}
+                    {groupBy === 'building+date' && groupedByBuildingDate.map(([building, dateGroups]) => (
+                        <React.Fragment key={building}>
+                            <div style={groupHeaderStyle()}>
+                                <span style={{ fontSize: '12px', fontWeight: '700', color: '#1D1D1F' }}>
+                                    {getBuildingName(building)}
+                                </span>
+                                <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
+                                    {dateGroups.reduce((s, [, rows]) => s + rows.length, 0)} records
+                                </span>
+                            </div>
+                            {dateGroups.map(([dateKey, dateLogs]) => (
+                                <React.Fragment key={dateKey}>
+                                    <div style={groupHeaderStyle(true)}>
+                                        <span style={{ fontSize: '11px', fontWeight: '500', color: '#6E6E73' }}>
+                                            {formatDateFull(dateKey)}
+                                        </span>
+                                        <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
+                                            {dateLogs.length} change{dateLogs.length !== 1 ? 's' : ''}
+                                        </span>
+                                    </div>
+                                    {renderRows(dateLogs)}
+                                </React.Fragment>
+                            ))}
+                        </React.Fragment>
                     ))}
                 </div>
             )}

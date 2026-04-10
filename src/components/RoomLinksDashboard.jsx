@@ -11,7 +11,85 @@ import { BUILDING_NAMES_EN as _BUILDING_NAMES_EN } from '../constants/buildingDa
 const LS_KEY = "ROOM_LINKS_DATA_v2";
 const OLD_LS_KEY = "ROOM_LINKS_OVERRIDES_v1";
 const FIRESTORE_COLLECTION = "roomLinks";
-const BUILDING_NAMES_EN = { ..._BUILDING_NAMES_EN, "가부키초K": "Kabukicho K", "가부키초KK": "Kabukicho KK" };
+const BUILDING_NAMES_EN = {
+  ..._BUILDING_NAMES_EN,
+  "아라키초AA": "Arakicho AA",
+  "가부키초K": "Kabukicho K",
+  "가부키초KK": "Kabukicho KK"
+};
+const BUILDING_DISPLAY_ORDER = [
+  "Arakicho A",
+  "Arakicho AA",
+  "Arakicho B",
+  "Kabukicho",
+  "Kabukicho K",
+  "Kabukicho KK",
+  "Takadanobaba",
+  "Okubo A",
+  "Okubo B",
+  "Okubo C",
+  "Sano",
+  "Daikyocho"
+];
+const BUILDING_DISPLAY_ORDER_INDEX = BUILDING_DISPLAY_ORDER.reduce((acc, label, index) => {
+  acc[label] = index;
+  return acc;
+}, {});
+
+function getBuildingLabel(buildingName) {
+  return BUILDING_NAMES_EN[buildingName] || buildingName;
+}
+
+function compareBuildingNames(a, b) {
+  const aLabel = getBuildingLabel(a);
+  const bLabel = getBuildingLabel(b);
+  const aIndex = BUILDING_DISPLAY_ORDER_INDEX[aLabel];
+  const bIndex = BUILDING_DISPLAY_ORDER_INDEX[bLabel];
+  const aRank = aIndex === undefined ? Number.MAX_SAFE_INTEGER : aIndex;
+  const bRank = bIndex === undefined ? Number.MAX_SAFE_INTEGER : bIndex;
+
+  if (aRank !== bRank) return aRank - bRank;
+  return aLabel.localeCompare(bLabel);
+}
+
+function createEmptyBuildingOrder() {
+  return { airbnb: [], booking: [] };
+}
+
+function normalizeBuildingOrder(orderList, platformData) {
+  const keys = Object.keys(platformData || {});
+  const seen = new Set();
+  const ordered = [];
+
+  if (Array.isArray(orderList)) {
+    orderList.forEach((key) => {
+      if (keys.includes(key) && !seen.has(key)) {
+        seen.add(key);
+        ordered.push(key);
+      }
+    });
+  }
+
+  const remaining = keys.filter((key) => !seen.has(key)).sort(compareBuildingNames);
+  return [...ordered, ...remaining];
+}
+
+function normalizeDataShape(rawData) {
+  const airbnbData = rawData?.airbnb && typeof rawData.airbnb === "object" ? splitKabukicho(rawData.airbnb) : {};
+  const bookingData = rawData?.booking && typeof rawData.booking === "object" ? rawData.booking : {};
+  const buildingOrder = rawData?.buildingOrder && typeof rawData.buildingOrder === "object"
+    ? rawData.buildingOrder
+    : createEmptyBuildingOrder();
+
+  return {
+    airbnb: airbnbData,
+    booking: bookingData,
+    buildingOrder: {
+      airbnb: normalizeBuildingOrder(buildingOrder.airbnb, airbnbData),
+      booking: normalizeBuildingOrder(buildingOrder.booking, bookingData)
+    }
+  };
+}
 
 function normalizeUrl(url) {
   const raw = String(url || "").trim();
@@ -60,6 +138,7 @@ function splitKabukicho(data) {
 function loadData() {
   let savedAirbnb = null;
   let savedBooking = null;
+  let savedBuildingOrder = null;
 
   try {
     const raw = localStorage.getItem(LS_KEY);
@@ -68,6 +147,7 @@ function loadData() {
       if (parsed && typeof parsed === "object") {
         savedAirbnb = parsed.airbnb && typeof parsed.airbnb === "object" ? parsed.airbnb : null;
         savedBooking = parsed.booking && typeof parsed.booking === "object" ? parsed.booking : null;
+        savedBuildingOrder = parsed.buildingOrder && typeof parsed.buildingOrder === "object" ? parsed.buildingOrder : null;
       }
     }
   } catch (e) {
@@ -75,15 +155,17 @@ function loadData() {
   }
 
   if (savedAirbnb && Object.keys(savedAirbnb).length > 0) {
-    if (savedAirbnb["가부키초"]) {
-      savedAirbnb = splitKabukicho(savedAirbnb);
-      try {
-        localStorage.setItem(LS_KEY, JSON.stringify({ airbnb: savedAirbnb, booking: savedBooking || {} }));
-      } catch (e) {
-        console.warn("Room Links save after split failed:", e);
-      }
+    const normalizedData = normalizeDataShape({
+      airbnb: savedAirbnb,
+      booking: savedBooking || {},
+      buildingOrder: savedBuildingOrder || createEmptyBuildingOrder()
+    });
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify(normalizedData));
+    } catch (e) {
+      console.warn("Room Links save after split failed:", e);
     }
-    return { airbnb: savedAirbnb, booking: savedBooking || {} };
+    return normalizedData;
   }
 
   try {
@@ -95,8 +177,11 @@ function loadData() {
     } catch { }
 
     const mergedAirbnb = mergeOldData(BASE_ROOM_LINKS, oldOverrides);
-    const splitAirbnb = splitKabukicho(mergedAirbnb);
-    const newData = { airbnb: splitAirbnb, booking: existingBooking };
+    const newData = normalizeDataShape({
+      airbnb: mergedAirbnb,
+      booking: existingBooking,
+      buildingOrder: createEmptyBuildingOrder()
+    });
     try {
       localStorage.setItem(LS_KEY, JSON.stringify(newData));
     } catch (e) {
@@ -107,7 +192,11 @@ function loadData() {
     console.error("Room Links migration failed:", e);
   }
 
-  return { airbnb: splitKabukicho(BASE_ROOM_LINKS), booking: {} };
+  return normalizeDataShape({
+    airbnb: BASE_ROOM_LINKS,
+    booking: {},
+    buildingOrder: createEmptyBuildingOrder()
+  });
 }
 
 function saveDataLocal(data) {
@@ -126,6 +215,7 @@ async function saveDataToFirestore(companyId, data) {
     await setDoc(doc(db, FIRESTORE_COLLECTION, companyId), {
       airbnb: data.airbnb || {},
       booking: data.booking || {},
+      buildingOrder: data.buildingOrder || createEmptyBuildingOrder(),
       updatedAt: new Date().toISOString()
     });
     return true;
@@ -149,16 +239,20 @@ export default function RoomLinksDashboard() {
 
   // Modal States
   const [showAddBuilding, setShowAddBuilding] = useState(false);
+  const [showRenameBuilding, setShowRenameBuilding] = useState(false);
   const [showAddRoom, setShowAddRoom] = useState(false);
   const [newBuildingName, setNewBuildingName] = useState("");
+  const [editBuildingName, setEditBuildingName] = useState("");
   const [newRoomName, setNewRoomName] = useState("");
   const [newHostUrl, setNewHostUrl] = useState("");
   const [newGuestUrl, setNewGuestUrl] = useState("");
 
   // Edit States
   const [editingRoom, setEditingRoom] = useState(null);
+  const [editRoomName, setEditRoomName] = useState("");
   const [editHost, setEditHost] = useState("");
   const [editGuest, setEditGuest] = useState("");
+  const [draggingBuilding, setDraggingBuilding] = useState("");
   const [savedTick, setSavedTick] = useState(0);
 
   // 팀 공용: Firestore에서 불러오기 (companyId 기준). 없으면 로컬 데이터를 Firestore에 올려 팀과 공유
@@ -173,13 +267,16 @@ export default function RoomLinksDashboard() {
         const ref = doc(db, FIRESTORE_COLLECTION, companyId);
         const snap = await getDoc(ref);
         if (cancelled) return;
-        if (snap.exists() && snap.data().airbnb && typeof snap.data().airbnb === "object" && Object.keys(snap.data().airbnb).length > 0) {
-          let airbnb = snap.data().airbnb;
-          if (airbnb["가부키초"]) airbnb = splitKabukicho(airbnb);
-          setData({
-            airbnb,
-            booking: snap.data().booking && typeof snap.data().booking === "object" ? snap.data().booking : {}
-          });
+        if (snap.exists()) {
+          const remoteData = normalizeDataShape(snap.data());
+          if (Object.keys(remoteData.airbnb).length > 0 || Object.keys(remoteData.booking).length > 0) {
+            setData(remoteData);
+          } else {
+            const local = loadData();
+            if (local.airbnb && Object.keys(local.airbnb).length > 0) {
+              await saveDataToFirestore(companyId, local);
+            }
+          }
         } else {
           const local = loadData();
           if (local.airbnb && Object.keys(local.airbnb).length > 0) {
@@ -195,7 +292,7 @@ export default function RoomLinksDashboard() {
   }, [companyId]);
 
   const buildings = useMemo(() => {
-    return Object.keys(data[platform] || {}).sort();
+    return normalizeBuildingOrder(data.buildingOrder?.[platform], data[platform]);
   }, [data, platform]);
 
   useEffect(() => {
@@ -223,10 +320,18 @@ export default function RoomLinksDashboard() {
     return keys.sort((a, b) => extractNumber(a) - extractNumber(b));
   }, [data, platform, selectedBuilding, roomFilter]);
 
+  const moveArrayItem = (items, fromIndex, toIndex) => {
+    const nextItems = [...items];
+    const [movedItem] = nextItems.splice(fromIndex, 1);
+    nextItems.splice(toIndex, 0, movedItem);
+    return nextItems;
+  };
+
   const updateData = async (newData) => {
-    setData(newData);
-    saveDataLocal(newData);
-    const ok = await saveDataToFirestore(companyId, newData);
+    const normalizedData = normalizeDataShape(newData);
+    setData(normalizedData);
+    saveDataLocal(normalizedData);
+    const ok = await saveDataToFirestore(companyId, normalizedData);
     if (!ok) alert("Team save failed. Your links are saved on this device only. Check your connection.");
     setSavedTick(Date.now());
   };
@@ -236,20 +341,139 @@ export default function RoomLinksDashboard() {
     if (!name) return alert("Please enter a property name.");
     if (data[platform]?.[name]) return alert("Property already exists.");
 
-    const newData = { ...data };
-    newData[platform] = { ...newData[platform], [name]: {} };
+    const nextPlatform = { ...(data[platform] || {}), [name]: {} };
+    const nextOrder = [...buildings, name];
+    const newData = {
+      ...data,
+      [platform]: nextPlatform,
+      buildingOrder: {
+        ...(data.buildingOrder || createEmptyBuildingOrder()),
+        [platform]: nextOrder
+      }
+    };
     updateData(newData);
     setSelectedBuilding(name);
     setNewBuildingName("");
     setShowAddBuilding(false);
   };
 
+  const openRenameBuilding = () => {
+    if (!selectedBuilding) return;
+    setEditBuildingName(selectedBuilding);
+    setShowRenameBuilding(true);
+  };
+
+  const closeRenameBuilding = () => {
+    setShowRenameBuilding(false);
+    setEditBuildingName("");
+  };
+
+  const renameBuilding = () => {
+    const currentName = selectedBuilding;
+    const nextName = editBuildingName.trim();
+
+    if (!currentName) return alert("Please select a property first.");
+    if (!nextName) return alert("Please enter a property name.");
+    if (currentName === nextName) {
+      closeRenameBuilding();
+      return;
+    }
+    if (data[platform]?.[nextName]) return alert("Property already exists.");
+
+    const currentPlatform = data[platform] || {};
+    const renamedRooms = currentPlatform[currentName];
+    if (!renamedRooms) return;
+
+    const nextPlatform = {};
+    Object.keys(currentPlatform).forEach((buildingName) => {
+      if (buildingName === currentName) {
+        nextPlatform[nextName] = renamedRooms;
+        return;
+      }
+      nextPlatform[buildingName] = currentPlatform[buildingName];
+    });
+
+    const nextOrder = buildings.map((buildingName) => (
+      buildingName === currentName ? nextName : buildingName
+    ));
+    const newData = {
+      ...data,
+      [platform]: nextPlatform,
+      buildingOrder: {
+        ...(data.buildingOrder || createEmptyBuildingOrder()),
+        [platform]: nextOrder
+      }
+    };
+    updateData(newData);
+    setSelectedBuilding(nextName);
+    closeRenameBuilding();
+  };
+
   const deleteBuilding = (buildingName) => {
     if (!window.confirm(`Delete property "${buildingName}" and all its rooms?`)) return;
     const nextPlatform = { ...(data[platform] || {}) };
     delete nextPlatform[buildingName];
-    const newData = { ...data, [platform]: nextPlatform };
+    const nextOrder = buildings.filter((name) => name !== buildingName);
+    const newData = {
+      ...data,
+      [platform]: nextPlatform,
+      buildingOrder: {
+        ...(data.buildingOrder || createEmptyBuildingOrder()),
+        [platform]: nextOrder
+      }
+    };
     updateData(newData);
+  };
+
+  const reorderBuildings = (fromIndex, toIndex) => {
+    if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex || toIndex >= buildings.length) return;
+    const nextOrder = moveArrayItem(buildings, fromIndex, toIndex);
+    const newData = {
+      ...data,
+      buildingOrder: {
+        ...(data.buildingOrder || createEmptyBuildingOrder()),
+        [platform]: nextOrder
+      }
+    };
+    updateData(newData);
+  };
+
+  const moveBuilding = (buildingName, direction) => {
+    const currentIndex = buildings.indexOf(buildingName);
+    if (currentIndex === -1) return;
+    reorderBuildings(currentIndex, currentIndex + direction);
+  };
+
+  const handleBuildingDragStart = (event, buildingName) => {
+    setDraggingBuilding(buildingName);
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", buildingName);
+    }
+  };
+
+  const handleBuildingDragOver = (event) => {
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+  };
+
+  const handleBuildingDrop = (event, targetBuilding) => {
+    event.preventDefault();
+    if (!draggingBuilding || draggingBuilding === targetBuilding) {
+      setDraggingBuilding("");
+      return;
+    }
+
+    const fromIndex = buildings.indexOf(draggingBuilding);
+    const toIndex = buildings.indexOf(targetBuilding);
+    if (fromIndex !== -1 && toIndex !== -1) {
+      reorderBuildings(fromIndex, toIndex);
+    }
+    setDraggingBuilding("");
+  };
+
+  const handleBuildingDragEnd = () => {
+    setDraggingBuilding("");
   };
 
   const addRoom = () => {
@@ -258,14 +482,17 @@ export default function RoomLinksDashboard() {
     if (!selectedBuilding) return alert("Please select a property first.");
     if (data[platform]?.[selectedBuilding]?.[name]) return alert("Room already exists.");
 
-    const newData = { ...data };
-    newData[platform][selectedBuilding] = {
-      ...newData[platform][selectedBuilding],
-      [name]: {
-        host: newHostUrl.trim(),
-        guest: newGuestUrl.trim()
+    const nextPlatform = {
+      ...(data[platform] || {}),
+      [selectedBuilding]: {
+        ...(data[platform]?.[selectedBuilding] || {}),
+        [name]: {
+          host: newHostUrl.trim(),
+          guest: newGuestUrl.trim()
+        }
       }
     };
+    const newData = { ...data, [platform]: nextPlatform };
     updateData(newData);
     setNewRoomName("");
     setNewHostUrl("");
@@ -285,26 +512,39 @@ export default function RoomLinksDashboard() {
   const startEdit = (roomName) => {
     const roomData = data[platform]?.[selectedBuilding]?.[roomName] || {};
     setEditingRoom(roomName);
+    setEditRoomName(roomName);
     setEditHost(roomData.host || "");
     setEditGuest(roomData.guest || "");
   };
 
   const saveEdit = () => {
-    if (!editingRoom) return;
-    const nextBuilding = {
-      ...(data[platform]?.[selectedBuilding] || {}),
-      [editingRoom]: { host: editHost.trim(), guest: editGuest.trim() }
-    };
+    if (!editingRoom || !selectedBuilding) return;
+    const nextRoomName = editRoomName.trim();
+    if (!nextRoomName) return alert("Please enter a room name.");
+
+    const currentBuilding = data[platform]?.[selectedBuilding] || {};
+    if (nextRoomName !== editingRoom && currentBuilding[nextRoomName]) return alert("Room already exists.");
+
+    const nextBuilding = {};
+    Object.keys(currentBuilding).forEach((roomName) => {
+      if (roomName === editingRoom) {
+        nextBuilding[nextRoomName] = { host: editHost.trim(), guest: editGuest.trim() };
+        return;
+      }
+      nextBuilding[roomName] = currentBuilding[roomName];
+    });
     const nextPlatform = { ...(data[platform] || {}), [selectedBuilding]: nextBuilding };
     const newData = { ...data, [platform]: nextPlatform };
     updateData(newData);
     setEditingRoom(null);
+    setEditRoomName("");
     setEditHost("");
     setEditGuest("");
   };
 
   const cancelEdit = () => {
     setEditingRoom(null);
+    setEditRoomName("");
     setEditHost("");
     setEditGuest("");
   };
@@ -370,6 +610,98 @@ export default function RoomLinksDashboard() {
       padding: '10px 14px', borderRadius: '10px', border: '1px solid #CBD5E1',
       fontSize: '14px', color: '#1E293B', outline: 'none'
     },
+    propertyPanel: {
+      marginBottom: '24px',
+      padding: '16px',
+      borderRadius: '18px',
+      border: '1px solid #E2E8F0',
+      background: 'linear-gradient(180deg, #FFFFFF 0%, #F8FAFC 100%)',
+      boxShadow: '0 12px 28px rgba(15, 23, 42, 0.05)'
+    },
+    propertyPanelHeader: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      gap: '12px',
+      flexWrap: 'wrap',
+      marginBottom: '14px'
+    },
+    propertyPanelTitle: {
+      fontSize: '15px',
+      fontWeight: '700',
+      color: '#0F172A'
+    },
+    propertyPanelHint: {
+      fontSize: '12px',
+      color: '#64748B',
+      fontWeight: '600'
+    },
+    propertyList: {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '8px',
+      maxHeight: '320px',
+      overflowY: 'auto'
+    },
+    propertyRow: (active, dragging) => ({
+      display: 'flex',
+      alignItems: 'center',
+      gap: '10px',
+      padding: '10px 12px',
+      borderRadius: '14px',
+      border: active ? '1px solid #C7D2FE' : '1px solid #E2E8F0',
+      background: active ? 'linear-gradient(180deg, #EEF2FF 0%, #F8FAFC 100%)' : '#FFFFFF',
+      boxShadow: dragging
+        ? '0 12px 24px rgba(79, 70, 229, 0.12)'
+        : active
+          ? '0 8px 18px rgba(79, 70, 229, 0.08)'
+          : '0 2px 8px rgba(15, 23, 42, 0.04)',
+      opacity: dragging ? 0.75 : 1,
+      transition: 'all 0.2s ease'
+    }),
+    dragHandle: (active) => ({
+      width: '34px',
+      height: '34px',
+      borderRadius: '10px',
+      border: active ? '1px solid #C7D2FE' : '1px solid #CBD5E1',
+      background: active ? '#FFFFFF' : '#F8FAFC',
+      color: active ? '#4F46E5' : '#475569',
+      fontSize: '12px',
+      fontWeight: '700',
+      cursor: 'grab',
+      flexShrink: 0
+    }),
+    propertyNameBtn: (active) => ({
+      flex: 1,
+      border: 'none',
+      background: 'transparent',
+      textAlign: 'left',
+      padding: 0,
+      cursor: 'pointer',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '2px'
+    }),
+    propertyName: (active) => ({
+      fontSize: '14px',
+      fontWeight: '700',
+      color: active ? '#1E1B4B' : '#0F172A'
+    }),
+    propertyMeta: (active) => ({
+      fontSize: '12px',
+      color: active ? '#6366F1' : '#64748B'
+    }),
+    propertyMoveBtn: (active, disabled) => ({
+      width: '34px',
+      height: '34px',
+      borderRadius: '10px',
+      border: active ? '1px solid #C7D2FE' : '1px solid #CBD5E1',
+      background: disabled ? '#F8FAFC' : '#FFFFFF',
+      color: disabled ? '#CBD5E1' : active ? '#4F46E5' : '#475569',
+      cursor: disabled ? 'not-allowed' : 'pointer',
+      flexShrink: 0,
+      boxShadow: active && !disabled ? '0 4px 10px rgba(79, 70, 229, 0.08)' : 'none'
+    }),
 
     // Link Button Styles
     linkBtn: (type, disabled) => ({
@@ -408,18 +740,15 @@ export default function RoomLinksDashboard() {
 
         {buildings.length > 0 && (
           <>
-            <select
-              style={styles.select}
-              value={selectedBuilding}
-              onChange={(e) => { setSelectedBuilding(e.target.value); cancelEdit(); }}
-            >
-              {buildings.map((b) => (
-                <option key={b} value={b}>{BUILDING_NAMES_EN[b] || b}</option>
-              ))}
-            </select>
-
             <button style={styles.primaryBtn} onClick={() => setShowAddRoom(true)}>
               <span>+ Add Room</span>
+            </button>
+
+            <button
+              style={{ ...styles.primaryBtn, background: '#E2E8F0', color: '#1E293B' }}
+              onClick={openRenameBuilding}
+            >
+              Rename Property
             </button>
 
             <input
@@ -440,6 +769,81 @@ export default function RoomLinksDashboard() {
           </>
         )}
       </div>
+
+      {buildings.length > 0 && (
+        <div style={styles.propertyPanel}>
+          <div style={styles.propertyPanelHeader}>
+            <div style={styles.propertyPanelTitle}>Property Order</div>
+            <div style={styles.propertyPanelHint}>Click to select, drag to move, or use up/down.</div>
+          </div>
+
+          <div style={styles.propertyList}>
+            {buildings.map((buildingName, index) => {
+              const active = selectedBuilding === buildingName;
+              const roomCount = Object.keys(data[platform]?.[buildingName] || {}).length;
+              const isDragging = draggingBuilding === buildingName;
+
+              return (
+                <div
+                  key={buildingName}
+                  style={styles.propertyRow(active, isDragging)}
+                  draggable
+                  onDragStart={(event) => handleBuildingDragStart(event, buildingName)}
+                  onDragOver={handleBuildingDragOver}
+                  onDrop={(event) => handleBuildingDrop(event, buildingName)}
+                  onDragEnd={handleBuildingDragEnd}
+                >
+                  <button
+                    type="button"
+                    aria-label={`Drag ${getBuildingLabel(buildingName)}`}
+                    style={styles.dragHandle(active)}
+                  >
+                    ::
+                  </button>
+
+                  <button
+                    type="button"
+                    style={styles.propertyNameBtn(active)}
+                    onClick={() => {
+                      setSelectedBuilding(buildingName);
+                      cancelEdit();
+                    }}
+                  >
+                    <span style={styles.propertyName(active)}>{getBuildingLabel(buildingName)}</span>
+                    <span style={styles.propertyMeta(active)}>{roomCount} rooms</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    aria-label={`Move ${getBuildingLabel(buildingName)} up`}
+                    disabled={index === 0}
+                    style={styles.propertyMoveBtn(active, index === 0)}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      moveBuilding(buildingName, -1);
+                    }}
+                  >
+                    ^
+                  </button>
+
+                  <button
+                    type="button"
+                    aria-label={`Move ${getBuildingLabel(buildingName)} down`}
+                    disabled={index === buildings.length - 1}
+                    style={styles.propertyMoveBtn(active, index === buildings.length - 1)}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      moveBuilding(buildingName, 1);
+                    }}
+                  >
+                    v
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Main Content */}
       <div className="responsive-grid-container">
@@ -475,7 +879,7 @@ export default function RoomLinksDashboard() {
                   return (
                     <tr key={room} style={{ background: index % 2 === 0 ? '#FFFFFF' : '#FAFAFA' }}>
                       <td style={{ padding: '16px', fontWeight: '600', color: '#1E293B', borderBottom: '1px solid #F1F5F9' }}>
-                        {room?.replace('호', '')}
+                        {isEditing ? (editRoomName || room?.replace('호', '')) : room?.replace('호', '')}
                       </td>
                       <td style={{ padding: '16px', borderBottom: '1px solid #F1F5F9' }}>
                         <div style={{ display: 'flex', gap: '8px' }}>
@@ -486,6 +890,7 @@ export default function RoomLinksDashboard() {
                       <td style={{ padding: '16px', fontSize: '12px', color: '#94A3B8', borderBottom: '1px solid #F1F5F9', maxWidth: '300px' }}>
                         {isEditing ? (
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                            <input placeholder="Room Name" value={editRoomName} onChange={(e) => setEditRoomName(e.target.value)} style={styles.input} />
                             <input placeholder="Host URL" value={editHost} onChange={(e) => setEditHost(e.target.value)} style={styles.input} />
                             <input placeholder="Guest URL" value={editGuest} onChange={(e) => setEditGuest(e.target.value)} style={styles.input} />
                             <div style={{ display: 'flex', gap: '8px' }}>
@@ -525,7 +930,7 @@ export default function RoomLinksDashboard() {
                 return (
                   <div key={room} className="mobile-card-item">
                     <div className="mobile-card-row" style={{ borderBottom: '1px solid #F1F5F9', paddingBottom: '12px', marginBottom: '12px' }}>
-                      <span style={{ fontWeight: '700', color: '#1E293B' }}>{room?.replace('호', '')}</span>
+                      <span style={{ fontWeight: '700', color: '#1E293B' }}>{isEditing ? (editRoomName || room?.replace('호', '')) : room?.replace('호', '')}</span>
                       {!isEditing && (
                         <div style={{ display: 'flex', gap: '8px' }}>
                           <button onClick={() => startEdit(room)} style={{ background: 'none', border: 'none', cursor: 'pointer' }}>✏️</button>
@@ -536,6 +941,10 @@ export default function RoomLinksDashboard() {
 
                     {isEditing ? (
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                        <div>
+                          <label style={{ fontSize: '12px', fontWeight: 'bold', color: '#64748B' }}>Room Name</label>
+                          <input value={editRoomName} onChange={(e) => setEditRoomName(e.target.value)} style={{ ...styles.input, width: '100%' }} />
+                        </div>
                         <div>
                           <label style={{ fontSize: '12px', fontWeight: 'bold', color: '#64748B' }}>Host URL</label>
                           <input value={editHost} onChange={(e) => setEditHost(e.target.value)} style={{ ...styles.input, width: '100%' }} />
@@ -588,6 +997,26 @@ export default function RoomLinksDashboard() {
             <div style={{ display: 'flex', gap: '10px' }}>
               <button style={{ ...styles.primaryBtn, flex: 1, justifyContent: 'center' }} onClick={addBuilding}>Add</button>
               <button style={{ ...styles.primaryBtn, background: '#F1F5F9', color: '#475569', flex: 1, justifyContent: 'center' }} onClick={() => setShowAddBuilding(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Rename Property Modal */}
+      {showRenameBuilding && (
+        <div style={{ position: 'fixed', top: 0, left: 0, width: '100%', height: '100%', background: 'rgba(0,0,0,0.5)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 50, backdropFilter: 'blur(4px)' }}>
+          <div style={{ background: 'white', padding: '24px', borderRadius: '16px', width: '90%', maxWidth: '400px', boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)' }}>
+            <h3 style={{ margin: '0 0 8px 0', fontSize: '18px' }}>Rename Property</h3>
+            <p style={{ margin: '0 0 16px 0', fontSize: '13px', color: '#64748B' }}>Current name: {selectedBuilding}</p>
+            <input
+              style={{ ...styles.input, width: '100%', marginBottom: '16px' }}
+              placeholder="Property Name"
+              value={editBuildingName}
+              onChange={(e) => setEditBuildingName(e.target.value)}
+            />
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <button style={{ ...styles.primaryBtn, flex: 1, justifyContent: 'center' }} onClick={renameBuilding}>Save</button>
+              <button style={{ ...styles.primaryBtn, background: '#F1F5F9', color: '#475569', flex: 1, justifyContent: 'center' }} onClick={closeRenameBuilding}>Cancel</button>
             </div>
           </div>
         </div>

@@ -2422,7 +2422,7 @@ function calculateBuildingMetrics(targetReservations, targetRooms, daysInMonth, 
   occupiedRoomsToday = roomNamesWithReservationToday.size;
 
   targetReservations.forEach(r => {
-    if (r.status !== "confirmed" || !r.arrival || !r.departure) return;
+    if (!r.arrival || !r.departure) return;
     const arrivalDate = new Date(r.arrival + 'T00:00:00');
     const departureDate = new Date(r.departure + 'T00:00:00');
     const monthStartDate = new Date(year, month, 1);
@@ -2435,7 +2435,7 @@ function calculateBuildingMetrics(targetReservations, targetRooms, daysInMonth, 
       const nightsInMonth = Math.ceil((effectiveEnd - effectiveStart) / (1000 * 60 * 60 * 24));
       const totalReservationNights = Math.max(1, Math.ceil((departureDate - arrivalDate) / (1000 * 60 * 60 * 24)));
 
-      const val = parseFloat(r.totalPrice) || parseFloat(r.price) || parseFloat(r.netRevenue) || 0;
+      const val = parseFloat(r.netRevenue) || parseFloat(r.totalPrice) || parseFloat(r.price) || 0;
       if (val > 0 && totalReservationNights > 0) {
         totalRevenue += (val / totalReservationNights) * nightsInMonth;
       }
@@ -2456,206 +2456,12 @@ function calculateBuildingMetrics(targetReservations, targetRooms, daysInMonth, 
   };
 }
 
-function calculateBuildingMetricsForRange(targetReservations, targetRooms, rangeStartStr, rangeEndStr) {
-  const uniqueRoomNames = [...new Set(targetRooms.map(r => r.name))];
-  const rangeStart = dayjs(rangeStartStr).startOf("day");
-  const rangeEnd = dayjs(rangeEndStr).startOf("day");
-  if (!rangeStart.isValid() || !rangeEnd.isValid() || rangeEnd.isBefore(rangeStart)) {
-    return {
-      occupancyRate: 0,
-      emptyRoomsToday: 0,
-      vacantNights: 0,
-      avgPrice: 0,
-      totalRevenue: 0,
-      occupiedDays: 0,
-      availableDays: 0
-    };
-  }
-
-  const rangeEndExclusive = rangeEnd.add(1, "day");
-  const rangeDays = rangeEnd.diff(rangeStart, "day") + 1;
-  let occupiedSlot = 0;
-
-  uniqueRoomNames.forEach(roomName => {
-    const roomRes = targetReservations.filter(r => r.room === roomName && r.status === "confirmed");
-    const occupiedSet = new Set();
-
-    roomRes.forEach(r => {
-      if (!r.arrival || !r.departure) return;
-      const arrivalDate = dayjs(r.arrival).startOf("day");
-      const departureDate = dayjs(r.departure).startOf("day");
-      if (!arrivalDate.isValid() || !departureDate.isValid()) return;
-
-      const effectiveStart = arrivalDate.isAfter(rangeStart) ? arrivalDate : rangeStart;
-      const effectiveEnd = departureDate.isBefore(rangeEndExclusive) ? departureDate : rangeEndExclusive;
-      if (!effectiveEnd.isAfter(effectiveStart)) return;
-
-      for (let d = effectiveStart; d.isBefore(effectiveEnd); d = d.add(1, "day")) {
-        occupiedSet.add(d.format("YYYY-MM-DD"));
-      }
-    });
-
-    occupiedSlot += occupiedSet.size;
-  });
-
-  const totalSlot = uniqueRoomNames.length * rangeDays;
-  const occupancyRate = totalSlot > 0 ? (occupiedSlot / totalSlot) * 100 : 0;
-  const vacantNights = Math.max(0, totalSlot - occupiedSlot);
-
-  let totalRevenue = 0;
-  const todayStr = dayjs().format("YYYY-MM-DD");
-  const roomNamesWithReservationToday = new Set();
-  targetReservations.forEach(r => {
-    if (r.status === "confirmed" && r.arrival <= todayStr && r.departure > todayStr) {
-      roomNamesWithReservationToday.add(r.room);
-    }
-  });
-
-  targetReservations.forEach(r => {
-    if (r.status !== "confirmed" || !r.arrival || !r.departure) return;
-    const arrivalDate = dayjs(r.arrival).startOf("day");
-    const departureDate = dayjs(r.departure).startOf("day");
-    if (!arrivalDate.isValid() || !departureDate.isValid()) return;
-
-    const effectiveStart = arrivalDate.isAfter(rangeStart) ? arrivalDate : rangeStart;
-    const effectiveEnd = departureDate.isBefore(rangeEndExclusive) ? departureDate : rangeEndExclusive;
-    if (!effectiveEnd.isAfter(effectiveStart)) return;
-
-    const visibleNights = effectiveEnd.diff(effectiveStart, "day");
-    const totalReservationNights = Math.max(1, departureDate.diff(arrivalDate, "day"));
-    const val = parseFloat(r.totalPrice) || parseFloat(r.price) || parseFloat(r.netRevenue) || 0;
-    if (val > 0 && totalReservationNights > 0) {
-      totalRevenue += (val / totalReservationNights) * visibleNights;
-    }
-  });
-
-  return {
-    occupancyRate,
-    emptyRoomsToday: Math.max(0, uniqueRoomNames.length - roomNamesWithReservationToday.size),
-    vacantNights,
-    avgPrice: occupiedSlot > 0 ? totalRevenue / occupiedSlot : 0,
-    totalRevenue,
-    occupiedDays: occupiedSlot,
-    availableDays: totalSlot
-  };
-}
-
-function normalizeDateInput(value) {
-  const digits = String(value || "").replace(/\D/g, "").slice(0, 8);
-  if (digits.length <= 4) return digits;
-  if (digits.length <= 6) return `${digits.slice(0, 4)}-${digits.slice(4)}`;
-  return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6)}`;
-}
-
-function getResolvedDateInput(value) {
-  const normalized = String(value || "").trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) return null;
-  const [year, month, day] = normalized.split("-").map(Number);
-  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null;
-  if (month < 1 || month > 12 || day < 1) return null;
-
-  const lastDayOfMonth = dayjs(new Date(year, month, 0)).date();
-  const safeDay = Math.min(day, lastDayOfMonth);
-  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(safeDay).padStart(2, "0")}`;
-}
-
-function parseMoneyAmount(value) {
-  if (value === null || value === undefined) return 0;
-  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
-  const parsed = parseFloat(String(value).replace(/[^0-9.-]+/g, ""));
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function getReservationChannelKey(reservation) {
-  const source = [
-    reservation?.referer,
-    reservation?.referrer,
-    reservation?.channel,
-    reservation?.platform,
-    reservation?.source,
-    reservation?.apiSource
-  ].filter(Boolean).join(" ").toLowerCase();
-
-  if (source.includes("airbnb")) return "airbnb";
-  if (source.includes("booking")) return "booking";
-  if (source.includes("direct") || source.includes("manual")) return "direct";
-  return "other";
-}
-
-function calculateCommissionSummary(targetReservations, visibleDays) {
-  const firstDate = visibleDays[0]?.dateStr;
-  const lastDate = visibleDays[visibleDays.length - 1]?.dateStr;
-  if (!firstDate || !lastDate) return { airbnb: 0, booking: 0, total: 0 };
-
-  const rangeStart = dayjs(firstDate).startOf("day");
-  const rangeEnd = dayjs(lastDate).add(1, "day").startOf("day");
-  const summary = { airbnb: 0, booking: 0 };
-
-  targetReservations.forEach((reservation) => {
-    if (reservation.status !== "confirmed" || !reservation.arrival || !reservation.departure) return;
-
-    const channelKey = getReservationChannelKey(reservation);
-    if (channelKey !== "airbnb" && channelKey !== "booking") return;
-
-    const commission = parseMoneyAmount(reservation.commission);
-    if (commission <= 0) return;
-
-    const arrivalDate = dayjs(reservation.arrival).startOf("day");
-    const departureDate = dayjs(reservation.departure).startOf("day");
-    const totalReservationNights = Math.max(1, departureDate.diff(arrivalDate, "day"));
-    const effectiveStart = arrivalDate.isAfter(rangeStart) ? arrivalDate : rangeStart;
-    const effectiveEnd = departureDate.isBefore(rangeEnd) ? departureDate : rangeEnd;
-    const visibleNights = effectiveEnd.diff(effectiveStart, "day");
-
-    if (visibleNights <= 0) return;
-    summary[channelKey] += (commission / totalReservationNights) * visibleNights;
-  });
-
-  return {
-    airbnb: summary.airbnb,
-    booking: summary.booking,
-    total: summary.airbnb + summary.booking
-  };
-}
-
-function calculateArrivalCountSummary(targetReservations, visibleDays) {
-  const firstDate = visibleDays[0]?.dateStr;
-  const lastDate = visibleDays[visibleDays.length - 1]?.dateStr;
-  if (!firstDate || !lastDate) return { airbnb: 0, booking: 0, direct: 0, total: 0 };
-
-  const rangeStart = dayjs(firstDate).startOf("day");
-  const rangeEnd = dayjs(lastDate).add(1, "day").startOf("day");
-  const summary = { airbnb: 0, booking: 0, direct: 0 };
-
-  targetReservations.forEach((reservation) => {
-    if (reservation.status !== "confirmed" || !reservation.arrival) return;
-
-    const arrivalDate = dayjs(reservation.arrival).startOf("day");
-    if (!arrivalDate.isValid()) return;
-    if (arrivalDate.isBefore(rangeStart) || !arrivalDate.isBefore(rangeEnd)) return;
-
-    const channelKey = getReservationChannelKey(reservation);
-    if (channelKey !== "airbnb" && channelKey !== "booking" && channelKey !== "direct") return;
-
-    summary[channelKey] += 1;
-  });
-
-  return {
-    airbnb: summary.airbnb,
-    booking: summary.booking,
-    direct: summary.direct,
-    total: summary.airbnb + summary.booking + summary.direct
-  };
-}
-
 // 메인 캘린더 컴포넌트
 function BuildingCalendar() {
   const { companyId } = useUser();
 
   const [selectedBuilding, setSelectedBuilding] = useState("Arakicho A");
   const [currentDate, setCurrentDate] = useState(new Date());
-  const [portfolioDateFrom, setPortfolioDateFrom] = useState("");
-  const [portfolioDateTo, setPortfolioDateTo] = useState("");
   const [reservations, setReservations] = useState([]);
   const [loading, setLoading] = useState(false);
   const [selectedReservation, setSelectedReservation] = useState(null);
@@ -2760,7 +2566,7 @@ function BuildingCalendar() {
   const priceJobListenersRef = useRef({});
   const [priceJobToast, setPriceJobToast] = useState(null);     // { status: 'success'|'error'|'partial'|'queued', message }
   const pendingPriceJobList = useMemo(() => Object.values(pendingPriceJobs), [pendingPriceJobs]);
-  const calendarBuilding = selectedBuilding === "전체" && (priceMode || gapEditMode) ? portfolioPriceBuilding : selectedBuilding;
+  const calendarBuilding = selectedBuilding === "전체" && priceMode ? portfolioPriceBuilding : selectedBuilding;
   const showBeds24DetailView = !!calendarBuilding && calendarBuilding !== "전체";
   const [vacantOnlyMode, setVacantOnlyMode] = useState(false);
   const toggleCalendarFullscreen = useCallback(() => {
@@ -3061,32 +2867,6 @@ function BuildingCalendar() {
   const year = currentDate.getFullYear();
   const month = currentDate.getMonth();
   const daysInMonth = getDaysInMonth(year, month);
-  const portfolioAnalysisRange = useMemo(() => {
-    const monthStart = dayjs(new Date(year, month, 1)).format("YYYY-MM-DD");
-    const monthEnd = dayjs(new Date(year, month, daysInMonth)).format("YYYY-MM-DD");
-    const validFrom = getResolvedDateInput(portfolioDateFrom);
-    const validTo = getResolvedDateInput(portfolioDateTo);
-
-    if (validFrom || validTo) {
-      const first = validFrom || validTo;
-      const last = validTo || validFrom;
-      const startDate = first <= last ? first : last;
-      const endDate = first <= last ? last : first;
-      return {
-        startDate,
-        endDate,
-        isCustom: true,
-        label: startDate === endDate ? startDate : `${startDate} ~ ${endDate}`
-      };
-    }
-
-    return {
-      startDate: monthStart,
-      endDate: monthEnd,
-      isCustom: false,
-      label: `${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][month]} ${year}`
-    };
-  }, [year, month, daysInMonth, portfolioDateFrom, portfolioDateTo]);
   const rooms = useMemo(() => BUILDING_DATA[calendarBuilding] || [], [calendarBuilding]);
   const currentBuildingLastPriceSync = calendarBuilding && calendarBuilding !== "전체"
     ? (lastPriceSyncByBuilding[calendarBuilding] || null)
@@ -3279,13 +3059,7 @@ function BuildingCalendar() {
   const goToPrevMonth = () => setCurrentDate(new Date(year, month - 1, 1));
   const goToNextMonth = () => setCurrentDate(new Date(year, month + 1, 1));
   const goToToday = () => setCurrentDate(new Date());
-  const handleMonthSelect = (newYear, newMonth) => {
-    setCurrentDate(new Date(newYear, newMonth, 1));
-    if (selectedBuilding === "전체") {
-      setPortfolioDateFrom("");
-      setPortfolioDateTo("");
-    }
-  };
+  const handleMonthSelect = (newYear, newMonth) => setCurrentDate(new Date(newYear, newMonth, 1));
 
   // 롤링 뷰 이동 (30일 단위)
   const goToRollingNext = () => {
@@ -3324,7 +3098,6 @@ function BuildingCalendar() {
       : null;
     const nextPriceMode = !priceMode;
     setPriceMode(nextPriceMode);
-    if (nextPriceMode) setGapEditMode(false);
     setSelectedRoom(null);
     setSelectedCells([]); // 초기화
     setSelectionStart(null); // 드래그 선택 중이었다면 초기화
@@ -3345,35 +3118,6 @@ function BuildingCalendar() {
     }
 
     restoreCalendarViewport(preservedViewport);
-  };
-
-  const toggleMinStayEditMode = () => {
-    const nextGapMode = !gapEditMode;
-    setGapEditMode(nextGapMode);
-    if (nextGapMode) setPriceMode(false);
-    setSelectedCells([]);
-    setSelectedRoom(null);
-    setSelectionStart(null);
-    setHoveredDay(null);
-    setHoveredRoom(null);
-  };
-
-  const selectRedGapCells = () => {
-    const todayStr = dayjs().format('YYYY-MM-DD');
-    const gapCells = [];
-    gapCellSet.forEach(key => {
-      const [room, date] = key.split('__');
-      if (date < todayStr) return;
-      const gapInfo = getCheckInGapInfo(room, date);
-      gapCells.push({ room, date, roomId: gapInfo.resolvedRoomId || "" });
-    });
-    if (gapCells.length === 0) {
-      alert("No red gap cells (1 night available with minStay 2) found.");
-      return;
-    }
-    gapCells.sort((a, b) => a.room.localeCompare(b.room) || a.date.localeCompare(b.date));
-    setSelectedCells(gapCells);
-    setSelectedRoom(gapCells[0]?.room || null);
   };
 
   const toggleVacantOnlyMode = useCallback(() => {
@@ -3805,10 +3549,7 @@ function BuildingCalendar() {
     try {
       // 뷰 모드에 따른 날짜 범위 계산
       let rangeStart, rangeEnd;
-      if (selectedBuilding === "전체") {
-        rangeStart = portfolioAnalysisRange.startDate;
-        rangeEnd = portfolioAnalysisRange.endDate;
-      } else if (viewMode === "rolling") {
+      if (viewMode === "rolling") {
         // 롤링 뷰: 시작일부터 30일
         rangeStart = dayjs(rollingStartDate).format('YYYY-MM-DD');
         rangeEnd = dayjs(rollingStartDate).add(30, 'day').format('YYYY-MM-DD');
@@ -3881,7 +3622,7 @@ function BuildingCalendar() {
     } finally {
       setLoading(false);
     }
-  }, [companyId, selectedBuilding, year, month, daysInMonth, showCancelled, viewMode, rollingStartDate, portfolioAnalysisRange.startDate, portfolioAnalysisRange.endDate]);
+  }, [companyId, selectedBuilding, year, month, daysInMonth, showCancelled, viewMode, rollingStartDate]);
 
   // 예약 데이터 재조회 트리거
   useEffect(() => {
@@ -4180,35 +3921,6 @@ function BuildingCalendar() {
       return { status: "available", reason: "sellable" };
     };
 
-    const getDualRoomPhysicalStatus = (targetDateStr) => {
-      if (overlapsDate(genericUnknownReservations, targetDateStr)) {
-        return { status: "unknown", reason: "generic_reservation_without_roomid" };
-      }
-      if (overlapsDate(genericBlockingReservations, targetDateStr)) {
-        return { status: "blocked", reason: "generic_block_without_roomid" };
-      }
-
-      const activeInfos = roomInfos.filter((info) => {
-        const targetPriceInfo = getPriceInfoForRoomIdDate(info.roomId, targetDateStr);
-        const ms = parseInt(targetPriceInfo?.m, 10);
-        return Number.isFinite(ms) &&
-          ms >= 1 &&
-          ms < INACTIVE_MINSTAY_THRESHOLD &&
-          String(targetPriceInfo?.ov || "").toLowerCase() !== "blackout";
-      });
-
-      if (activeInfos.length === 0) {
-        return { status: "blocked", reason: "no_active_roomid" };
-      }
-      if (activeInfos.length > 1) {
-        return { status: "unknown", reason: "multiple_active_roomids" };
-      }
-      if (overlapsDate(buildUnitReservations(activeInfos[0].roomId), targetDateStr)) {
-        return { status: "blocked", reason: "active_roomid_reserved_or_blocked" };
-      }
-      return { status: "available", reason: "physical_room_sellable" };
-    };
-
     let resolvedRoomId = null;
     let currentDateStatusInfo = { status: "unknown", reason: "unresolved_roomid" };
     if (roomInfos.length === 1) {
@@ -4246,7 +3958,7 @@ function BuildingCalendar() {
       ? { status: "past", reason: "before_today" }
       : roomInfos.length === 1
         ? getSingleRoomStatus(previousDateStr, resolvedRoomId)
-        : getDualRoomPhysicalStatus(previousDateStr);
+        : getDualRoomStatus(previousDateStr, resolvedRoomId);
     const nextDateStatusInfo = roomInfos.length === 1
       ? getSingleRoomStatus(nextDateStr, resolvedRoomId)
       : getDualRoomStatus(nextDateStr, resolvedRoomId);
@@ -4307,18 +4019,18 @@ function BuildingCalendar() {
       const bReservations = calendarReservations.filter(r => r.building === bName);
       const bRooms = BUILDING_ROOMS[bName] || [];
       result[bName] = {
-        metrics: calculateBuildingMetricsForRange(bReservations, bRooms, portfolioAnalysisRange.startDate, portfolioAnalysisRange.endDate),
+        metrics: calculateBuildingMetrics(bReservations, bRooms, daysInMonth, year, month),
         roomMetrics: {}
       };
       const uniqueRoomNames = [...new Set(bRooms.map(r => r.name))];
       uniqueRoomNames.forEach(roomName => {
         const rReservations = bReservations.filter(r => r.room === roomName);
         const roomInfosForName = bRooms.filter(r => r.name === roomName);
-        result[bName].roomMetrics[roomName] = calculateBuildingMetricsForRange(rReservations, roomInfosForName, portfolioAnalysisRange.startDate, portfolioAnalysisRange.endDate);
+        result[bName].roomMetrics[roomName] = calculateBuildingMetrics(rReservations, roomInfosForName, daysInMonth, year, month);
       });
     });
     return result;
-  }, [calendarReservations, selectedBuilding, portfolioAnalysisRange.startDate, portfolioAnalysisRange.endDate]);
+  }, [calendarReservations, selectedBuilding, daysInMonth, year, month]);
 
   // ✅ min/maxPrice 계산은 별도로 처리 (API 데이터 기반)
   const priceStats = useMemo(() => {
@@ -4356,47 +4068,6 @@ function BuildingCalendar() {
 
   // analysis 객실에 min/max 업데이트 (Single View 전용 편의)
   const singleAnalysis = { ...analysis, ...priceStats };
-  const commissionSummary = useMemo(() => {
-    if (!calendarBuilding || calendarBuilding === "전체") return { airbnb: 0, booking: 0, total: 0 };
-    const buildingReservations = calendarReservations.filter((reservation) => reservation.building === calendarBuilding);
-    return calculateCommissionSummary(buildingReservations, displayDays);
-  }, [calendarBuilding, calendarReservations, displayDays]);
-  const arrivalCountSummary = useMemo(() => {
-    if (!calendarBuilding || calendarBuilding === "전체") return { airbnb: 0, booking: 0, direct: 0, total: 0 };
-    const buildingReservations = calendarReservations.filter((reservation) => reservation.building === calendarBuilding);
-    return calculateArrivalCountSummary(buildingReservations, displayDays);
-  }, [calendarBuilding, calendarReservations, displayDays]);
-  const futureVacancySummary = useMemo(() => {
-    if (!calendarBuilding || calendarBuilding === "전체") return { vacantRoomNights: 0, totalRoomNights: 0, days: 0, avgVacantRooms: 0 };
-
-    const todayStr = dayjs().format("YYYY-MM-DD");
-    const futureDays = displayDays.filter((dayInfo) => dayInfo.dateStr >= todayStr);
-    let vacantRoomNights = 0;
-
-    futureDays.forEach(({ dateStr }) => {
-      rooms.forEach((room) => {
-        const isUnavailable = (roomReservationsMap[room] || []).some((reservation) =>
-          reservation.status !== "cancelled" &&
-          reservation.status !== "inquiry" &&
-          dateStr >= reservation.arrival &&
-          dateStr < reservation.departure
-        );
-
-        if (!isUnavailable) {
-          vacantRoomNights += 1;
-        }
-      });
-    });
-
-    const totalRoomNights = futureDays.length * rooms.length;
-
-    return {
-      vacantRoomNights,
-      totalRoomNights,
-      days: futureDays.length,
-      avgVacantRooms: futureDays.length > 0 ? vacantRoomNights / futureDays.length : 0
-    };
-  }, [calendarBuilding, displayDays, roomReservationsMap, rooms]);
 
 
 
@@ -4525,28 +4196,22 @@ function BuildingCalendar() {
           height: `${barHeight}px`,
           backgroundColor: platformColor,
           border: isCancelled ? "1.5px dashed rgba(255,255,255,0.5)" : "none",
-          opacity: isCancelled ? 0.56 : (allowPriceEditThroughBlock ? 0.3 : (isPastReservation ? 0.44 : (showBeds24DetailView ? 0.94 : 1))),
+          opacity: isCancelled ? 0.6 : (allowPriceEditThroughBlock ? 0.35 : (isPastReservation ? 0.48 : 1)),
           borderRadius: showBeds24DetailView ? "5px" : "8px",
           color: "white",
           fontSize: showBeds24DetailView ? "9px" : "11px",
-          fontWeight: showBeds24DetailView ? "600" : "700",
+          fontWeight: "700",
           padding: showBeds24DetailView ? "1px 6px" : "4px 10px",
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
           cursor: (isManualCheckoutTargetActive || isInventoryLikeBlock || allowPriceEditThroughBlock) ? "default" : "pointer",
-          boxShadow: isCancelled
-            ? "none"
-            : (showBeds24DetailView
-              ? "0 1px 4px rgba(15, 23, 42, 0.14)"
-              : "0 4px 8px rgba(0,0,0,0.15), inset 0 1px 1px rgba(255,255,255,0.2)"),
+          boxShadow: isCancelled ? "none" : "0 4px 8px rgba(0,0,0,0.15), inset 0 1px 1px rgba(255,255,255,0.2)",
           transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
           zIndex: isCancelled ? 5 : (isBlackout ? 6 : 10),
           backgroundImage: isBlackout
             ? "repeating-linear-gradient(45deg, transparent, transparent 10px, rgba(255,255,255,0.05) 10px, rgba(255,255,255,0.05) 20px)"
-            : (showBeds24DetailView
-              ? "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(0,0,0,0.02) 100%)"
-              : "linear-gradient(180deg, rgba(255,255,255,0.1) 0%, rgba(0,0,0,0.05) 100%)"),
+            : "linear-gradient(180deg, rgba(255,255,255,0.1) 0%, rgba(0,0,0,0.05) 100%)",
           display: "flex",
           alignItems: "center",
           gap: showBeds24DetailView ? "4px" : "6px",
@@ -4560,19 +4225,13 @@ function BuildingCalendar() {
               ? "scale(1.01)"
               : "translateY(-50%) translateY(-1px) scale(1.01)";
           e.currentTarget.style.transform = hoverTransform;
-          e.currentTarget.style.boxShadow = showBeds24DetailView
-            ? "0 2px 8px rgba(15, 23, 42, 0.18)"
-            : "0 6px 12px rgba(0,0,0,0.25), inset 0 1px 1px rgba(255,255,255,0.3)";
+          e.currentTarget.style.boxShadow = "0 6px 12px rgba(0,0,0,0.25), inset 0 1px 1px rgba(255,255,255,0.3)";
           e.currentTarget.style.zIndex = 25;
         }}
         onMouseLeave={(e) => {
           if (isManualCheckoutTargetActive || isInventoryLikeBlock || allowPriceEditThroughBlock) return;
           e.currentTarget.style.transform = barTransform;
-          e.currentTarget.style.boxShadow = isCancelled
-            ? "none"
-            : (showBeds24DetailView
-              ? "0 1px 4px rgba(15, 23, 42, 0.14)"
-              : "0 4px 8px rgba(0,0,0,0.15), inset 0 1px 1px rgba(255,255,255,0.2)");
+          e.currentTarget.style.boxShadow = isCancelled ? "none" : "0 4px 8px rgba(0,0,0,0.15), inset 0 1px 1px rgba(255,255,255,0.2)";
           e.currentTarget.style.zIndex = isCancelled ? 5 : (isBlackout ? 6 : 10);
         }}
         title={isInventoryLikeBlock
@@ -4581,11 +4240,11 @@ function BuildingCalendar() {
       >
         <span style={{
           display: "inline-block",
-          width: showBeds24DetailView ? "5px" : "6px",
-          height: showBeds24DetailView ? "5px" : "6px",
+          width: "6px",
+          height: "6px",
           borderRadius: "50%",
           backgroundColor: "white",
-          boxShadow: showBeds24DetailView ? "none" : "0 0 4px rgba(255,255,255,0.8)"
+          boxShadow: "0 0 4px rgba(255,255,255,0.8)"
         }}></span>
         <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>{displayText}</span>
       </div>
@@ -5792,135 +5451,8 @@ function BuildingCalendar() {
                 <line x1="12" y1="20" x2="12" y2="4" />
                 <line x1="6" y1="20" x2="6" y2="14" />
               </svg>
-              {portfolioAnalysisRange.label} Portfolio Overview
+              {["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][month]} {year} Portfolio Overview
             </h3>
-
-            <div style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: "14px",
-              flexWrap: "wrap",
-              marginBottom: "22px",
-              padding: "12px 14px",
-              borderRadius: "14px",
-              background: "linear-gradient(135deg, #F8FAFC 0%, #FFFFFF 100%)",
-              border: "1px solid #E5E7EB"
-            }}>
-              <button
-                onClick={() => setShowMonthPicker(true)}
-                style={{
-                  padding: "9px 14px",
-                  borderRadius: "10px",
-                  border: "1px solid #D1D5DB",
-                  background: portfolioAnalysisRange.isCustom ? "white" : "linear-gradient(135deg, #1F2937 0%, #111827 100%)",
-                  color: portfolioAnalysisRange.isCustom ? "#374151" : "white",
-                  cursor: "pointer",
-                  fontWeight: "700",
-                  fontSize: "13px",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "8px",
-                  boxShadow: portfolioAnalysisRange.isCustom ? "none" : "0 4px 12px rgba(31,41,55,0.16)"
-                }}
-              >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <rect x="3" y="4" width="18" height="18" rx="2" />
-                  <line x1="16" y1="2" x2="16" y2="6" />
-                  <line x1="8" y1="2" x2="8" y2="6" />
-                  <line x1="3" y1="10" x2="21" y2="10" />
-                </svg>
-                Monthly Search
-              </button>
-
-              <div style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "8px",
-                padding: "6px 10px",
-                borderRadius: "10px",
-                background: "#FFFFFF",
-                border: "1px solid #E5E5EA",
-                flexWrap: "wrap"
-              }}>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  maxLength={10}
-                  value={portfolioDateFrom}
-                  onChange={e => setPortfolioDateFrom(normalizeDateInput(e.target.value))}
-                  placeholder="From YYYY-MM-DD"
-                  style={{
-                    width: "132px",
-                    padding: "7px 10px",
-                    borderRadius: "8px",
-                    border: "1px solid #D1D1D6",
-                    fontSize: "12px",
-                    color: "#1D1D1F",
-                    background: "#FFFFFF",
-                    outline: "none",
-                    fontVariantNumeric: "tabular-nums"
-                  }}
-                />
-                <span style={{ fontSize: "12px", color: "#AEAEB2" }}>~</span>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  maxLength={10}
-                  value={portfolioDateTo}
-                  onChange={e => setPortfolioDateTo(normalizeDateInput(e.target.value))}
-                  placeholder="To YYYY-MM-DD"
-                  style={{
-                    width: "124px",
-                    padding: "7px 10px",
-                    borderRadius: "8px",
-                    border: "1px solid #D1D1D6",
-                    fontSize: "12px",
-                    color: "#1D1D1F",
-                    background: "#FFFFFF",
-                    outline: "none",
-                    fontVariantNumeric: "tabular-nums"
-                  }}
-                />
-                <button
-                  onClick={() => {
-                    const todayKey = dayjs().format("YYYY-MM-DD");
-                    setPortfolioDateFrom(todayKey);
-                    setPortfolioDateTo(todayKey);
-                  }}
-                  style={{
-                    padding: "6px 10px",
-                    borderRadius: "8px",
-                    border: "1px solid #D1D1D6",
-                    background: "#F8FAFC",
-                    color: "#334155",
-                    fontSize: "12px",
-                    fontWeight: "600",
-                    cursor: "pointer"
-                  }}
-                >
-                  Today
-                </button>
-                <button
-                  onClick={() => {
-                    setPortfolioDateFrom("");
-                    setPortfolioDateTo("");
-                  }}
-                  style={{
-                    padding: "6px 10px",
-                    borderRadius: "8px",
-                    border: "1px solid #D1D1D6",
-                    background: "#FFFFFF",
-                    color: "#6B7280",
-                    fontSize: "12px",
-                    fontWeight: "600",
-                    cursor: "pointer"
-                  }}
-                >
-                  Clear
-                </button>
-              </div>
-            </div>
 
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "14px" }}>
               <thead>
@@ -5929,7 +5461,7 @@ function BuildingCalendar() {
                   <th style={{ padding: "14px 16px", textAlign: "center", fontWeight: "600", color: "#374151" }}>Occupancy</th>
                   <th style={{ padding: "14px 16px", textAlign: "center", fontWeight: "600", color: "#374151" }}>Vacant</th>
                   <th style={{ padding: "14px 16px", textAlign: "right", fontWeight: "600", color: "#374151" }}>Avg. Rate</th>
-                  <th style={{ padding: "14px 16px", textAlign: "right", borderRadius: "0 10px 10px 0", fontWeight: "600", color: "#374151" }}>Revenue</th>
+                  <th style={{ padding: "14px 16px", textAlign: "right", borderRadius: "0 10px 10px 0", fontWeight: "600", color: "#374151" }}>Net Revenue</th>
                 </tr>
               </thead>
               <tbody>
@@ -6556,7 +6088,6 @@ function BuildingCalendar() {
           </div>
         )}
 
-        {(selectedBuilding !== "전체" || priceMode || gapEditMode || isCalendarFullscreen) && (
         <div style={isCalendarFullscreen ? {
           position: "fixed",
           inset: 0,
@@ -6601,7 +6132,7 @@ function BuildingCalendar() {
                 <button
                   key={`fullscreen-building-${building}`}
                   onClick={() => {
-                    if (selectedBuilding === "전체" && (priceMode || gapEditMode)) {
+                    if (selectedBuilding === "전체" && priceMode) {
                       setPortfolioPriceBuilding(building);
                     } else {
                       setSelectedBuilding(building);
@@ -6978,144 +6509,6 @@ function BuildingCalendar() {
                 Apply Price
               </button>
             )}
-            {isCalendarFullscreen && (
-              <button
-                onClick={toggleMinStayEditMode}
-                style={{
-                  padding: "7px 14px",
-                  borderRadius: "8px",
-                  border: gapEditMode ? "2px solid #8B5CF6" : "none",
-                  background: gapEditMode
-                    ? "linear-gradient(135deg, #EDE9FE 0%, #DDD6FE 100%)"
-                    : "linear-gradient(135deg, #8B5CF6 0%, #7C3AED 100%)",
-                  color: gapEditMode ? "#5B21B6" : "white",
-                  cursor: "pointer",
-                  fontWeight: "700",
-                  fontSize: "12px",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  boxShadow: gapEditMode ? "0 0 0 2px rgba(139, 92, 246, 0.18)" : "0 3px 8px rgba(139, 92, 246, 0.24)",
-                  transition: "all 0.2s"
-                }}
-                onMouseEnter={(e) => e.currentTarget.style.transform = "translateY(-1px)"}
-                onMouseLeave={(e) => e.currentTarget.style.transform = "translateY(0)"}
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  {gapEditMode ? (
-                    <>
-                      <line x1="18" y1="6" x2="6" y2="18" />
-                      <line x1="6" y1="6" x2="18" y2="18" />
-                    </>
-                  ) : (
-                    <>
-                      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
-                      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
-                    </>
-                  )}
-                </svg>
-                {gapEditMode ? "Exit Min Stay" : "Min Stay"}
-              </button>
-            )}
-            {isCalendarFullscreen && gapEditMode && (
-              <>
-                <button
-                  onClick={selectRedGapCells}
-                  style={{
-                    padding: "7px 12px",
-                    borderRadius: "8px",
-                    border: "1px solid #FCA5A5",
-                    background: "linear-gradient(135deg, #FEF2F2 0%, #FEE2E2 100%)",
-                    color: "#DC2626",
-                    cursor: "pointer",
-                    fontWeight: "700",
-                    fontSize: "12px",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    transition: "all 0.2s"
-                  }}
-                  title="Auto-select gap cells that need minStay change"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                    <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
-                  </svg>
-                  Red Gaps
-                </button>
-                <button
-                  disabled={selectedCells.length === 0 || isGapApplying}
-                  onClick={() => { setGapEditMinStay(1); setShowGapEditModal(true); }}
-                  style={{
-                    padding: "7px 12px",
-                    borderRadius: "8px",
-                    border: "none",
-                    background: selectedCells.length === 0 || isGapApplying
-                      ? "#E5E7EB"
-                      : "linear-gradient(135deg, #10B981 0%, #059669 100%)",
-                    color: selectedCells.length === 0 || isGapApplying ? "#9CA3AF" : "white",
-                    cursor: selectedCells.length === 0 || isGapApplying ? "not-allowed" : "pointer",
-                    fontWeight: "700",
-                    fontSize: "12px",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    boxShadow: selectedCells.length > 0 && !isGapApplying ? "0 3px 8px rgba(16, 185, 129, 0.24)" : "none",
-                    transition: "all 0.2s"
-                  }}
-                >
-                  Set 1N
-                </button>
-                <button
-                  disabled={selectedCells.length === 0 || isGapApplying}
-                  onClick={() => { setGapEditMinStay(2); setShowGapEditModal(true); }}
-                  style={{
-                    padding: "7px 12px",
-                    borderRadius: "8px",
-                    border: "none",
-                    background: selectedCells.length === 0 || isGapApplying
-                      ? "#E5E7EB"
-                      : "linear-gradient(135deg, #F59E0B 0%, #D97706 100%)",
-                    color: selectedCells.length === 0 || isGapApplying ? "#9CA3AF" : "white",
-                    cursor: selectedCells.length === 0 || isGapApplying ? "not-allowed" : "pointer",
-                    fontWeight: "700",
-                    fontSize: "12px",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    boxShadow: selectedCells.length > 0 && !isGapApplying ? "0 3px 8px rgba(245, 158, 11, 0.24)" : "none",
-                    transition: "all 0.2s"
-                  }}
-                >
-                  Set 2N
-                </button>
-                <button
-                  disabled={selectedCells.length === 0}
-                  onClick={() => { setSelectedCells([]); setSelectedRoom(null); }}
-                  style={{
-                    padding: "7px 12px",
-                    borderRadius: "8px",
-                    border: "1px solid #E5E7EB",
-                    background: "white",
-                    color: selectedCells.length === 0 ? "#9CA3AF" : "#6B7280",
-                    cursor: selectedCells.length === 0 ? "not-allowed" : "pointer",
-                    fontWeight: "700",
-                    fontSize: "12px",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    transition: "all 0.2s"
-                  }}
-                  onMouseEnter={(e) => {
-                    if (selectedCells.length > 0) e.currentTarget.style.background = "#F9FAFB";
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.background = "white";
-                  }}
-                >
-                  Clear
-                </button>
-              </>
-            )}
 
             <button
               onClick={toggleCalendarFullscreen}
@@ -7286,13 +6679,13 @@ function BuildingCalendar() {
           background: "white",
           borderRadius: "20px",
           boxShadow: "0 10px 25px rgba(0,0,0,0.05)",
-          overflow: isCalendarFullscreen ? "hidden" : "visible",
+          overflow: "hidden",
           marginBottom: isCalendarFullscreen ? "0" : "24px",
           border: "1px solid #E5E7EB",
           display: 'flex',
           flexDirection: 'column',
-          maxHeight: isCalendarFullscreen ? 'none' : undefined,
-          minHeight: isCalendarFullscreen ? '0' : undefined,
+          maxHeight: isCalendarFullscreen ? 'none' : '60vh',
+          minHeight: isCalendarFullscreen ? '0' : '400px',
           flex: isCalendarFullscreen ? 1 : undefined
         }}>
           {loading ? (
@@ -7312,10 +6705,8 @@ function BuildingCalendar() {
             </div>
           ) : (
             <div style={{
-              overflowX: "auto",
-              overflowY: isCalendarFullscreen ? "auto" : "visible",
-              flex: isCalendarFullscreen ? 1 : undefined,
-              minHeight: isCalendarFullscreen ? 0 : undefined,
+              overflow: "auto",
+              flex: 1,
               cursor: isDraggingCalendar ? 'grabbing' : 'grab',
               userSelect: 'none'
             }}
@@ -7331,12 +6722,9 @@ function BuildingCalendar() {
                   display: "flex",
                   borderBottom: "1px solid #E5E7EB",
                   background: "#F9FAFB",
-                  position: isCalendarFullscreen ? 'sticky' : 'relative',
-                  top: isCalendarFullscreen ? 0 : undefined,
-                  zIndex: isCalendarFullscreen ? 100 : 40,
-                  boxShadow: isCalendarFullscreen ? "none" : "0 1px 0 rgba(226, 232, 240, 0.9)",
-                  minHeight: "48px",
-                  flexShrink: 0
+                  position: 'sticky',
+                  top: 0,
+                  zIndex: 100
                 }}>
                   <div style={{
                     width: showBeds24DetailView ? `${BEDS24_DETAIL_STICKY_WIDTH}px` : "120px",
@@ -7351,7 +6739,7 @@ function BuildingCalendar() {
                     background: "#F9FAFB",
                     position: 'sticky',
                     left: 0,
-                    zIndex: isCalendarFullscreen ? 110 : 121
+                    zIndex: 110
                   }}>
                     Room
                   </div>
@@ -7373,8 +6761,6 @@ function BuildingCalendar() {
                             flex: "1 1 0",
                             minWidth: "32px",
                             padding: "10px 2px",
-                            minHeight: "48px",
-                            boxSizing: "border-box",
                             textAlign: "center",
                             fontSize: "12px",
                             fontWeight: isToday ? "800" : "600",
@@ -7383,7 +6769,7 @@ function BuildingCalendar() {
                               : isToday
                                 ? "#3B82F6"
                                 : isWeekend
-                                  ? "#E98B8B"
+                                  ? "#EF4444"
                                   : "#4B5563",
                             background: isHeaderSelected
                               ? "linear-gradient(180deg, rgba(245,158,11,0.18) 0%, rgba(251,191,36,0.08) 100%)"
@@ -7391,7 +6777,7 @@ function BuildingCalendar() {
                                 ? "#EFF6FF"
                                 : isPastHeaderDate
                                   ? "rgba(248,250,252,0.96)"
-                                  : "#F9FAFB",
+                                : "transparent",
                             borderRight: "1px solid #F3F4F6",
                             boxShadow: isHeaderSelected ? "inset 0 -3px 0 #F59E0B" : "none",
                             display: 'flex',
@@ -7424,8 +6810,6 @@ function BuildingCalendar() {
                             flex: "1 1 0",
                             minWidth: "32px",
                             padding: "10px 2px",
-                            minHeight: "48px",
-                            boxSizing: "border-box",
                             textAlign: "center",
                             fontSize: "12px",
                             fontWeight: isToday ? "800" : "600",
@@ -7444,7 +6828,7 @@ function BuildingCalendar() {
                                   ? "rgba(248,250,252,0.96)"
                                 : isNewMonth
                                   ? "#FFFBEB"
-                                  : "#F9FAFB",
+                                  : "transparent",
                             borderRight: "1px solid #F3F4F6",
                             borderLeft: isNewMonth && i > 0 ? "2px solid #F59E0B" : "none",
                             boxShadow: isHeaderSelected ? "inset 0 -3px 0 #F59E0B" : "none",
@@ -7486,8 +6870,8 @@ function BuildingCalendar() {
                       padding: showBeds24DetailView ? "0" : "12px",
                       fontWeight: "700",
                       fontSize: "13px",
-                      color: "#334155",
-                      borderRight: "1px solid #EDF2F7",
+                      color: "#1F2937",
+                      borderRight: "1px solid #E5E7EB",
                       background: "#FFFFFF",
                       display: "flex",
                       alignItems: showBeds24DetailView ? "stretch" : "center",
@@ -7495,8 +6879,8 @@ function BuildingCalendar() {
                       flexDirection: showBeds24DetailView ? "row" : "row",
                       position: 'sticky',
                       left: 0,
-                      zIndex: isCalendarFullscreen ? 90 : 35,
-                      boxShadow: '1px 0 3px rgba(15,23,42,0.025)'
+                      zIndex: 90,
+                      boxShadow: '2px 0 5px rgba(0,0,0,0.02)'
                     }}>
                       {showBeds24DetailView ? (
                         <div style={{
@@ -7513,40 +6897,26 @@ function BuildingCalendar() {
                             alignItems: "center",
                             justifyContent: priceMode ? "space-between" : "flex-start",
                             padding: "0 10px",
-                            borderRight: "1px solid #F5F7FA",
-                            color: "#334155",
+                            borderRight: "1px solid #F3F4F6",
+                            color: "#1F2937",
                             background: "linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(248,250,252,0.98) 100%)",
-                            gap: "8px",
-                            cursor: priceMode ? "pointer" : "default",
-                            userSelect: "none"
-                          }}
-                          onClick={priceMode ? (e => {
-                            e.stopPropagation();
-                            toggleRoomSelection(room);
-                          }) : undefined}
-                          title={priceMode ? `${selectedRooms.includes(room) ? "Deselect" : "Select"} ${getRoomNameEN(room)}` : undefined}
-                          onMouseEnter={priceMode ? (e => {
-                            e.currentTarget.style.background = selectedRooms.includes(room)
-                              ? "linear-gradient(180deg, rgba(219,234,254,0.92) 0%, rgba(239,246,255,0.96) 100%)"
-                              : "linear-gradient(180deg, rgba(248,250,252,1) 0%, rgba(241,245,249,0.98) 100%)";
-                          }) : undefined}
-                          onMouseLeave={priceMode ? (e => {
-                            e.currentTarget.style.background = "linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(248,250,252,0.98) 100%)";
-                          }) : undefined}>
+                            gap: "8px"
+                          }}>
                             <span>{getRoomNameEN(room)}</span>
                             {priceMode && (
                               <input
                                 type="checkbox"
                                 checked={selectedRooms.includes(room)}
-                                readOnly
-                                tabIndex={-1}
+                                onChange={(e) => {
+                                  e.stopPropagation();
+                                  toggleRoomSelection(room);
+                                }}
                                 style={{
-                                  width: '16px',
-                                  height: '16px',
+                                  width: '14px',
+                                  height: '14px',
                                   cursor: "pointer",
                                   accentColor: '#3B82F6',
-                                  flexShrink: 0,
-                                  pointerEvents: "none"
+                                  flexShrink: 0
                                 }}
                               />
                             )}
@@ -7555,81 +6925,58 @@ function BuildingCalendar() {
                             display: "flex",
                             alignItems: "center",
                             paddingLeft: "10px",
-                            borderTop: "1px solid #F7FAFC",
-                            fontSize: "8.5px",
-                            fontWeight: "700",
-                            color: "#94A3B8",
-                            letterSpacing: "0.025em"
+                            borderTop: "1px solid #F3F4F6",
+                            fontSize: "9px",
+                            fontWeight: "800",
+                            color: "#64748B",
+                            letterSpacing: "0.03em"
                           }}>Airbnb</div>
                           <div style={{
                             display: "flex",
                             alignItems: "center",
                             paddingLeft: "10px",
-                            borderTop: "1px solid #F7FAFC",
-                            fontSize: "8.5px",
-                            fontWeight: "700",
-                            color: "#94A3B8",
-                            letterSpacing: "0.025em"
+                            borderTop: "1px solid #F3F4F6",
+                            fontSize: "9px",
+                            fontWeight: "800",
+                            color: "#64748B",
+                            letterSpacing: "0.03em"
                           }}>Booking</div>
                           <div style={{
                             display: "flex",
                             alignItems: "center",
                             paddingLeft: "10px",
-                            borderTop: "1px solid #F7FAFC",
-                            fontSize: "8.5px",
-                            fontWeight: "700",
-                            color: "#A3B2C4",
-                            letterSpacing: "0.025em"
+                            borderTop: "1px solid #F3F4F6",
+                            fontSize: "9px",
+                            fontWeight: "800",
+                            color: "#64748B",
+                            letterSpacing: "0.03em"
                           }}>Min Stay</div>
                           <div style={{
                             display: "flex",
                             alignItems: "center",
                             paddingLeft: "10px",
-                            borderTop: "1px solid #F7FAFC",
-                            fontSize: "8.5px",
-                            fontWeight: "700",
-                            color: "#A3B2C4",
-                            letterSpacing: "0.025em"
+                            borderTop: "1px solid #F3F4F6",
+                            fontSize: "9px",
+                            fontWeight: "800",
+                            color: "#475569",
+                            letterSpacing: "0.03em"
                           }}>Reservation</div>
                         </div>
                       ) : (
-                        <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "10px",
-                            minHeight: "18px",
-                            cursor: priceMode ? "pointer" : "default",
-                            userSelect: "none",
-                            padding: priceMode ? "4px 6px" : "0",
-                            margin: priceMode ? "-4px -6px" : "0",
-                            borderRadius: priceMode ? "8px" : "0",
-                            transition: "background 0.15s ease"
-                          }}
-                          onClick={priceMode ? (e => {
-                            e.stopPropagation();
-                            toggleRoomSelection(room);
-                          }) : undefined}
-                          title={priceMode ? `${selectedRooms.includes(room) ? "Deselect" : "Select"} ${getRoomNameEN(room)}` : undefined}
-                          onMouseEnter={priceMode ? (e => {
-                            e.currentTarget.style.background = "rgba(241,245,249,0.95)";
-                          }) : undefined}
-                          onMouseLeave={priceMode ? (e => {
-                            e.currentTarget.style.background = "transparent";
-                          }) : undefined}
-                        >
+                        <div style={{ display: "flex", alignItems: "center", gap: "10px", minHeight: "18px" }}>
                           {priceMode && (
                             <input
                               type="checkbox"
                               checked={selectedRooms.includes(room)}
-                              readOnly
-                              tabIndex={-1}
+                              onChange={(e) => {
+                                e.stopPropagation();
+                                toggleRoomSelection(room);
+                              }}
                               style={{
-                                width: '18px',
-                                height: '18px',
+                                width: '16px',
+                                height: '16px',
                                 cursor: "pointer",
-                                accentColor: '#3B82F6',
-                                pointerEvents: "none"
+                                accentColor: '#3B82F6'
                               }}
                             />
                           )}
@@ -7861,7 +7208,7 @@ function BuildingCalendar() {
                                   justifyContent: "center",
                                   borderTop: "1px solid rgba(226, 232, 240, 0.9)",
                                   background: "rgba(255,255,255,0.78)",
-                                  color: isPendingPriceCell ? "#4C51BF" : "#E15B74",
+                                  color: isPendingPriceCell ? "#4338CA" : "#FF385C",
                                   fontSize: "13.5px",
                                   fontWeight: "400",
                                   letterSpacing: "0",
@@ -7877,7 +7224,7 @@ function BuildingCalendar() {
                                   justifyContent: "center",
                                   borderTop: "1px solid rgba(226, 232, 240, 0.9)",
                                   background: "rgba(255,255,255,0.72)",
-                                  color: "#5B84E5",
+                                  color: "#2563EB",
                                   fontSize: "13.5px",
                                   fontWeight: "400",
                                   letterSpacing: "0",
@@ -7893,18 +7240,18 @@ function BuildingCalendar() {
                                   justifyContent: "center",
                                   borderTop: "1px solid rgba(226, 232, 240, 0.9)",
                                   background: isGap
-                                    ? "linear-gradient(135deg, rgba(254,226,226,0.82) 0%, rgba(254,202,202,0.72) 100%)"
+                                    ? "linear-gradient(135deg, rgba(254,226,226,0.92) 0%, rgba(254,202,202,0.88) 100%)"
                                     : minStay === 1
-                                      ? "linear-gradient(135deg, rgba(209,250,229,0.74) 0%, rgba(167,243,208,0.62) 100%)"
-                                      : "rgba(248,250,252,0.72)",
+                                      ? "linear-gradient(135deg, rgba(209,250,229,0.92) 0%, rgba(167,243,208,0.88) 100%)"
+                                      : "rgba(248,250,252,0.95)",
                                   color: isGap
-                                    ? "#DC6A6A"
+                                    ? "#DC2626"
                                     : minStay === 1
-                                      ? "#2F8F73"
-                                      : "#94A3B8",
-                                  fontSize: "8.5px",
-                                  fontWeight: "700",
-                                  letterSpacing: "0.02em"
+                                      ? "#059669"
+                                      : "#64748B",
+                                  fontSize: "9px",
+                                  fontWeight: "900",
+                                  letterSpacing: "0.01em"
                                 }}
                                 title={minStay > 0
                                   ? (() => {
@@ -7938,16 +7285,16 @@ function BuildingCalendar() {
                                         width: "20px",
                                         height: "20px",
                                         borderRadius: "999px",
-                                        border: "1px dashed rgba(148, 163, 184, 0.22)",
-                                        background: "rgba(148, 163, 184, 0.04)",
-                                        color: "rgba(100, 116, 139, 0.35)",
+                                        border: "1px dashed rgba(59, 130, 246, 0.28)",
+                                        background: "rgba(59, 130, 246, 0.06)",
+                                        color: "rgba(37, 99, 235, 0.48)",
                                         display: "flex",
                                         alignItems: "center",
                                         justifyContent: "center",
                                         fontSize: "13px",
-                                        fontWeight: "700",
+                                        fontWeight: "800",
                                         lineHeight: 1,
-                                        boxShadow: "none"
+                                        boxShadow: "0 1px 2px rgba(59, 130, 246, 0.06)"
                                       }}>
                                         +
                                       </div>
@@ -8116,7 +7463,6 @@ function BuildingCalendar() {
           )}
         </div>
         </div>
-        )}
 
         {/* 건물 통계 섹션 (전체 보기 아닌 경우만) - Premium Design */}
             {selectedBuilding !== "전체" && (
@@ -8167,49 +7513,15 @@ function BuildingCalendar() {
                 <div style={{ fontSize: "12px", color: "#9CA3AF", marginTop: "4px" }}>of {rooms.length} total rooms</div>
               </div>
               <div style={{
-                background: "linear-gradient(135deg, #FFFFFF 0%, #F0FDFA 100%)",
+                background: "white",
                 borderRadius: "16px",
-                padding: "18px 20px",
-                border: "1px solid #CCFBF1",
-                boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
-              }}>
-                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "8px" }}>Future Vacancy <span style={{ fontSize: "10px", color: "#9CA3AF" }}>(visible range)</span></div>
-                <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}>
-                  <span style={{ fontSize: "28px", fontWeight: "800", color: "#0F766E" }}>{futureVacancySummary.vacantRoomNights}</span>
-                  <span style={{ fontSize: "12px", fontWeight: "700", color: "#5EEAD4" }}>room nights</span>
-                </div>
-                <div style={{ fontSize: "12px", color: "#9CA3AF", marginTop: "4px" }}>
-                  {futureVacancySummary.days > 0
-                    ? `${futureVacancySummary.days} days from today · avg ${futureVacancySummary.avgVacantRooms.toFixed(1)} rooms/day`
-                    : "No future dates in current view"}
-                </div>
-                <div style={{ fontSize: "11px", color: "#94A3B8", marginTop: "3px" }}>
-                  {futureVacancySummary.totalRoomNights} total room nights checked
-                </div>
-              </div>
-              <div style={{
-                background: "linear-gradient(135deg, #FFFFFF 0%, #F8FAFC 100%)",
-                borderRadius: "16px",
-                padding: "18px 20px",
+                padding: "20px",
                 border: "1px solid #E5E7EB",
                 boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
               }}>
-                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "10px" }}>Rate Summary</div>
-                <div style={{ display: "grid", gap: "9px" }}>
-                  <div>
-                    <div style={{ fontSize: "11px", color: "#9CA3AF", fontWeight: "700", letterSpacing: "0.04em", textTransform: "uppercase", marginBottom: "3px" }}>Avg. Daily Rate</div>
-                    <div style={{ fontSize: "26px", fontWeight: "700", color: "#8B5CF6" }}>{formatPrice(singleAnalysis.avgPrice)}</div>
-                    <div style={{ fontSize: "11px", color: "#9CA3AF", marginTop: "2px" }}>Revenue per night incl. OTA fees</div>
-                  </div>
-                  <div style={{ height: "1px", background: "#E5E7EB" }}></div>
-                  <div>
-                    <div style={{ fontSize: "11px", color: "#9CA3AF", fontWeight: "700", letterSpacing: "0.04em", textTransform: "uppercase", marginBottom: "3px" }}>Airbnb Price Range</div>
-                    <div style={{ fontSize: "20px", fontWeight: "700", color: "#EF4444" }}>
-                      {singleAnalysis.minPrice >= 0 ? `${formatPrice(singleAnalysis.minPrice)} ~ ${formatPrice(singleAnalysis.maxPrice)}` : "-"}
-                    </div>
-                    <div style={{ fontSize: "11px", color: "#9CA3AF", marginTop: "2px" }}>Available rooms only</div>
-                  </div>
-                </div>
+                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "8px" }}>Avg. Daily Rate</div>
+                <div style={{ fontSize: "28px", fontWeight: "700", color: "#8B5CF6" }}>{formatPrice(singleAnalysis.avgPrice)}</div>
+                <div style={{ fontSize: "12px", color: "#9CA3AF", marginTop: "4px" }}>Net revenue per night</div>
               </div>
               <div style={{
                 background: "white",
@@ -8218,76 +7530,22 @@ function BuildingCalendar() {
                 border: "1px solid #E5E7EB",
                 boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
               }}>
-                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "8px" }}>Est. Revenue <span style={{ fontSize: "10px", color: "#9CA3AF" }}>(incl. OTA fees)</span></div>
+                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "8px" }}>Est. Net Revenue <span style={{ fontSize: "10px", color: "#9CA3AF" }}>(excl. OTA fees)</span></div>
                 <div style={{ fontSize: "28px", fontWeight: "700", color: "#10B981" }}>{formatPrice(singleAnalysis.totalRevenue)}</div>
                 <div style={{ fontSize: "12px", color: "#9CA3AF", marginTop: "4px" }}>{reservations.length} reservations</div>
               </div>
               <div style={{
-                background: "linear-gradient(135deg, #FFFFFF 0%, #F8FAFC 100%)",
+                background: "white",
                 borderRadius: "16px",
-                padding: "18px 20px",
+                padding: "20px",
                 border: "1px solid #E5E7EB",
                 boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
               }}>
-                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "10px" }}>OTA Fees <span style={{ fontSize: "10px", color: "#9CA3AF" }}>(visible range)</span></div>
-                <div style={{ display: "grid", gap: "7px" }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "7px", fontSize: "12px", fontWeight: "600", color: "#64748B" }}>
-                      <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: PLATFORM_COLORS.Airbnb }}></span>
-                      Airbnb
-                    </span>
-                    <span style={{ fontSize: "15px", fontWeight: "700", color: "#E15B74" }}>{formatPrice(commissionSummary.airbnb)}</span>
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "7px", fontSize: "12px", fontWeight: "600", color: "#64748B" }}>
-                      <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: PLATFORM_COLORS.Booking }}></span>
-                      Booking
-                    </span>
-                    <span style={{ fontSize: "15px", fontWeight: "700", color: "#5B84E5" }}>{formatPrice(commissionSummary.booking)}</span>
-                  </div>
-                  <div style={{ height: "1px", background: "#E5E7EB", margin: "2px 0" }}></div>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ fontSize: "12px", fontWeight: "700", color: "#334155" }}>Total</span>
-                    <span style={{ fontSize: "18px", fontWeight: "800", color: "#0F172A" }}>{formatPrice(commissionSummary.total)}</span>
-                  </div>
+                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "8px" }}>Price Range <span style={{ fontSize: "10px", color: "#9CA3AF" }}>(Airbnb)</span></div>
+                <div style={{ fontSize: "20px", fontWeight: "700", color: "#EF4444" }}>
+                  {singleAnalysis.minPrice >= 0 ? `${formatPrice(singleAnalysis.minPrice)} ~ ${formatPrice(singleAnalysis.maxPrice)}` : "-"}
                 </div>
-              </div>
-              <div style={{
-                background: "linear-gradient(135deg, #FFFFFF 0%, #F8FAFC 100%)",
-                borderRadius: "16px",
-                padding: "18px 20px",
-                border: "1px solid #E5E7EB",
-                boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
-              }}>
-                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "10px" }}>Reservations <span style={{ fontSize: "10px", color: "#9CA3AF" }}>(arrival date)</span></div>
-                <div style={{ display: "grid", gap: "7px" }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "7px", fontSize: "12px", fontWeight: "600", color: "#64748B" }}>
-                      <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: PLATFORM_COLORS.Airbnb }}></span>
-                      Airbnb
-                    </span>
-                    <span style={{ fontSize: "15px", fontWeight: "700", color: "#E15B74" }}>{arrivalCountSummary.airbnb}</span>
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "7px", fontSize: "12px", fontWeight: "600", color: "#64748B" }}>
-                      <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: PLATFORM_COLORS.Booking }}></span>
-                      Booking
-                    </span>
-                    <span style={{ fontSize: "15px", fontWeight: "700", color: "#5B84E5" }}>{arrivalCountSummary.booking}</span>
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "7px", fontSize: "12px", fontWeight: "600", color: "#64748B" }}>
-                      <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: PLATFORM_COLORS.Direct }}></span>
-                      Direct
-                    </span>
-                    <span style={{ fontSize: "15px", fontWeight: "700", color: "#00A7D8" }}>{arrivalCountSummary.direct}</span>
-                  </div>
-                  <div style={{ height: "1px", background: "#E5E7EB", margin: "2px 0" }}></div>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ fontSize: "12px", fontWeight: "700", color: "#334155" }}>Total</span>
-                    <span style={{ fontSize: "18px", fontWeight: "800", color: "#0F172A" }}>{arrivalCountSummary.total}</span>
-                  </div>
-                </div>
+                <div style={{ fontSize: "12px", color: "#9CA3AF", marginTop: "4px" }}>Available rooms only</div>
               </div>
             </div>
           </div>

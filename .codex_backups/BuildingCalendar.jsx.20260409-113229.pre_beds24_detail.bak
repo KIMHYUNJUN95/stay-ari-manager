@@ -78,7 +78,6 @@ const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || "https://us-central1-
 
 // 비활성 계정 minStay 기준값 (50 이상 = 비활성 판단)
 const INACTIVE_MINSTAY_THRESHOLD = 50;
-const CALENDAR_NUMERIC_FONT_FAMILY = '"Bahnschrift", "DIN Alternate", "Inter", "Aptos", "Segoe UI", sans-serif';
 
 // 가격 설정 모달 (고급 버전)
 function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose, onSave, onJobQueued, selectedRooms, selectedCells, companyId, pendingPriceCellMap }) {
@@ -111,26 +110,28 @@ function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose,
 
   const getModalPriceForRoomDate = useCallback((roomName, dateStr) => {
     const dateKey = dateStr.replace(/-/g, "");
-    const activeRoomInfos = getModalActiveRoomInfosForDate(roomName, dateStr);
-    const allRoomInfos = BUILDING_ROOMS[building]?.filter(r => r.name === roomName) || [];
-    const mergedPrices = getMergedRoomChannelPrices({
-      primaryUnitInfos: activeRoomInfos,
-      fallbackUnitInfos: allRoomInfos,
-      roomPrices,
-      dateKey
-    });
+    const roomInfos = getModalActiveRoomInfosForDate(roomName, dateStr);
+    let airbnbPrice = 0;
+    let bookingPrice = 0;
 
-    let airbnbPrice = mergedPrices.airbnbPrice;
-    let bookingPrice = mergedPrices.bookingPrice;
+      roomInfos.forEach((info) => {
+        const priceData = roomPrices?.[String(info.roomId)]?.dates?.[dateKey];
+        if (!priceData) return;
 
-    const pendingPriceCell = pendingPriceCellMap?.[`${roomName}__${dateStr}`];
-    if (pendingPriceCell?.airbnbPrice > 0) {
-      airbnbPrice = pendingPriceCell.airbnbPrice;
-    }
+        const ap = parseFloat(priceData.p1) || 0;
+      const bp = parseFloat(priceData.p2) || 0;
+      if (ap > 0) airbnbPrice = ap;
+        if (bp > 0) bookingPrice = bp;
+      });
 
-    return {
-      airbnbPrice,
-      bookingPrice,
+      const pendingPriceCell = pendingPriceCellMap?.[`${roomName}__${dateStr}`];
+      if (pendingPriceCell?.airbnbPrice > 0) {
+        airbnbPrice = pendingPriceCell.airbnbPrice;
+      }
+
+      return {
+        airbnbPrice,
+        bookingPrice,
       hasPrice: airbnbPrice > 0 || bookingPrice > 0
     };
   }, [getModalActiveRoomInfosForDate, roomPrices, pendingPriceCellMap]);
@@ -927,81 +928,6 @@ const formatPrice = (price) => {
   if (isNaN(num)) return "¥0";
   return new Intl.NumberFormat('ja-JP', { style: 'currency', currency: 'JPY', maximumFractionDigits: 0 }).format(num);
 };
-const formatCalendarPriceShort = (price) => {
-  if (!price) return "—";
-  const num = parseFloat(String(price).replace(/[^0-9.-]+/g, ""));
-  if (!Number.isFinite(num) || num <= 0) return "—";
-  if (num >= 1000) {
-    const compact = num / 1000;
-    return `${compact.toFixed(num % 1000 === 0 ? 0 : 1)}K`;
-  }
-  return Math.round(num).toLocaleString();
-};
-
-const getMergedRoomChannelPrices = ({
-  primaryUnitInfos = [],
-  fallbackUnitInfos = [],
-  roomPrices = {},
-  dateKey,
-  preferAirbnbPrice3 = false
-}) => {
-  const orderedInfos = [];
-  const seenRoomIds = new Set();
-
-  [primaryUnitInfos, fallbackUnitInfos].forEach((unitInfos) => {
-    (unitInfos || []).forEach((info) => {
-      const roomId = String(info?.roomId || "");
-      if (!roomId || seenRoomIds.has(roomId)) return;
-      seenRoomIds.add(roomId);
-      orderedInfos.push(info);
-    });
-  });
-
-  let airbnbPrice = 0;
-  let bookingPrice = 0;
-  let hasError = false;
-  let errorMsg = "";
-
-  for (const info of orderedInfos) {
-    const roomPriceData = roomPrices?.[String(info.roomId)];
-    if (roomPriceData?.dates?.error && !hasError) {
-      hasError = true;
-      errorMsg = roomPriceData.dates.error;
-    }
-
-    const priceInfo = roomPriceData?.dates?.[dateKey];
-    if (!priceInfo) continue;
-
-    if (airbnbPrice <= 0) {
-      const airbnbRaw = preferAirbnbPrice3 ? (priceInfo.p3 || priceInfo.p1) : priceInfo.p1;
-      const ap = parseFloat(airbnbRaw) || 0;
-      if (ap > 0) airbnbPrice = ap;
-    }
-
-    if (bookingPrice <= 0) {
-      const bp = parseFloat(priceInfo.p2) || 0;
-      if (bp > 0) bookingPrice = bp;
-    }
-
-    if (airbnbPrice > 0 && bookingPrice > 0 && hasError) break;
-  }
-
-  return {
-    airbnbPrice,
-    bookingPrice,
-    hasError,
-    errorMsg
-  };
-};
-
-const BEDS24_DETAIL_ROW_HEIGHT = 112;
-const BEDS24_DETAIL_PRICE_TRACK_HEIGHT = 30;
-const BEDS24_DETAIL_MINSTAY_TRACK_HEIGHT = 22;
-const BEDS24_DETAIL_RESERVATION_TRACK_HEIGHT = 30;
-const BEDS24_DETAIL_RESERVATION_TRACK_TOP =
-  BEDS24_DETAIL_ROW_HEIGHT - BEDS24_DETAIL_RESERVATION_TRACK_HEIGHT;
-const BEDS24_DETAIL_STICKY_WIDTH = 164;
-const BEDS24_DETAIL_ROOM_NAME_WIDTH = 86;
 
 // 예약 상세 모달 내부 컴포넌트 (재사용을 위해 함수 바깥에서 정의)
 const InfoRow = ({ label, value, icon, field, isEditing, editData, setEditData }) => (
@@ -2422,7 +2348,7 @@ function calculateBuildingMetrics(targetReservations, targetRooms, daysInMonth, 
   occupiedRoomsToday = roomNamesWithReservationToday.size;
 
   targetReservations.forEach(r => {
-    if (r.status !== "confirmed" || !r.arrival || !r.departure) return;
+    if (!r.arrival || !r.departure) return;
     const arrivalDate = new Date(r.arrival + 'T00:00:00');
     const departureDate = new Date(r.departure + 'T00:00:00');
     const monthStartDate = new Date(year, month, 1);
@@ -2435,7 +2361,7 @@ function calculateBuildingMetrics(targetReservations, targetRooms, daysInMonth, 
       const nightsInMonth = Math.ceil((effectiveEnd - effectiveStart) / (1000 * 60 * 60 * 24));
       const totalReservationNights = Math.max(1, Math.ceil((departureDate - arrivalDate) / (1000 * 60 * 60 * 24)));
 
-      const val = parseFloat(r.totalPrice) || parseFloat(r.price) || parseFloat(r.netRevenue) || 0;
+      const val = parseFloat(r.netRevenue) || parseFloat(r.totalPrice) || parseFloat(r.price) || 0;
       if (val > 0 && totalReservationNights > 0) {
         totalRevenue += (val / totalReservationNights) * nightsInMonth;
       }
@@ -2456,213 +2382,17 @@ function calculateBuildingMetrics(targetReservations, targetRooms, daysInMonth, 
   };
 }
 
-function calculateBuildingMetricsForRange(targetReservations, targetRooms, rangeStartStr, rangeEndStr) {
-  const uniqueRoomNames = [...new Set(targetRooms.map(r => r.name))];
-  const rangeStart = dayjs(rangeStartStr).startOf("day");
-  const rangeEnd = dayjs(rangeEndStr).startOf("day");
-  if (!rangeStart.isValid() || !rangeEnd.isValid() || rangeEnd.isBefore(rangeStart)) {
-    return {
-      occupancyRate: 0,
-      emptyRoomsToday: 0,
-      vacantNights: 0,
-      avgPrice: 0,
-      totalRevenue: 0,
-      occupiedDays: 0,
-      availableDays: 0
-    };
-  }
-
-  const rangeEndExclusive = rangeEnd.add(1, "day");
-  const rangeDays = rangeEnd.diff(rangeStart, "day") + 1;
-  let occupiedSlot = 0;
-
-  uniqueRoomNames.forEach(roomName => {
-    const roomRes = targetReservations.filter(r => r.room === roomName && r.status === "confirmed");
-    const occupiedSet = new Set();
-
-    roomRes.forEach(r => {
-      if (!r.arrival || !r.departure) return;
-      const arrivalDate = dayjs(r.arrival).startOf("day");
-      const departureDate = dayjs(r.departure).startOf("day");
-      if (!arrivalDate.isValid() || !departureDate.isValid()) return;
-
-      const effectiveStart = arrivalDate.isAfter(rangeStart) ? arrivalDate : rangeStart;
-      const effectiveEnd = departureDate.isBefore(rangeEndExclusive) ? departureDate : rangeEndExclusive;
-      if (!effectiveEnd.isAfter(effectiveStart)) return;
-
-      for (let d = effectiveStart; d.isBefore(effectiveEnd); d = d.add(1, "day")) {
-        occupiedSet.add(d.format("YYYY-MM-DD"));
-      }
-    });
-
-    occupiedSlot += occupiedSet.size;
-  });
-
-  const totalSlot = uniqueRoomNames.length * rangeDays;
-  const occupancyRate = totalSlot > 0 ? (occupiedSlot / totalSlot) * 100 : 0;
-  const vacantNights = Math.max(0, totalSlot - occupiedSlot);
-
-  let totalRevenue = 0;
-  const todayStr = dayjs().format("YYYY-MM-DD");
-  const roomNamesWithReservationToday = new Set();
-  targetReservations.forEach(r => {
-    if (r.status === "confirmed" && r.arrival <= todayStr && r.departure > todayStr) {
-      roomNamesWithReservationToday.add(r.room);
-    }
-  });
-
-  targetReservations.forEach(r => {
-    if (r.status !== "confirmed" || !r.arrival || !r.departure) return;
-    const arrivalDate = dayjs(r.arrival).startOf("day");
-    const departureDate = dayjs(r.departure).startOf("day");
-    if (!arrivalDate.isValid() || !departureDate.isValid()) return;
-
-    const effectiveStart = arrivalDate.isAfter(rangeStart) ? arrivalDate : rangeStart;
-    const effectiveEnd = departureDate.isBefore(rangeEndExclusive) ? departureDate : rangeEndExclusive;
-    if (!effectiveEnd.isAfter(effectiveStart)) return;
-
-    const visibleNights = effectiveEnd.diff(effectiveStart, "day");
-    const totalReservationNights = Math.max(1, departureDate.diff(arrivalDate, "day"));
-    const val = parseFloat(r.totalPrice) || parseFloat(r.price) || parseFloat(r.netRevenue) || 0;
-    if (val > 0 && totalReservationNights > 0) {
-      totalRevenue += (val / totalReservationNights) * visibleNights;
-    }
-  });
-
-  return {
-    occupancyRate,
-    emptyRoomsToday: Math.max(0, uniqueRoomNames.length - roomNamesWithReservationToday.size),
-    vacantNights,
-    avgPrice: occupiedSlot > 0 ? totalRevenue / occupiedSlot : 0,
-    totalRevenue,
-    occupiedDays: occupiedSlot,
-    availableDays: totalSlot
-  };
-}
-
-function normalizeDateInput(value) {
-  const digits = String(value || "").replace(/\D/g, "").slice(0, 8);
-  if (digits.length <= 4) return digits;
-  if (digits.length <= 6) return `${digits.slice(0, 4)}-${digits.slice(4)}`;
-  return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6)}`;
-}
-
-function getResolvedDateInput(value) {
-  const normalized = String(value || "").trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) return null;
-  const [year, month, day] = normalized.split("-").map(Number);
-  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null;
-  if (month < 1 || month > 12 || day < 1) return null;
-
-  const lastDayOfMonth = dayjs(new Date(year, month, 0)).date();
-  const safeDay = Math.min(day, lastDayOfMonth);
-  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(safeDay).padStart(2, "0")}`;
-}
-
-function parseMoneyAmount(value) {
-  if (value === null || value === undefined) return 0;
-  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
-  const parsed = parseFloat(String(value).replace(/[^0-9.-]+/g, ""));
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function getReservationChannelKey(reservation) {
-  const source = [
-    reservation?.referer,
-    reservation?.referrer,
-    reservation?.channel,
-    reservation?.platform,
-    reservation?.source,
-    reservation?.apiSource
-  ].filter(Boolean).join(" ").toLowerCase();
-
-  if (source.includes("airbnb")) return "airbnb";
-  if (source.includes("booking")) return "booking";
-  if (source.includes("direct") || source.includes("manual")) return "direct";
-  return "other";
-}
-
-function calculateCommissionSummary(targetReservations, visibleDays) {
-  const firstDate = visibleDays[0]?.dateStr;
-  const lastDate = visibleDays[visibleDays.length - 1]?.dateStr;
-  if (!firstDate || !lastDate) return { airbnb: 0, booking: 0, total: 0 };
-
-  const rangeStart = dayjs(firstDate).startOf("day");
-  const rangeEnd = dayjs(lastDate).add(1, "day").startOf("day");
-  const summary = { airbnb: 0, booking: 0 };
-
-  targetReservations.forEach((reservation) => {
-    if (reservation.status !== "confirmed" || !reservation.arrival || !reservation.departure) return;
-
-    const channelKey = getReservationChannelKey(reservation);
-    if (channelKey !== "airbnb" && channelKey !== "booking") return;
-
-    const commission = parseMoneyAmount(reservation.commission);
-    if (commission <= 0) return;
-
-    const arrivalDate = dayjs(reservation.arrival).startOf("day");
-    const departureDate = dayjs(reservation.departure).startOf("day");
-    const totalReservationNights = Math.max(1, departureDate.diff(arrivalDate, "day"));
-    const effectiveStart = arrivalDate.isAfter(rangeStart) ? arrivalDate : rangeStart;
-    const effectiveEnd = departureDate.isBefore(rangeEnd) ? departureDate : rangeEnd;
-    const visibleNights = effectiveEnd.diff(effectiveStart, "day");
-
-    if (visibleNights <= 0) return;
-    summary[channelKey] += (commission / totalReservationNights) * visibleNights;
-  });
-
-  return {
-    airbnb: summary.airbnb,
-    booking: summary.booking,
-    total: summary.airbnb + summary.booking
-  };
-}
-
-function calculateArrivalCountSummary(targetReservations, visibleDays) {
-  const firstDate = visibleDays[0]?.dateStr;
-  const lastDate = visibleDays[visibleDays.length - 1]?.dateStr;
-  if (!firstDate || !lastDate) return { airbnb: 0, booking: 0, direct: 0, total: 0 };
-
-  const rangeStart = dayjs(firstDate).startOf("day");
-  const rangeEnd = dayjs(lastDate).add(1, "day").startOf("day");
-  const summary = { airbnb: 0, booking: 0, direct: 0 };
-
-  targetReservations.forEach((reservation) => {
-    if (reservation.status !== "confirmed" || !reservation.arrival) return;
-
-    const arrivalDate = dayjs(reservation.arrival).startOf("day");
-    if (!arrivalDate.isValid()) return;
-    if (arrivalDate.isBefore(rangeStart) || !arrivalDate.isBefore(rangeEnd)) return;
-
-    const channelKey = getReservationChannelKey(reservation);
-    if (channelKey !== "airbnb" && channelKey !== "booking" && channelKey !== "direct") return;
-
-    summary[channelKey] += 1;
-  });
-
-  return {
-    airbnb: summary.airbnb,
-    booking: summary.booking,
-    direct: summary.direct,
-    total: summary.airbnb + summary.booking + summary.direct
-  };
-}
-
 // 메인 캘린더 컴포넌트
 function BuildingCalendar() {
   const { companyId } = useUser();
 
   const [selectedBuilding, setSelectedBuilding] = useState("Arakicho A");
   const [currentDate, setCurrentDate] = useState(new Date());
-  const [portfolioDateFrom, setPortfolioDateFrom] = useState("");
-  const [portfolioDateTo, setPortfolioDateTo] = useState("");
   const [reservations, setReservations] = useState([]);
   const [loading, setLoading] = useState(false);
   const [selectedReservation, setSelectedReservation] = useState(null);
   const [showMonthPicker, setShowMonthPicker] = useState(false);
   const [expandedBuildings, setExpandedBuildings] = useState([]); // 전체보기 확장 상태
-  const [isCalendarFullscreen, setIsCalendarFullscreen] = useState(false);
-  const [portfolioPriceBuilding, setPortfolioPriceBuilding] = useState(ACTIVE_BUILDING_ORDER[0] || "");
 
   // 캘린더 드래그 스크롤 참조
   const calendarRef = React.useRef(null);
@@ -2692,18 +2422,6 @@ function BuildingCalendar() {
     setIsDraggingCalendar(false);
   };
 
-  const restoreCalendarViewport = useCallback((viewport) => {
-    if (!viewport) return;
-
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        if (!calendarRef.current) return;
-        calendarRef.current.scrollLeft = viewport.left;
-        calendarRef.current.scrollTop = viewport.top;
-      });
-    });
-  }, []);
-
   // 가격 설정 관련 state
   const [priceMode, setPriceMode] = useState(false);
   const [isDragging, setIsDragging] = useState(false); // 드래그 선택 상태 (가격모드에서 사용)
@@ -2713,7 +2431,6 @@ function BuildingCalendar() {
   // selectedCells에서 고유한 방만 추출 (편의를 위해)
   const selectedRooms = useMemo(() => [...new Set(selectedCells.map(c => c.room))], [selectedCells]);
   const selectedDates = useMemo(() => [...new Set(selectedCells.map(c => c.date))], [selectedCells]);
-  const selectedDateSet = useMemo(() => new Set(selectedDates), [selectedDates]);
   const getSelectedCellKey = useCallback((roomName, dateStr) => `${roomName}__${dateStr}`, []);
   const selectedCellKeySet = useMemo(
     () => new Set(selectedCells.map((cell) => getSelectedCellKey(cell.room, cell.date))),
@@ -2760,12 +2477,6 @@ function BuildingCalendar() {
   const priceJobListenersRef = useRef({});
   const [priceJobToast, setPriceJobToast] = useState(null);     // { status: 'success'|'error'|'partial'|'queued', message }
   const pendingPriceJobList = useMemo(() => Object.values(pendingPriceJobs), [pendingPriceJobs]);
-  const calendarBuilding = selectedBuilding === "전체" && (priceMode || gapEditMode) ? portfolioPriceBuilding : selectedBuilding;
-  const showBeds24DetailView = !!calendarBuilding && calendarBuilding !== "전체";
-  const [vacantOnlyMode, setVacantOnlyMode] = useState(false);
-  const toggleCalendarFullscreen = useCallback(() => {
-    setIsCalendarFullscreen((prev) => !prev);
-  }, []);
 
   // 모바일 전용 state
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
@@ -2785,32 +2496,8 @@ function BuildingCalendar() {
   }, [priceMode]);
 
   useEffect(() => {
-    selectedBuildingRef.current = calendarBuilding;
-  }, [calendarBuilding]);
-
-  useEffect(() => {
-    if (!isCalendarFullscreen) return undefined;
-
-    const prevBodyOverflow = document.body.style.overflow;
-    const prevHtmlOverflow = document.documentElement.style.overflow;
-
-    document.body.style.overflow = 'hidden';
-    document.documentElement.style.overflow = 'hidden';
-
-    const handleKeyDown = (event) => {
-      if (event.key === 'Escape') {
-        setIsCalendarFullscreen(false);
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-
-    return () => {
-      document.body.style.overflow = prevBodyOverflow;
-      document.documentElement.style.overflow = prevHtmlOverflow;
-      window.removeEventListener('keydown', handleKeyDown);
-    };
-  }, [isCalendarFullscreen]);
+    selectedBuildingRef.current = selectedBuilding;
+  }, [selectedBuilding]);
 
   useEffect(() => {
     priceCacheRef.current = priceCache;
@@ -3061,35 +2748,9 @@ function BuildingCalendar() {
   const year = currentDate.getFullYear();
   const month = currentDate.getMonth();
   const daysInMonth = getDaysInMonth(year, month);
-  const portfolioAnalysisRange = useMemo(() => {
-    const monthStart = dayjs(new Date(year, month, 1)).format("YYYY-MM-DD");
-    const monthEnd = dayjs(new Date(year, month, daysInMonth)).format("YYYY-MM-DD");
-    const validFrom = getResolvedDateInput(portfolioDateFrom);
-    const validTo = getResolvedDateInput(portfolioDateTo);
-
-    if (validFrom || validTo) {
-      const first = validFrom || validTo;
-      const last = validTo || validFrom;
-      const startDate = first <= last ? first : last;
-      const endDate = first <= last ? last : first;
-      return {
-        startDate,
-        endDate,
-        isCustom: true,
-        label: startDate === endDate ? startDate : `${startDate} ~ ${endDate}`
-      };
-    }
-
-    return {
-      startDate: monthStart,
-      endDate: monthEnd,
-      isCustom: false,
-      label: `${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][month]} ${year}`
-    };
-  }, [year, month, daysInMonth, portfolioDateFrom, portfolioDateTo]);
-  const rooms = useMemo(() => BUILDING_DATA[calendarBuilding] || [], [calendarBuilding]);
-  const currentBuildingLastPriceSync = calendarBuilding && calendarBuilding !== "전체"
-    ? (lastPriceSyncByBuilding[calendarBuilding] || null)
+  const rooms = useMemo(() => BUILDING_DATA[selectedBuilding] || [], [selectedBuilding]);
+  const currentBuildingLastPriceSync = selectedBuilding !== "전체"
+    ? (lastPriceSyncByBuilding[selectedBuilding] || null)
     : null;
   const pendingPriceCellMap = useMemo(() => {
     const cellMap = {};
@@ -3187,22 +2848,22 @@ function BuildingCalendar() {
 
   // 날짜별 활성 roomId 맵: minStay 50/99이면 비활성 판단, 1~49이면 활성
   const getMinStayForRoomIdDate = useCallback((roomId, dateStr) => {
-    if (!calendarBuilding || calendarBuilding === "전체") return null;
+    if (selectedBuilding === "전체") return null;
     const dateKey = dateStr.replace(/-/g, "");
     const priceInfo = roomPrices?.[String(roomId)]?.dates?.[dateKey];
     if (!priceInfo) return null;
     const ms = parseInt(priceInfo.m, 10);
     return Number.isFinite(ms) ? ms : null;
-  }, [calendarBuilding, roomPrices]);
+  }, [selectedBuilding, roomPrices]);
 
   const getPriceInfoForRoomIdDate = useCallback((roomId, dateStr) => {
-    if (!calendarBuilding || calendarBuilding === "전체") return null;
+    if (selectedBuilding === "전체") return null;
     const dateKey = dateStr.replace(/-/g, "");
     return roomPrices?.[String(roomId)]?.dates?.[dateKey] || null;
-  }, [calendarBuilding, roomPrices]);
+  }, [selectedBuilding, roomPrices]);
 
   const getActiveUnitInfosForDate = useCallback((roomName, dateStr) => {
-    const unitInfos = BUILDING_ROOMS[calendarBuilding]?.filter(r => r.name === roomName) || [];
+    const unitInfos = BUILDING_ROOMS[selectedBuilding]?.filter(r => r.name === roomName) || [];
     if (unitInfos.length <= 1) return unitInfos;
 
     // minStay >= INACTIVE_MINSTAY_THRESHOLD(50/99)이면 비활성 room으로 본다.
@@ -3214,17 +2875,17 @@ function BuildingCalendar() {
 
     // 활성화된 것이 없으면 전체 반환 (비활성화된 roomId로만 구성 가능한 방도 포함)
     return activeInfos;
-  }, [calendarBuilding, getMinStayForRoomIdDate]);
+  }, [selectedBuilding, getMinStayForRoomIdDate]);
 
   const getDisplayUnitInfosForDate = useCallback((roomName, dateStr) => {
     const dateKey = dateStr.replace(/-/g, "");
     const activeInfos = getActiveUnitInfosForDate(roomName, dateStr);
     if (activeInfos.length > 0) return activeInfos;
 
-    const allInfos = BUILDING_ROOMS[calendarBuilding]?.filter(r => r.name === roomName) || [];
+    const allInfos = BUILDING_ROOMS[selectedBuilding]?.filter(r => r.name === roomName) || [];
     const withData = allInfos.filter((info) => roomPrices[String(info.roomId)]?.dates?.[dateKey]);
     return withData.length > 0 ? withData : allInfos;
-  }, [calendarBuilding, getActiveUnitInfosForDate, roomPrices]);
+  }, [selectedBuilding, getActiveUnitInfosForDate, roomPrices]);
 
   const getMinStayFromUnitInfos = useCallback((unitInfos, dateStr) => {
     const dateKey = dateStr.replace(/-/g, "");
@@ -3248,10 +2909,10 @@ function BuildingCalendar() {
   }, [getDisplayUnitInfosForDate, getMinStayFromUnitInfos]);
 
   const isBeds24InventoryBlackoutForDate = useCallback((roomName, dateStr) => {
-    if (!calendarBuilding || calendarBuilding === "전체") return false;
+    if (selectedBuilding === "전체") return false;
 
     const dateKey = dateStr.replace(/-/g, "");
-    const allInfos = BUILDING_ROOMS[calendarBuilding]?.filter(r => r.name === roomName) || [];
+    const allInfos = BUILDING_ROOMS[selectedBuilding]?.filter(r => r.name === roomName) || [];
     if (allInfos.length === 0) return false;
 
     const activeInfos = getActiveUnitInfosForDate(roomName, dateStr);
@@ -3263,7 +2924,7 @@ function BuildingCalendar() {
       const priceInfo = roomPrices?.[String(info.roomId)]?.dates?.[dateKey];
       return String(priceInfo?.ov || "").toLowerCase() === "blackout";
     });
-  }, [calendarBuilding, getActiveUnitInfosForDate, roomPrices]);
+  }, [selectedBuilding, getActiveUnitInfosForDate, roomPrices]);
 
   // 날짜별 예약 여부 캐시 (드래그 선택용)
   useEffect(() => {
@@ -3279,13 +2940,7 @@ function BuildingCalendar() {
   const goToPrevMonth = () => setCurrentDate(new Date(year, month - 1, 1));
   const goToNextMonth = () => setCurrentDate(new Date(year, month + 1, 1));
   const goToToday = () => setCurrentDate(new Date());
-  const handleMonthSelect = (newYear, newMonth) => {
-    setCurrentDate(new Date(newYear, newMonth, 1));
-    if (selectedBuilding === "전체") {
-      setPortfolioDateFrom("");
-      setPortfolioDateTo("");
-    }
-  };
+  const handleMonthSelect = (newYear, newMonth) => setCurrentDate(new Date(newYear, newMonth, 1));
 
   // 롤링 뷰 이동 (30일 단위)
   const goToRollingNext = () => {
@@ -3316,74 +2971,27 @@ function BuildingCalendar() {
 
   // 가격 모드 토글
   const togglePriceMode = () => {
-    const preservedViewport = calendarRef.current
-      ? {
-          left: calendarRef.current.scrollLeft,
-          top: calendarRef.current.scrollTop
-        }
-      : null;
     const nextPriceMode = !priceMode;
     setPriceMode(nextPriceMode);
-    if (nextPriceMode) setGapEditMode(false);
     setSelectedRoom(null);
     setSelectedCells([]); // 초기화
     setSelectionStart(null); // 드래그 선택 중이었다면 초기화
     setHoveredDay(null);
     setHoveredRoom(null);
     // priceMode ON 진입 시: 캐시 없음 / 빈 데이터 / stale(5분 초과) 이상이면 fetch
-    if (nextPriceMode && calendarBuilding && calendarBuilding !== "전체") {
+    if (nextPriceMode && selectedBuilding !== "전체") {
       const cacheAge = currentBuildingLastPriceSync ? (Date.now() - currentBuildingLastPriceSync.getTime()) : Infinity;
       const isStale = cacheAge > 5 * 60 * 1000;
-      const hasNoCache = !priceCache[calendarBuilding];
+      const hasNoCache = !priceCache[selectedBuilding];
       const hasEmptyPrices = Object.keys(roomPrices).length === 0;
-      const hasIncompleteCache = !hasNoCache && !hasVisiblePriceCoverage(calendarBuilding, priceCache[calendarBuilding]);
+      const hasIncompleteCache = !hasNoCache && !hasVisiblePriceCoverage(selectedBuilding, priceCache[selectedBuilding]);
       if (hasNoCache || hasEmptyPrices) {
-        fetchPrices(false, calendarBuilding);
+        fetchPrices();
       } else if (isStale || hasIncompleteCache) {
-        fetchPrices(true, calendarBuilding);
+        fetchPrices(true);
       }
     }
-
-    restoreCalendarViewport(preservedViewport);
   };
-
-  const toggleMinStayEditMode = () => {
-    const nextGapMode = !gapEditMode;
-    setGapEditMode(nextGapMode);
-    if (nextGapMode) setPriceMode(false);
-    setSelectedCells([]);
-    setSelectedRoom(null);
-    setSelectionStart(null);
-    setHoveredDay(null);
-    setHoveredRoom(null);
-  };
-
-  const selectRedGapCells = () => {
-    const todayStr = dayjs().format('YYYY-MM-DD');
-    const gapCells = [];
-    gapCellSet.forEach(key => {
-      const [room, date] = key.split('__');
-      if (date < todayStr) return;
-      const gapInfo = getCheckInGapInfo(room, date);
-      gapCells.push({ room, date, roomId: gapInfo.resolvedRoomId || "" });
-    });
-    if (gapCells.length === 0) {
-      alert("No red gap cells (1 night available with minStay 2) found.");
-      return;
-    }
-    gapCells.sort((a, b) => a.room.localeCompare(b.room) || a.date.localeCompare(b.date));
-    setSelectedCells(gapCells);
-    setSelectedRoom(gapCells[0]?.room || null);
-  };
-
-  const toggleVacantOnlyMode = useCallback(() => {
-    setVacantOnlyMode((prev) => !prev);
-    setSelectedRoom(null);
-    setSelectedCells([]);
-    setSelectionStart(null);
-    setHoveredDay(null);
-    setHoveredRoom(null);
-  }, []);
 
   // 객실 선택 토글
   const toggleRoomSelection = (room) => {
@@ -3411,15 +3019,13 @@ function BuildingCalendar() {
 
   // 전체 객실 선택
   const toggleSelectAllRooms = () => {
-    if (allSelectableRoomsSelected) {
-      const selectableRoomSet = new Set(selectableRooms);
-      setSelectedCells(prev => prev.filter(c => !selectableRoomSet.has(c.room)));
-      const remaining = selectedRooms.filter(r => !selectableRoomSet.has(r));
-      setSelectedRoom(remaining.length > 0 ? remaining[remaining.length - 1] : null);
+    if (selectedRooms.length === rooms.length) {
+      setSelectedCells([]);
+      setSelectedRoom(null);
     } else {
       // 모든 방 × 현재 선택된 날짜들
       const newCells = [];
-      selectableRooms.forEach(room => {
+      rooms.forEach(room => {
         selectedDates.forEach(date => {
           if (!selectedCellKeySet.has(getSelectedCellKey(room, date))) {
             newCells.push({ room, date });
@@ -3427,7 +3033,7 @@ function BuildingCalendar() {
         });
       });
       setSelectedCells(prev => [...prev, ...newCells]);
-      setSelectedRoom(selectableRooms[0] || null); // 첫 번째 방을 기본으로
+      setSelectedRoom(rooms[0]); // 첫 번째 방을 기본으로
     }
   };
 
@@ -3463,7 +3069,7 @@ function BuildingCalendar() {
     });
 
     // 선택된 날짜와 방으로 셀 쌍 생성
-    const roomsToUse = selectedRooms.length > 0 ? selectedRooms : selectableRooms;
+    const roomsToUse = selectedRooms.length > 0 ? selectedRooms : rooms;
     const newCells = [];
     roomsToUse.forEach(room => {
       newDates.forEach(date => {
@@ -3473,6 +3079,72 @@ function BuildingCalendar() {
     setSelectedCells(newCells);
 
     // ✅ Bug #1 Fix: 첫 번째 방을 위해 selectedRoom 설정
+    if (roomsToUse.length > 0) {
+      setSelectedRoom(roomsToUse[0]);
+    }
+  };
+
+  // 주별 선택 (1주~5주 기준 적용)
+  const selectWeek = (weekIdx, filterType) => {
+    // weekIdx: 1~5
+    // filterType: 'all', 'weekday', 'weekend'
+    const newDates = [];
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    if (viewMode === "rolling") {
+      // Rolling View: displayDays를 7일 기준 주별로 나누어 선택
+      const startIdx = (weekIdx - 1) * 7;
+      const endIdx = weekIdx === 5 ? displayDays.length : weekIdx * 7;
+
+      for (let i = startIdx; i < endIdx && i < displayDays.length; i++) {
+        const d = displayDays[i];
+        if (d.date < today) continue;
+
+        const dayOfWeek = d.date.getDay();
+        let shouldSelect = false;
+        if (filterType === 'all') shouldSelect = true;
+        else if (filterType === 'weekend') shouldSelect = (dayOfWeek === 5 || dayOfWeek === 6 || dayOfWeek === 0);
+        else if (filterType === 'weekday') shouldSelect = (dayOfWeek >= 1 && dayOfWeek <= 4);
+
+        if (shouldSelect) newDates.push(d.dateStr);
+      }
+    } else {
+      // Monthly View: 기준 주 기반 반복
+      let startDay = (weekIdx - 1) * 7 + 1;
+      let endDay = weekIdx * 7;
+      if (weekIdx === 5) endDay = daysInMonth;
+
+      for (let i = startDay; i <= daysInMonth; i++) {
+        if (i > endDay) break;
+
+        const date = new Date(year, month, i);
+        if (date < today) continue;
+
+        const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(i).padStart(2, '0')}`;
+        const dayOfWeek = date.getDay();
+
+        let shouldSelect = false;
+        if (filterType === 'all') shouldSelect = true;
+        else if (filterType === 'weekend') shouldSelect = (dayOfWeek === 5 || dayOfWeek === 6 || dayOfWeek === 0);
+        else if (filterType === 'weekday') shouldSelect = (dayOfWeek >= 1 && dayOfWeek <= 4);
+
+        if (shouldSelect) newDates.push(dateStr);
+      }
+    }
+
+    // 선택된 날짜와 방으로 셀 쌍 추가 (기존)
+    const roomsToUse = selectedRooms.length > 0 ? selectedRooms : rooms;
+    const newCells = [];
+    roomsToUse.forEach(room => {
+      newDates.forEach(date => {
+        if (!selectedCellKeySet.has(getSelectedCellKey(room, date))) {
+          newCells.push({ room, date });
+        }
+      });
+    });
+    setSelectedCells(prev => [...prev, ...newCells]);
+
     if (roomsToUse.length > 0) {
       setSelectedRoom(roomsToUse[0]);
     }
@@ -3666,10 +3338,10 @@ function BuildingCalendar() {
 
   // 일반 모드/가격 모드 모두 날짜별 활성 roomId 결정을 위해 캐시 로드
   useEffect(() => {
-    if (calendarBuilding && calendarBuilding !== "전체") {
-      fetchPrices(false, calendarBuilding);
+    if (selectedBuilding !== "전체") {
+      fetchPrices();
     }
-  }, [calendarBuilding, fetchPrices]);
+  }, [selectedBuilding, fetchPrices]);
 
   // 선택 초기화 (건물 변경 시)
   useEffect(() => {
@@ -3805,10 +3477,7 @@ function BuildingCalendar() {
     try {
       // 뷰 모드에 따른 날짜 범위 계산
       let rangeStart, rangeEnd;
-      if (selectedBuilding === "전체") {
-        rangeStart = portfolioAnalysisRange.startDate;
-        rangeEnd = portfolioAnalysisRange.endDate;
-      } else if (viewMode === "rolling") {
+      if (viewMode === "rolling") {
         // 롤링 뷰: 시작일부터 30일
         rangeStart = dayjs(rollingStartDate).format('YYYY-MM-DD');
         rangeEnd = dayjs(rollingStartDate).add(30, 'day').format('YYYY-MM-DD');
@@ -3881,7 +3550,7 @@ function BuildingCalendar() {
     } finally {
       setLoading(false);
     }
-  }, [companyId, selectedBuilding, year, month, daysInMonth, showCancelled, viewMode, rollingStartDate, portfolioAnalysisRange.startDate, portfolioAnalysisRange.endDate]);
+  }, [companyId, selectedBuilding, year, month, daysInMonth, showCancelled, viewMode, rollingStartDate]);
 
   // 예약 데이터 재조회 트리거
   useEffect(() => {
@@ -3889,7 +3558,7 @@ function BuildingCalendar() {
   }, [fetchReservations]);
 
   const externalInventoryBlocks = useMemo(() => {
-    if (!calendarBuilding || calendarBuilding === '전체' || displayDays.length === 0 || rooms.length === 0) return [];
+    if (selectedBuilding === '전체' || displayDays.length === 0 || rooms.length === 0) return [];
 
     const blocks = [];
 
@@ -3920,10 +3589,10 @@ function BuildingCalendar() {
         if ((!isInventoryBlocked || isLastDay) && blockStart && lastBlockedDate) {
           const blockEndDate = isInventoryBlocked && isLastDay ? dateStr : lastBlockedDate;
           blocks.push({
-            id: `inventory-blackout:${calendarBuilding}:${room}:${blockStart}:${blockEndDate}`,
-            bookId: `inventory-blackout:${calendarBuilding}:${room}:${blockStart}:${blockEndDate}`,
+            id: `inventory-blackout:${selectedBuilding}:${room}:${blockStart}:${blockEndDate}`,
+            bookId: `inventory-blackout:${selectedBuilding}:${room}:${blockStart}:${blockEndDate}`,
             companyId,
-            building: calendarBuilding,
+            building: selectedBuilding,
             room,
             guestName: "Beds24 Block",
             arrival: blockStart,
@@ -3943,7 +3612,7 @@ function BuildingCalendar() {
     });
 
     return blocks;
-  }, [calendarBuilding, companyId, displayDays, isBeds24InventoryBlackoutForDate, reservations, rooms]);
+  }, [companyId, displayDays, isBeds24InventoryBlackoutForDate, reservations, rooms, selectedBuilding]);
 
   const isSameCalendarBlock = useCallback((left, right) => {
     if (!left || !right) return false;
@@ -3993,7 +3662,6 @@ function BuildingCalendar() {
 
     rooms.forEach(room => {
       map[room] = calendarReservations.filter((r) =>
-        r.building === calendarBuilding &&
         r.room === room &&
         r.status !== 'cancelled' &&
         r.arrival &&
@@ -4002,18 +3670,17 @@ function BuildingCalendar() {
     });
 
     return map;
-  }, [calendarBuilding, calendarReservations, rooms]);
+  }, [calendarReservations, rooms]);
 
   // 객실명 + 실제 roomId 기준 전체 예약 목록 (듀얼 객실 1박 gap 판정용)
   const roomAllReservationsByUnitMap = useMemo(() => {
     const map = {};
-    const roomCatalog = BUILDING_ROOMS[calendarBuilding] || [];
+    const roomCatalog = BUILDING_ROOMS[selectedBuilding] || [];
 
     rooms.forEach((room) => {
       const roomInfos = roomCatalog.filter((info) => info.name === room);
       roomInfos.forEach((info) => {
         map[`${room}__${String(info.roomId)}`] = calendarReservations.filter((r) =>
-          r.building === calendarBuilding &&
           r.room === room &&
           String(r.roomId || "") === String(info.roomId) &&
           r.status !== "cancelled" &&
@@ -4024,7 +3691,7 @@ function BuildingCalendar() {
     });
 
     return map;
-  }, [calendarBuilding, calendarReservations, rooms]);
+  }, [calendarReservations, rooms, selectedBuilding]);
 
   // 객실별 예약 목록
   const roomReservationsMap = useMemo(() => {
@@ -4034,7 +3701,7 @@ function BuildingCalendar() {
     const viewEndExclusive = viewEnd ? dayjs(viewEnd).add(1, 'day').format('YYYY-MM-DD') : null;
 
     rooms.forEach(room => {
-      const roomAll = calendarReservations.filter(r => r.building === calendarBuilding && r.room === room);
+      const roomAll = calendarReservations.filter(r => r.room === room);
       map[room] = roomAll.filter((r) => {
         if (!r.arrival || !r.departure || !viewStart || !viewEndExclusive) return false;
         const start = r.arrival > viewStart ? r.arrival : viewStart;
@@ -4043,37 +3710,7 @@ function BuildingCalendar() {
       });
     });
     return map;
-  }, [calendarBuilding, calendarReservations, rooms, displayDays]);
-
-  const roomsVacantTodaySet = useMemo(() => {
-    const set = new Set();
-    const todayStr = dayjs().format('YYYY-MM-DD');
-
-    rooms.forEach((room) => {
-      const isBookedToday = (roomReservationsMap[room] || []).some((reservation) =>
-        reservation.status !== "cancelled" &&
-        reservation.status !== "blackout" &&
-        !reservation.isExternalInventoryBlock &&
-        !reservation.isInventoryOverrideBlock &&
-        todayStr >= reservation.arrival &&
-        todayStr < reservation.departure
-      );
-
-      if (!isBookedToday) {
-        set.add(room);
-      }
-    });
-
-    return set;
-  }, [roomReservationsMap, rooms]);
-
-  const visibleRooms = useMemo(() => {
-    if (!vacantOnlyMode) return rooms;
-    return rooms.filter((room) => roomsVacantTodaySet.has(room));
-  }, [rooms, roomsVacantTodaySet, vacantOnlyMode]);
-
-  const selectableRooms = vacantOnlyMode ? visibleRooms : rooms;
-  const allSelectableRoomsSelected = selectableRooms.length > 0 && selectableRooms.every((room) => selectedRooms.includes(room));
+  }, [calendarReservations, rooms, displayDays]);
 
   // Gap detection helper: check-in on this date → only 1 sellable night → minStay 2 → red gap.
   // Row-level vacancy uses roomReservationsMap (same source as cell renderer isFullyOccupied).
@@ -4098,8 +3735,8 @@ function BuildingCalendar() {
       return { resolvedRoomId: null, isVacant: true, availableNightsFromDate: 0, cellMinStay, isOneNightMinStayGap: false };
     }
 
-    const roomInfos = calendarBuilding && calendarBuilding !== '전체'
-      ? (BUILDING_ROOMS[calendarBuilding]?.filter((info) => info.name === roomName) || [])
+    const roomInfos = selectedBuilding !== '전체'
+      ? (BUILDING_ROOMS[selectedBuilding]?.filter((info) => info.name === roomName) || [])
       : [];
 
     if (roomInfos.length === 0) {
@@ -4180,35 +3817,6 @@ function BuildingCalendar() {
       return { status: "available", reason: "sellable" };
     };
 
-    const getDualRoomPhysicalStatus = (targetDateStr) => {
-      if (overlapsDate(genericUnknownReservations, targetDateStr)) {
-        return { status: "unknown", reason: "generic_reservation_without_roomid" };
-      }
-      if (overlapsDate(genericBlockingReservations, targetDateStr)) {
-        return { status: "blocked", reason: "generic_block_without_roomid" };
-      }
-
-      const activeInfos = roomInfos.filter((info) => {
-        const targetPriceInfo = getPriceInfoForRoomIdDate(info.roomId, targetDateStr);
-        const ms = parseInt(targetPriceInfo?.m, 10);
-        return Number.isFinite(ms) &&
-          ms >= 1 &&
-          ms < INACTIVE_MINSTAY_THRESHOLD &&
-          String(targetPriceInfo?.ov || "").toLowerCase() !== "blackout";
-      });
-
-      if (activeInfos.length === 0) {
-        return { status: "blocked", reason: "no_active_roomid" };
-      }
-      if (activeInfos.length > 1) {
-        return { status: "unknown", reason: "multiple_active_roomids" };
-      }
-      if (overlapsDate(buildUnitReservations(activeInfos[0].roomId), targetDateStr)) {
-        return { status: "blocked", reason: "active_roomid_reserved_or_blocked" };
-      }
-      return { status: "available", reason: "physical_room_sellable" };
-    };
-
     let resolvedRoomId = null;
     let currentDateStatusInfo = { status: "unknown", reason: "unresolved_roomid" };
     if (roomInfos.length === 1) {
@@ -4246,7 +3854,7 @@ function BuildingCalendar() {
       ? { status: "past", reason: "before_today" }
       : roomInfos.length === 1
         ? getSingleRoomStatus(previousDateStr, resolvedRoomId)
-        : getDualRoomPhysicalStatus(previousDateStr);
+        : getDualRoomStatus(previousDateStr, resolvedRoomId);
     const nextDateStatusInfo = roomInfos.length === 1
       ? getSingleRoomStatus(nextDateStr, resolvedRoomId)
       : getDualRoomStatus(nextDateStr, resolvedRoomId);
@@ -4273,7 +3881,7 @@ function BuildingCalendar() {
       nextDateStatus: nextDateStatusInfo.status,
       nextDateReason: nextDateStatusInfo.reason
     };
-  }, [calendarBuilding, roomAllReservationsByUnitMap, roomAllReservationsMap, roomReservationsMap, getCellMinStayForDate, getPriceInfoForRoomIdDate]);
+  }, [roomAllReservationsByUnitMap, roomAllReservationsMap, roomReservationsMap, selectedBuilding, getCellMinStayForDate, getPriceInfoForRoomIdDate]);
 
   // Gap cell set: only cells where check-in → 1 sellable night AND displayed minStay === 2.
   // Uses getCheckInGapInfo (row-level vacancy + dual-roomId safe).
@@ -4307,31 +3915,30 @@ function BuildingCalendar() {
       const bReservations = calendarReservations.filter(r => r.building === bName);
       const bRooms = BUILDING_ROOMS[bName] || [];
       result[bName] = {
-        metrics: calculateBuildingMetricsForRange(bReservations, bRooms, portfolioAnalysisRange.startDate, portfolioAnalysisRange.endDate),
+        metrics: calculateBuildingMetrics(bReservations, bRooms, daysInMonth, year, month),
         roomMetrics: {}
       };
       const uniqueRoomNames = [...new Set(bRooms.map(r => r.name))];
       uniqueRoomNames.forEach(roomName => {
         const rReservations = bReservations.filter(r => r.room === roomName);
         const roomInfosForName = bRooms.filter(r => r.name === roomName);
-        result[bName].roomMetrics[roomName] = calculateBuildingMetricsForRange(rReservations, roomInfosForName, portfolioAnalysisRange.startDate, portfolioAnalysisRange.endDate);
+        result[bName].roomMetrics[roomName] = calculateBuildingMetrics(rReservations, roomInfosForName, daysInMonth, year, month);
       });
     });
     return result;
-  }, [calendarReservations, selectedBuilding, portfolioAnalysisRange.startDate, portfolioAnalysisRange.endDate]);
+  }, [calendarReservations, selectedBuilding, daysInMonth, year, month]);
 
   // ✅ min/maxPrice 계산은 별도로 처리 (API 데이터 기반)
   const priceStats = useMemo(() => {
     let minPrice = Infinity;
     let maxPrice = 0;
-    if (calendarBuilding && calendarBuilding !== '전체') {
+    if (selectedBuilding !== '전체') {
       // displayDays 기준으로 현재 화면에 보이는 날짜만 추려냄
       for (const { dateStr } of displayDays) {
         const dateKey = dateStr.replace(/-/g, '');
 
         for (const roomName of rooms) {
           const isReserved = calendarReservations.some(r =>
-            r.building === calendarBuilding &&
             r.room === roomName &&
             r.arrival <= dateStr &&
             r.departure > dateStr
@@ -4352,51 +3959,10 @@ function BuildingCalendar() {
       }
     }
     return { minPrice: minPrice === Infinity ? 0 : minPrice, maxPrice };
-  }, [calendarBuilding, calendarReservations, rooms, displayDays, roomPrices, getActiveUnitInfosForDate]);
+  }, [calendarReservations, rooms, displayDays, roomPrices, selectedBuilding, getActiveUnitInfosForDate]);
 
   // analysis 객실에 min/max 업데이트 (Single View 전용 편의)
   const singleAnalysis = { ...analysis, ...priceStats };
-  const commissionSummary = useMemo(() => {
-    if (!calendarBuilding || calendarBuilding === "전체") return { airbnb: 0, booking: 0, total: 0 };
-    const buildingReservations = calendarReservations.filter((reservation) => reservation.building === calendarBuilding);
-    return calculateCommissionSummary(buildingReservations, displayDays);
-  }, [calendarBuilding, calendarReservations, displayDays]);
-  const arrivalCountSummary = useMemo(() => {
-    if (!calendarBuilding || calendarBuilding === "전체") return { airbnb: 0, booking: 0, direct: 0, total: 0 };
-    const buildingReservations = calendarReservations.filter((reservation) => reservation.building === calendarBuilding);
-    return calculateArrivalCountSummary(buildingReservations, displayDays);
-  }, [calendarBuilding, calendarReservations, displayDays]);
-  const futureVacancySummary = useMemo(() => {
-    if (!calendarBuilding || calendarBuilding === "전체") return { vacantRoomNights: 0, totalRoomNights: 0, days: 0, avgVacantRooms: 0 };
-
-    const todayStr = dayjs().format("YYYY-MM-DD");
-    const futureDays = displayDays.filter((dayInfo) => dayInfo.dateStr >= todayStr);
-    let vacantRoomNights = 0;
-
-    futureDays.forEach(({ dateStr }) => {
-      rooms.forEach((room) => {
-        const isUnavailable = (roomReservationsMap[room] || []).some((reservation) =>
-          reservation.status !== "cancelled" &&
-          reservation.status !== "inquiry" &&
-          dateStr >= reservation.arrival &&
-          dateStr < reservation.departure
-        );
-
-        if (!isUnavailable) {
-          vacantRoomNights += 1;
-        }
-      });
-    });
-
-    const totalRoomNights = futureDays.length * rooms.length;
-
-    return {
-      vacantRoomNights,
-      totalRoomNights,
-      days: futureDays.length,
-      avgVacantRooms: futureDays.length > 0 ? vacantRoomNights / futureDays.length : 0
-    };
-  }, [calendarBuilding, displayDays, roomReservationsMap, rooms]);
 
 
 
@@ -4471,6 +4037,7 @@ function BuildingCalendar() {
     let displayText = isInventoryLikeBlock
       ? "[Beds24 Block]"
       : `${isCancelled ? "[Cancelled] " : ""}${isBlackout ? "[Block] " : ""}${guestName}`;
+    if (!isBlackout) displayText += ` ${formatPrice(reservation.totalPrice || reservation.price)}`;
 
     // ✅ 예약 감지: 같은 room에서 날짜가 겹치는 non-cancelled 예약 목록
     const overlapGroup = (roomReservationsMap[reservation.room] || []).filter(r =>
@@ -4487,27 +4054,12 @@ function BuildingCalendar() {
       (r.bookId || r.id) === (reservation.bookId || reservation.id)
     );
     const barIndex = overlapIndex >= 0 ? overlapIndex : 0;
-    const reservationTrackHeight = showBeds24DetailView
-      ? BEDS24_DETAIL_RESERVATION_TRACK_HEIGHT
-      : 40;
-    const barSlotHeight = reservationTrackHeight / Math.max(totalCount, 1);
-    const barHeight = totalCount > 1
-      ? Math.max(9, Math.floor(barSlotHeight) - 2)
-      : reservationTrackHeight;
-    const barTop = showBeds24DetailView
-      ? `${BEDS24_DETAIL_RESERVATION_TRACK_TOP + (barIndex * barSlotHeight)}px`
-      : totalCount > 1
-        ? `${(barIndex / totalCount) * 100}%`
-        : "50%";
-    const barTransform = showBeds24DetailView
-      ? "none"
-      : totalCount > 1
-        ? "none"
-        : "translateY(-50%)";
+    const barHeight = totalCount > 1 ? Math.floor(40 / totalCount) : 40;
+    const barTop = totalCount > 1 ? `${(barIndex / totalCount) * 100}%` : "50%";
+    const barTransform = totalCount > 1 ? "none" : "translateY(-50%)";
 
     const isManualCheckoutTargetActive = !!selectionStart && !priceMode && !gapEditMode && selectionStart.room === reservation.room;
     const allowPriceEditThroughBlock = !!priceMode && (isBlackout || isInventoryLikeBlock);
-    const isPastReservation = dayjs(reservation.departure).startOf('day').valueOf() <= dayjs().startOf('day').valueOf();
 
     return (
       <div
@@ -4525,54 +4077,38 @@ function BuildingCalendar() {
           height: `${barHeight}px`,
           backgroundColor: platformColor,
           border: isCancelled ? "1.5px dashed rgba(255,255,255,0.5)" : "none",
-          opacity: isCancelled ? 0.56 : (allowPriceEditThroughBlock ? 0.3 : (isPastReservation ? 0.44 : (showBeds24DetailView ? 0.94 : 1))),
-          borderRadius: showBeds24DetailView ? "5px" : "8px",
+          opacity: isCancelled ? 0.6 : (allowPriceEditThroughBlock ? 0.35 : 1),
+          borderRadius: "8px",
           color: "white",
-          fontSize: showBeds24DetailView ? "9px" : "11px",
-          fontWeight: showBeds24DetailView ? "600" : "700",
-          padding: showBeds24DetailView ? "1px 6px" : "4px 10px",
+          fontSize: "11px",
+          fontWeight: "700",
+          padding: "4px 10px",
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
           cursor: (isManualCheckoutTargetActive || isInventoryLikeBlock || allowPriceEditThroughBlock) ? "default" : "pointer",
-          boxShadow: isCancelled
-            ? "none"
-            : (showBeds24DetailView
-              ? "0 1px 4px rgba(15, 23, 42, 0.14)"
-              : "0 4px 8px rgba(0,0,0,0.15), inset 0 1px 1px rgba(255,255,255,0.2)"),
+          boxShadow: isCancelled ? "none" : "0 4px 8px rgba(0,0,0,0.15), inset 0 1px 1px rgba(255,255,255,0.2)",
           transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
           zIndex: isCancelled ? 5 : (isBlackout ? 6 : 10),
           backgroundImage: isBlackout
             ? "repeating-linear-gradient(45deg, transparent, transparent 10px, rgba(255,255,255,0.05) 10px, rgba(255,255,255,0.05) 20px)"
-            : (showBeds24DetailView
-              ? "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(0,0,0,0.02) 100%)"
-              : "linear-gradient(180deg, rgba(255,255,255,0.1) 0%, rgba(0,0,0,0.05) 100%)"),
+            : "linear-gradient(180deg, rgba(255,255,255,0.1) 0%, rgba(0,0,0,0.05) 100%)",
           display: "flex",
           alignItems: "center",
-          gap: showBeds24DetailView ? "4px" : "6px",
+          gap: "6px",
           pointerEvents: (isManualCheckoutTargetActive || allowPriceEditThroughBlock) ? "none" : "auto"
         }}
         onMouseEnter={(e) => {
           if (isManualCheckoutTargetActive || isInventoryLikeBlock || allowPriceEditThroughBlock) return;
-          const hoverTransform = showBeds24DetailView
-            ? "translateY(-1px) scale(1.01)"
-            : totalCount > 1
-              ? "scale(1.01)"
-              : "translateY(-50%) translateY(-1px) scale(1.01)";
+          const hoverTransform = totalCount > 1 ? "scale(1.01)" : "translateY(-50%) translateY(-1px) scale(1.01)";
           e.currentTarget.style.transform = hoverTransform;
-          e.currentTarget.style.boxShadow = showBeds24DetailView
-            ? "0 2px 8px rgba(15, 23, 42, 0.18)"
-            : "0 6px 12px rgba(0,0,0,0.25), inset 0 1px 1px rgba(255,255,255,0.3)";
+          e.currentTarget.style.boxShadow = "0 6px 12px rgba(0,0,0,0.25), inset 0 1px 1px rgba(255,255,255,0.3)";
           e.currentTarget.style.zIndex = 25;
         }}
         onMouseLeave={(e) => {
           if (isManualCheckoutTargetActive || isInventoryLikeBlock || allowPriceEditThroughBlock) return;
           e.currentTarget.style.transform = barTransform;
-          e.currentTarget.style.boxShadow = isCancelled
-            ? "none"
-            : (showBeds24DetailView
-              ? "0 1px 4px rgba(15, 23, 42, 0.14)"
-              : "0 4px 8px rgba(0,0,0,0.15), inset 0 1px 1px rgba(255,255,255,0.2)");
+          e.currentTarget.style.boxShadow = isCancelled ? "none" : "0 4px 8px rgba(0,0,0,0.15), inset 0 1px 1px rgba(255,255,255,0.2)";
           e.currentTarget.style.zIndex = isCancelled ? 5 : (isBlackout ? 6 : 10);
         }}
         title={isInventoryLikeBlock
@@ -4581,11 +4117,11 @@ function BuildingCalendar() {
       >
         <span style={{
           display: "inline-block",
-          width: showBeds24DetailView ? "5px" : "6px",
-          height: showBeds24DetailView ? "5px" : "6px",
+          width: "6px",
+          height: "6px",
           borderRadius: "50%",
           backgroundColor: "white",
-          boxShadow: showBeds24DetailView ? "none" : "0 0 4px rgba(255,255,255,0.8)"
+          boxShadow: "0 0 4px rgba(255,255,255,0.8)"
         }}></span>
         <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>{displayText}</span>
       </div>
@@ -5039,7 +4575,7 @@ function BuildingCalendar() {
         {/* 가격 설정 모달 */}
         {showPriceModal && selectedRoom && (
           <PriceSettingModal
-            building={calendarBuilding}
+            building={selectedBuilding}
             room={selectedRoom}
             selectedDates={selectedDates}
             roomPrices={roomPrices}
@@ -5049,10 +4585,10 @@ function BuildingCalendar() {
               setSelectedRoom(null);
               setPriceCache(prev => {
                 const newCache = { ...prev };
-                delete newCache[calendarBuilding];
+                delete newCache[selectedBuilding];
                 return newCache;
               });
-              fetchPrices(true, calendarBuilding);
+              fetchPrices(true);
             }}
             onJobQueued={({ jobId, roomCount, pendingCells = [] }) => {
               setSelectedCells([]);
@@ -5065,7 +4601,7 @@ function BuildingCalendar() {
                 ...prev,
                 [jobId]: {
                   jobId,
-                  building: calendarBuilding,
+                  building: selectedBuilding,
                   roomCount,
                   status: "queued",
                   pendingCells: pendingCellsByKey,
@@ -5224,8 +4760,8 @@ function BuildingCalendar() {
                       });
 
                       setPriceCache(prev => {
-                        if (!prev[calendarBuilding]) return prev;
-                        const updatedBuilding = { ...prev[calendarBuilding] };
+                        if (!prev[selectedBuilding]) return prev;
+                        const updatedBuilding = { ...prev[selectedBuilding] };
 
                         Object.entries(optimisticPatchMap).forEach(([roomId, dateKeySet]) => {
                           const roomEntry = updatedBuilding[roomId];
@@ -5240,7 +4776,7 @@ function BuildingCalendar() {
                           updatedBuilding[roomId] = { ...roomEntry, dates: nextDates };
                         });
 
-                        return { ...prev, [calendarBuilding]: updatedBuilding };
+                        return { ...prev, [selectedBuilding]: updatedBuilding };
                       });
 
                       // ✅ 2단계: 낙관적 업데이트 후 API 호출 (병렬 처리)
@@ -5249,7 +4785,7 @@ function BuildingCalendar() {
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
                           companyId,
-                          building: calendarBuilding,
+                          building: selectedBuilding,
                           cells: cellTargets
                         })
                       })
@@ -5325,7 +4861,7 @@ function BuildingCalendar() {
                       setSelectedRoom(null);
 
                       // ✅ 4단계: 최신 서버에서 최종 가격 새로고침 (Beds24 실제 상태 반영)
-                      fetchPrices(true, calendarBuilding);
+                      fetchPrices(true);
 
                     } catch (error) {
                       console.error("[Gap Apply] Fatal error:", error);
@@ -5633,7 +5169,7 @@ function BuildingCalendar() {
             </p>
           </div>
           <div style={{ display: "flex", gap: "12px" }}>
-        {!priceMode && (
+        {!priceMode && selectedBuilding !== "전체" && (
               <>
                 <button
                   onClick={() => setShowCancelled(!showCancelled)}
@@ -5770,7 +5306,7 @@ function BuildingCalendar() {
         </div>
 
         {/* 전체 선택 시 통계 표시 섹션 */}
-          {selectedBuilding === "전체" && !priceMode ? (
+          {selectedBuilding === "전체" ? (
           <div style={{
             background: "white",
             borderRadius: "20px",
@@ -5792,135 +5328,8 @@ function BuildingCalendar() {
                 <line x1="12" y1="20" x2="12" y2="4" />
                 <line x1="6" y1="20" x2="6" y2="14" />
               </svg>
-              {portfolioAnalysisRange.label} Portfolio Overview
+              {["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][month]} {year} Portfolio Overview
             </h3>
-
-            <div style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: "14px",
-              flexWrap: "wrap",
-              marginBottom: "22px",
-              padding: "12px 14px",
-              borderRadius: "14px",
-              background: "linear-gradient(135deg, #F8FAFC 0%, #FFFFFF 100%)",
-              border: "1px solid #E5E7EB"
-            }}>
-              <button
-                onClick={() => setShowMonthPicker(true)}
-                style={{
-                  padding: "9px 14px",
-                  borderRadius: "10px",
-                  border: "1px solid #D1D5DB",
-                  background: portfolioAnalysisRange.isCustom ? "white" : "linear-gradient(135deg, #1F2937 0%, #111827 100%)",
-                  color: portfolioAnalysisRange.isCustom ? "#374151" : "white",
-                  cursor: "pointer",
-                  fontWeight: "700",
-                  fontSize: "13px",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "8px",
-                  boxShadow: portfolioAnalysisRange.isCustom ? "none" : "0 4px 12px rgba(31,41,55,0.16)"
-                }}
-              >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <rect x="3" y="4" width="18" height="18" rx="2" />
-                  <line x1="16" y1="2" x2="16" y2="6" />
-                  <line x1="8" y1="2" x2="8" y2="6" />
-                  <line x1="3" y1="10" x2="21" y2="10" />
-                </svg>
-                Monthly Search
-              </button>
-
-              <div style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "8px",
-                padding: "6px 10px",
-                borderRadius: "10px",
-                background: "#FFFFFF",
-                border: "1px solid #E5E5EA",
-                flexWrap: "wrap"
-              }}>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  maxLength={10}
-                  value={portfolioDateFrom}
-                  onChange={e => setPortfolioDateFrom(normalizeDateInput(e.target.value))}
-                  placeholder="From YYYY-MM-DD"
-                  style={{
-                    width: "132px",
-                    padding: "7px 10px",
-                    borderRadius: "8px",
-                    border: "1px solid #D1D1D6",
-                    fontSize: "12px",
-                    color: "#1D1D1F",
-                    background: "#FFFFFF",
-                    outline: "none",
-                    fontVariantNumeric: "tabular-nums"
-                  }}
-                />
-                <span style={{ fontSize: "12px", color: "#AEAEB2" }}>~</span>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  maxLength={10}
-                  value={portfolioDateTo}
-                  onChange={e => setPortfolioDateTo(normalizeDateInput(e.target.value))}
-                  placeholder="To YYYY-MM-DD"
-                  style={{
-                    width: "124px",
-                    padding: "7px 10px",
-                    borderRadius: "8px",
-                    border: "1px solid #D1D1D6",
-                    fontSize: "12px",
-                    color: "#1D1D1F",
-                    background: "#FFFFFF",
-                    outline: "none",
-                    fontVariantNumeric: "tabular-nums"
-                  }}
-                />
-                <button
-                  onClick={() => {
-                    const todayKey = dayjs().format("YYYY-MM-DD");
-                    setPortfolioDateFrom(todayKey);
-                    setPortfolioDateTo(todayKey);
-                  }}
-                  style={{
-                    padding: "6px 10px",
-                    borderRadius: "8px",
-                    border: "1px solid #D1D1D6",
-                    background: "#F8FAFC",
-                    color: "#334155",
-                    fontSize: "12px",
-                    fontWeight: "600",
-                    cursor: "pointer"
-                  }}
-                >
-                  Today
-                </button>
-                <button
-                  onClick={() => {
-                    setPortfolioDateFrom("");
-                    setPortfolioDateTo("");
-                  }}
-                  style={{
-                    padding: "6px 10px",
-                    borderRadius: "8px",
-                    border: "1px solid #D1D1D6",
-                    background: "#FFFFFF",
-                    color: "#6B7280",
-                    fontSize: "12px",
-                    fontWeight: "600",
-                    cursor: "pointer"
-                  }}
-                >
-                  Clear
-                </button>
-              </div>
-            </div>
 
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "14px" }}>
               <thead>
@@ -5929,7 +5338,7 @@ function BuildingCalendar() {
                   <th style={{ padding: "14px 16px", textAlign: "center", fontWeight: "600", color: "#374151" }}>Occupancy</th>
                   <th style={{ padding: "14px 16px", textAlign: "center", fontWeight: "600", color: "#374151" }}>Vacant</th>
                   <th style={{ padding: "14px 16px", textAlign: "right", fontWeight: "600", color: "#374151" }}>Avg. Rate</th>
-                  <th style={{ padding: "14px 16px", textAlign: "right", borderRadius: "0 10px 10px 0", fontWeight: "600", color: "#374151" }}>Revenue</th>
+                  <th style={{ padding: "14px 16px", textAlign: "right", borderRadius: "0 10px 10px 0", fontWeight: "600", color: "#374151" }}>Net Revenue</th>
                 </tr>
               </thead>
               <tbody>
@@ -6098,54 +5507,6 @@ function BuildingCalendar() {
                       )}
                     </div>
                   </div>
-                  {selectedBuilding === "전체" && (
-                    <div style={{
-                      marginTop: "18px",
-                      paddingTop: "18px",
-                      borderTop: "1px solid rgba(245, 158, 11, 0.22)"
-                    }}>
-                      <div style={{
-                        fontSize: "12px",
-                        fontWeight: "700",
-                        color: "#92400E",
-                        marginBottom: "10px",
-                        letterSpacing: "0.02em"
-                      }}>
-                        Editing Property In All Properties View
-                      </div>
-                      <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-                        {ACTIVE_BUILDING_ORDER.map((building) => {
-                          const isActive = portfolioPriceBuilding === building;
-                          return (
-                            <button
-                              key={`portfolio-price-${building}`}
-                              onClick={() => {
-                                setPortfolioPriceBuilding(building);
-                                setSelectedCells([]);
-                                setSelectedRoom(null);
-                              }}
-                              style={{
-                                padding: "8px 12px",
-                                borderRadius: "999px",
-                                border: isActive ? "none" : "1px solid #FCD34D",
-                                background: isActive
-                                  ? "linear-gradient(135deg, #1F2937 0%, #111827 100%)"
-                                  : "rgba(255,255,255,0.84)",
-                                color: isActive ? "white" : "#92400E",
-                                fontSize: "12px",
-                                fontWeight: "700",
-                                cursor: "pointer",
-                                boxShadow: isActive ? "0 4px 12px rgba(15, 23, 42, 0.22)" : "none",
-                                transition: "all 0.2s"
-                              }}
-                            >
-                              {getBuildingNameEN(building)}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
                   <div style={{ display: "flex", gap: "10px" }}>
                     <button
                       onClick={() => navigate('/price-history')}
@@ -6466,11 +5827,11 @@ function BuildingCalendar() {
                       style={{
                         padding: "8px 14px",
                         borderRadius: "8px",
-                        border: allSelectableRoomsSelected ? "none" : "1px solid #D1D5DB",
-                        background: allSelectableRoomsSelected
+                        border: selectedRooms.length === rooms.length ? "none" : "1px solid #D1D5DB",
+                        background: selectedRooms.length === rooms.length
                           ? "linear-gradient(135deg, #1F2937 0%, #111827 100%)"
                           : "white",
-                        color: allSelectableRoomsSelected ? "white" : "#374151",
+                        color: selectedRooms.length === rooms.length ? "white" : "#374151",
                         fontSize: "12px",
                         cursor: "pointer",
                         fontWeight: "600",
@@ -6478,15 +5839,15 @@ function BuildingCalendar() {
                         alignItems: "center",
                         gap: "6px",
                         transition: "all 0.2s",
-                        boxShadow: allSelectableRoomsSelected ? "0 2px 8px rgba(31, 41, 55, 0.3)" : "none"
+                        boxShadow: selectedRooms.length === rooms.length ? "0 2px 8px rgba(31, 41, 55, 0.3)" : "none"
                       }}
                     >
-                      {allSelectableRoomsSelected && (
+                      {selectedRooms.length === rooms.length && (
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
                           <polyline points="20 6 9 17 4 12" />
                         </svg>
                       )}
-                      {allSelectableRoomsSelected ? "Deselect All" : "Select All Rooms"}
+                      {selectedRooms.length === rooms.length ? "Deselect All" : "Select All Rooms"}
                     </button>
                   </div>
                   <div style={{ width: "1px", height: "24px", background: "#E5E7EB" }}></div>
@@ -6551,152 +5912,98 @@ function BuildingCalendar() {
                     </button>
                   </div>
                 </div>
+
+                {/* Row 2: 주별 선택 슬라이더(스크롤) - Premium Design */}
+                <div style={{ marginTop: "20px", paddingTop: "20px", borderTop: "1px solid #FCD34D" }}>
+                  <div style={{ fontSize: "14px", fontWeight: "600", marginBottom: "14px", color: "#92400E", display: "flex", alignItems: "center", gap: "8px" }}>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+                      <line x1="16" y1="2" x2="16" y2="6" />
+                      <line x1="8" y1="2" x2="8" y2="6" />
+                      <line x1="3" y1="10" x2="21" y2="10" />
+                    </svg>
+                    <span>Weekly Selection</span>
+                    <span style={{ fontSize: "12px", color: "#B45309", fontWeight: "400" }}>(Click to add specific weeks)</span>
+                  </div>
+                  <div style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(5, 1fr)",
+                    gap: "14px",
+                    background: "white",
+                    padding: "18px",
+                    borderRadius: "14px",
+                    border: "1px solid #E5E7EB",
+                    boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
+                  }}>
+                    {[1, 2, 3, 4, 5].map(week => (
+                      <div key={week} style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                        <div style={{
+                          fontSize: "13px",
+                          fontWeight: "700",
+                          color: "#374151",
+                          textAlign: "center",
+                          marginBottom: "6px",
+                          padding: "6px",
+                          background: "#F9FAFB",
+                          borderRadius: "6px"
+                        }}>
+                          Week {week}
+                        </div>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); selectWeek(week, 'all'); }}
+                          style={{ ...filterBtnStyle, background: "#F3F4F6", border: "none", fontWeight: "600", color: "#374151" }}
+                        >
+                          All
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); selectWeek(week, 'weekday'); }}
+                          style={{ ...filterBtnStyle, color: "#374151" }}
+                        >
+                          Weekdays
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); selectWeek(week, 'weekend'); }}
+                          style={{ ...filterBtnStyle, color: "#EF4444" }}
+                        >
+                          Weekends
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               </div>
             )}
           </div>
         )}
 
-        {(selectedBuilding !== "전체" || priceMode || gapEditMode || isCalendarFullscreen) && (
-        <div style={isCalendarFullscreen ? {
-          position: "fixed",
-          inset: 0,
-          zIndex: 1400,
-          padding: "14px",
-          background: "linear-gradient(180deg, rgba(248,250,252,0.98) 0%, rgba(241,245,249,0.98) 100%)",
-          backdropFilter: "blur(14px)",
-          display: "flex",
-          flexDirection: "column",
-          minHeight: 0,
-          overflow: "hidden"
-        } : undefined}>
-        {isCalendarFullscreen && (
-          <div style={{
-            display: "flex",
-            gap: "8px",
-            alignItems: "center",
-            overflowX: "auto",
-            marginBottom: "8px",
-            padding: "8px 10px",
-            background: "rgba(255,255,255,0.9)",
-            border: "1px solid rgba(226, 232, 240, 0.9)",
-            borderRadius: "12px",
-            boxShadow: "0 8px 18px rgba(15, 23, 42, 0.07)",
-            flexShrink: 0,
-            scrollbarWidth: "none",
-            msOverflowStyle: "none"
-          }}>
-            <div style={{
-              fontSize: "10px",
-              fontWeight: "800",
-              color: "#64748B",
-              letterSpacing: "0.04em",
-              whiteSpace: "nowrap",
-              paddingRight: "4px"
-            }}>
-              PROPERTY
-            </div>
-            {ACTIVE_BUILDING_ORDER.map((building) => {
-              const isActive = calendarBuilding === building;
-              return (
-                <button
-                  key={`fullscreen-building-${building}`}
-                  onClick={() => {
-                    if (selectedBuilding === "전체" && (priceMode || gapEditMode)) {
-                      setPortfolioPriceBuilding(building);
-                    } else {
-                      setSelectedBuilding(building);
-                    }
-                    setSelectedCells([]);
-                    setSelectedRoom(null);
-                  }}
-                  style={{
-                    padding: "6px 10px",
-                    borderRadius: "999px",
-                    border: isActive ? "none" : "1px solid #E5E7EB",
-                    background: isActive
-                      ? "linear-gradient(135deg, #1F2937 0%, #111827 100%)"
-                      : "white",
-                    color: isActive ? "white" : "#475569",
-                    fontWeight: "700",
-                    fontSize: "10px",
-                    cursor: "pointer",
-                    whiteSpace: "nowrap",
-                    boxShadow: isActive ? "0 5px 12px rgba(15, 23, 42, 0.14)" : "0 1px 2px rgba(0,0,0,0.05)",
-                    transition: "all 0.2s"
-                  }}
-                >
-                  {getBuildingNameEN(building)}
-                </button>
-              );
-            })}
-          </div>
-        )}
-        {isCalendarFullscreen && (priceMode || gapEditMode) && (
-          <div style={{
-            display: "flex",
-            gap: "8px",
-            alignItems: "center",
-            flexWrap: "wrap",
-            marginBottom: "8px",
-            padding: "6px 8px",
-            background: "rgba(255,255,255,0.88)",
-            border: "1px solid rgba(226, 232, 240, 0.9)",
-            borderRadius: "10px",
-            boxShadow: "0 6px 14px rgba(15, 23, 42, 0.05)",
-            flexShrink: 0
-          }}>
-            <button
-              onClick={toggleSelectAllRooms}
-              style={{
-                padding: "6px 10px",
-                borderRadius: "7px",
-                border: allSelectableRoomsSelected ? "none" : "1px solid #D1D5DB",
-                background: allSelectableRoomsSelected
-                  ? "linear-gradient(135deg, #1F2937 0%, #111827 100%)"
-                  : "white",
-                color: allSelectableRoomsSelected ? "white" : "#374151",
-                fontSize: "11px",
-                fontWeight: "700",
-                cursor: "pointer",
-                transition: "all 0.2s"
-              }}
-            >
-              {allSelectableRoomsSelected ? "Deselect All Rooms" : "Select All Rooms"}
-            </button>
-            <button onClick={() => selectDatesByFilter('all')} style={{ ...filterBtnStyle, padding: "6px 10px", borderRadius: "7px", fontSize: "11px" }}>All Days</button>
-            <button onClick={() => selectDatesByFilter('weekday')} style={{ ...filterBtnStyle, padding: "6px 10px", borderRadius: "7px", fontSize: "11px" }}>Weekdays</button>
-            <button onClick={() => selectDatesByFilter('weekend')} style={{ ...filterBtnStyle, padding: "6px 10px", borderRadius: "7px", fontSize: "11px" }}>Weekends</button>
-          </div>
-        )}
         {/* 월 네비게이션 - Premium Design */}
         <div style={{
           display: "flex",
           justifyContent: "space-between",
           alignItems: "center",
-          marginBottom: isCalendarFullscreen ? "8px" : "20px",
+          marginBottom: "20px",
           background: "white",
-          padding: isCalendarFullscreen ? "8px 12px" : "16px 24px",
-          borderRadius: isCalendarFullscreen ? "12px" : "16px",
-          boxShadow: isCalendarFullscreen ? "0 10px 22px rgba(15, 23, 42, 0.09)" : "0 4px 16px rgba(0,0,0,0.06)",
-          border: "1px solid #F3F4F6",
-          flexShrink: 0
+          padding: "16px 24px",
+          borderRadius: "16px",
+          boxShadow: "0 4px 16px rgba(0,0,0,0.06)",
+          border: "1px solid #F3F4F6"
         }}>
-          <div style={{ display: "flex", gap: isCalendarFullscreen ? "6px" : "10px", alignItems: "center", flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
             {/* 뷰 모드 전환 버튼 */}
             <button
               onClick={toggleViewMode}
               style={{
-                padding: isCalendarFullscreen ? "7px 12px" : "10px 16px",
-                borderRadius: isCalendarFullscreen ? "8px" : "10px",
+                padding: "10px 16px",
+                borderRadius: "10px",
                 border: viewMode === "rolling" ? "2px solid #7C3AED" : "1px solid #E5E7EB",
                 background: viewMode === "rolling" ? "linear-gradient(135deg, #EDE9FE 0%, #DDD6FE 100%)" : "white",
                 color: viewMode === "rolling" ? "#7C3AED" : "#4B5563",
                 cursor: "pointer",
                 fontWeight: "600",
-                fontSize: isCalendarFullscreen ? "12px" : "13px",
+                fontSize: "13px",
                 display: "flex",
                 alignItems: "center",
-                gap: isCalendarFullscreen ? "5px" : "6px",
+                gap: "6px",
                 transition: "all 0.2s"
               }}
             >
@@ -6709,7 +6016,7 @@ function BuildingCalendar() {
               {viewMode === "rolling" ? "30-Day View" : "Monthly"}
             </button>
 
-            <div style={{ width: "1px", height: isCalendarFullscreen ? "20px" : "24px", background: "#E5E7EB", margin: "0 4px" }}></div>
+            <div style={{ width: "1px", height: "24px", background: "#E5E7EB", margin: "0 4px" }}></div>
 
             {viewMode === "monthly" ? (
               /* 월별 뷰 네비게이터 */
@@ -6717,13 +6024,13 @@ function BuildingCalendar() {
                 <button
                   onClick={goToPrevMonth}
                   style={{
-                    padding: isCalendarFullscreen ? "7px 12px" : "10px 16px",
-                    borderRadius: isCalendarFullscreen ? "8px" : "10px",
+                    padding: "10px 16px",
+                    borderRadius: "10px",
                     border: "1px solid #E5E7EB",
                     background: "white",
                     cursor: "pointer",
                     fontWeight: "600",
-                    fontSize: isCalendarFullscreen ? "12px" : "13px",
+                    fontSize: "13px",
                     color: "#374151",
                     display: "flex",
                     alignItems: "center",
@@ -6741,15 +6048,15 @@ function BuildingCalendar() {
                 <button
                   onClick={goToToday}
                   style={{
-                    padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                    borderRadius: isCalendarFullscreen ? "8px" : "10px",
+                    padding: "10px 18px",
+                    borderRadius: "10px",
                     border: "none",
                     background: "linear-gradient(135deg, #10B981 0%, #059669 100%)",
                     color: "white",
                     cursor: "pointer",
                     fontWeight: "600",
-                    fontSize: isCalendarFullscreen ? "12px" : "13px",
-                    boxShadow: isCalendarFullscreen ? "0 3px 8px rgba(16, 185, 129, 0.26)" : "0 4px 12px rgba(16, 185, 129, 0.3)",
+                    fontSize: "13px",
+                    boxShadow: "0 4px 12px rgba(16, 185, 129, 0.3)",
                     transition: "all 0.2s"
                   }}
                   onMouseEnter={(e) => e.currentTarget.style.transform = "translateY(-1px)"}
@@ -6760,13 +6067,13 @@ function BuildingCalendar() {
                 <button
                   onClick={goToNextMonth}
                   style={{
-                    padding: isCalendarFullscreen ? "7px 12px" : "10px 16px",
-                    borderRadius: isCalendarFullscreen ? "8px" : "10px",
+                    padding: "10px 16px",
+                    borderRadius: "10px",
                     border: "1px solid #E5E7EB",
                     background: "white",
                     cursor: "pointer",
                     fontWeight: "600",
-                    fontSize: isCalendarFullscreen ? "12px" : "13px",
+                    fontSize: "13px",
                     color: "#374151",
                     display: "flex",
                     alignItems: "center",
@@ -6788,13 +6095,13 @@ function BuildingCalendar() {
                 <button
                   onClick={goToRollingPrev}
                   style={{
-                    padding: isCalendarFullscreen ? "7px 12px" : "10px 16px",
-                    borderRadius: isCalendarFullscreen ? "8px" : "10px",
+                    padding: "10px 16px",
+                    borderRadius: "10px",
                     border: "1px solid #E5E7EB",
                     background: "white",
                     cursor: "pointer",
                     fontWeight: "600",
-                    fontSize: isCalendarFullscreen ? "12px" : "13px",
+                    fontSize: "13px",
                     color: "#374151",
                     display: "flex",
                     alignItems: "center",
@@ -6812,15 +6119,15 @@ function BuildingCalendar() {
                 <button
                   onClick={goToRollingToday}
                   style={{
-                    padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                    borderRadius: isCalendarFullscreen ? "8px" : "10px",
+                    padding: "10px 18px",
+                    borderRadius: "10px",
                     border: "none",
                     background: "linear-gradient(135deg, #10B981 0%, #059669 100%)",
                     color: "white",
                     cursor: "pointer",
                     fontWeight: "600",
-                    fontSize: isCalendarFullscreen ? "12px" : "13px",
-                    boxShadow: isCalendarFullscreen ? "0 3px 8px rgba(16, 185, 129, 0.26)" : "0 4px 12px rgba(16, 185, 129, 0.3)",
+                    fontSize: "13px",
+                    boxShadow: "0 4px 12px rgba(16, 185, 129, 0.3)",
                     transition: "all 0.2s"
                   }}
                   onMouseEnter={(e) => e.currentTarget.style.transform = "translateY(-1px)"}
@@ -6831,13 +6138,13 @@ function BuildingCalendar() {
                 <button
                   onClick={goToRollingNext}
                   style={{
-                    padding: isCalendarFullscreen ? "7px 12px" : "10px 16px",
-                    borderRadius: isCalendarFullscreen ? "8px" : "10px",
+                    padding: "10px 16px",
+                    borderRadius: "10px",
                     border: "1px solid #E5E7EB",
                     background: "white",
                     cursor: "pointer",
                     fontWeight: "600",
-                    fontSize: isCalendarFullscreen ? "12px" : "13px",
+                    fontSize: "13px",
                     color: "#374151",
                     display: "flex",
                     alignItems: "center",
@@ -6853,328 +6160,63 @@ function BuildingCalendar() {
                   </svg>
                 </button>
                 <span style={{
-                  fontSize: isCalendarFullscreen ? "11px" : "13px",
+                  fontSize: "13px",
                   color: "#6B7280",
-                  marginLeft: isCalendarFullscreen ? "4px" : "8px",
-                  padding: isCalendarFullscreen ? "5px 10px" : "6px 12px",
+                  marginLeft: "8px",
+                  padding: "6px 12px",
                   background: "#F9FAFB",
-                  borderRadius: isCalendarFullscreen ? "7px" : "8px"
+                  borderRadius: "8px"
                 }}>
                   {dayjs(rollingStartDate).format('M/D')} ~ {dayjs(rollingStartDate).add(29, 'day').format('M/D')}
                 </span>
               </>
             )}
 
-            <div style={{ width: "1px", height: isCalendarFullscreen ? "20px" : "24px", background: "#E5E7EB", margin: "0 4px" }}></div>
+            <div style={{ width: "1px", height: "24px", background: "#E5E7EB", margin: "0 4px" }}></div>
 
-            <button
-              onClick={togglePriceMode}
-              style={{
-                padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                border: priceMode ? "2px solid #F59E0B" : "none",
-                background: priceMode
-                  ? "linear-gradient(135deg, #FFFBEB 0%, #FEF3C7 100%)"
-                  : "linear-gradient(135deg, #F59E0B 0%, #D97706 100%)",
-                color: priceMode ? "#B45309" : "white",
-                cursor: "pointer",
-                fontWeight: "700",
-                fontSize: isCalendarFullscreen ? "12px" : "13px",
-                display: "flex",
-                alignItems: "center",
-                gap: isCalendarFullscreen ? "6px" : "8px",
-                boxShadow: priceMode
-                  ? "0 0 0 2px rgba(245, 158, 11, 0.16)"
-                  : isCalendarFullscreen
-                    ? "0 3px 8px rgba(245, 158, 11, 0.24)"
-                    : "0 4px 12px rgba(245, 158, 11, 0.3)",
-                transition: "all 0.2s"
-              }}
-              onMouseEnter={(e) => e.currentTarget.style.transform = "translateY(-1px)"}
-              onMouseLeave={(e) => e.currentTarget.style.transform = "translateY(0)"}
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                {priceMode ? (
-                  <>
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                  </>
-                ) : (
-                  <>
-                    <line x1="12" y1="1" x2="12" y2="23" />
-                    <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
-                  </>
-                )}
-              </svg>
-              {priceMode ? "Exit Price" : "Edit Price"}
-            </button>
-            {priceMode && (
+        {!priceMode && selectedBuilding !== "전체" && (
               <button
-                onClick={() => { setSelectedCells([]); setSelectedRoom(null); }}
-                disabled={selectedCells.length === 0}
+                onClick={togglePriceMode}
                 style={{
-                  padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                  borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                  border: "1px solid #E5E7EB",
-                  background: "white",
-                  color: selectedCells.length === 0 ? "#9CA3AF" : "#6B7280",
-                  cursor: selectedCells.length === 0 ? "not-allowed" : "pointer",
-                  fontWeight: "700",
-                  fontSize: isCalendarFullscreen ? "12px" : "13px",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: isCalendarFullscreen ? "6px" : "8px",
-                  transition: "all 0.2s"
-                }}
-                onMouseEnter={(e) => {
-                  if (selectedCells.length > 0) e.currentTarget.style.background = "#F9FAFB";
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "white";
-                }}
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <line x1="18" y1="6" x2="6" y2="18" />
-                  <line x1="6" y1="6" x2="18" y2="18" />
-                </svg>
-                Clear Selection
-              </button>
-            )}
-            {priceMode && (
-              <button
-                onClick={openPriceModal}
-                disabled={selectedCells.length === 0 || !selectedRoom}
-                style={{
-                  padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                  borderRadius: isCalendarFullscreen ? "8px" : "10px",
+                  padding: "10px 18px",
+                  borderRadius: "10px",
                   border: "none",
-                  background: selectedCells.length === 0 || !selectedRoom
-                    ? "#E5E7EB"
-                    : "linear-gradient(135deg, #F59E0B 0%, #D97706 100%)",
-                  color: selectedCells.length === 0 || !selectedRoom ? "#9CA3AF" : "white",
-                  cursor: selectedCells.length === 0 || !selectedRoom ? "not-allowed" : "pointer",
-                  fontWeight: "700",
-                  fontSize: isCalendarFullscreen ? "12px" : "13px",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: isCalendarFullscreen ? "6px" : "8px",
-                  boxShadow: selectedCells.length === 0 || !selectedRoom
-                    ? "none"
-                    : isCalendarFullscreen
-                      ? "0 3px 8px rgba(245, 158, 11, 0.24)"
-                      : "0 4px 12px rgba(245, 158, 11, 0.3)",
-                  transition: "all 0.2s"
-                }}
-                onMouseEnter={(e) => {
-                  if (selectedCells.length > 0 && selectedRoom) e.currentTarget.style.transform = "translateY(-1px)";
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.transform = "translateY(0)";
-                }}
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                  <polyline points="20 6 9 17 4 12" />
-                </svg>
-                Apply Price
-              </button>
-            )}
-            {isCalendarFullscreen && (
-              <button
-                onClick={toggleMinStayEditMode}
-                style={{
-                  padding: "7px 14px",
-                  borderRadius: "8px",
-                  border: gapEditMode ? "2px solid #8B5CF6" : "none",
-                  background: gapEditMode
-                    ? "linear-gradient(135deg, #EDE9FE 0%, #DDD6FE 100%)"
-                    : "linear-gradient(135deg, #8B5CF6 0%, #7C3AED 100%)",
-                  color: gapEditMode ? "#5B21B6" : "white",
+                  background: "linear-gradient(135deg, #F59E0B 0%, #D97706 100%)",
+                  color: "white",
                   cursor: "pointer",
-                  fontWeight: "700",
-                  fontSize: "12px",
+                  fontWeight: "600",
+                  fontSize: "13px",
                   display: "flex",
                   alignItems: "center",
-                  gap: "6px",
-                  boxShadow: gapEditMode ? "0 0 0 2px rgba(139, 92, 246, 0.18)" : "0 3px 8px rgba(139, 92, 246, 0.24)",
+                  gap: "8px",
+                  boxShadow: "0 4px 12px rgba(245, 158, 11, 0.3)",
                   transition: "all 0.2s"
                 }}
                 onMouseEnter={(e) => e.currentTarget.style.transform = "translateY(-1px)"}
                 onMouseLeave={(e) => e.currentTarget.style.transform = "translateY(0)"}
               >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  {gapEditMode ? (
-                    <>
-                      <line x1="18" y1="6" x2="6" y2="18" />
-                      <line x1="6" y1="6" x2="18" y2="18" />
-                    </>
-                  ) : (
-                    <>
-                      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
-                      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
-                    </>
-                  )}
+                  <line x1="12" y1="1" x2="12" y2="23" />
+                  <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
                 </svg>
-                {gapEditMode ? "Exit Min Stay" : "Min Stay"}
+                Edit Price
               </button>
             )}
-            {isCalendarFullscreen && gapEditMode && (
-              <>
-                <button
-                  onClick={selectRedGapCells}
-                  style={{
-                    padding: "7px 12px",
-                    borderRadius: "8px",
-                    border: "1px solid #FCA5A5",
-                    background: "linear-gradient(135deg, #FEF2F2 0%, #FEE2E2 100%)",
-                    color: "#DC2626",
-                    cursor: "pointer",
-                    fontWeight: "700",
-                    fontSize: "12px",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    transition: "all 0.2s"
-                  }}
-                  title="Auto-select gap cells that need minStay change"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                    <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
-                  </svg>
-                  Red Gaps
-                </button>
-                <button
-                  disabled={selectedCells.length === 0 || isGapApplying}
-                  onClick={() => { setGapEditMinStay(1); setShowGapEditModal(true); }}
-                  style={{
-                    padding: "7px 12px",
-                    borderRadius: "8px",
-                    border: "none",
-                    background: selectedCells.length === 0 || isGapApplying
-                      ? "#E5E7EB"
-                      : "linear-gradient(135deg, #10B981 0%, #059669 100%)",
-                    color: selectedCells.length === 0 || isGapApplying ? "#9CA3AF" : "white",
-                    cursor: selectedCells.length === 0 || isGapApplying ? "not-allowed" : "pointer",
-                    fontWeight: "700",
-                    fontSize: "12px",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    boxShadow: selectedCells.length > 0 && !isGapApplying ? "0 3px 8px rgba(16, 185, 129, 0.24)" : "none",
-                    transition: "all 0.2s"
-                  }}
-                >
-                  Set 1N
-                </button>
-                <button
-                  disabled={selectedCells.length === 0 || isGapApplying}
-                  onClick={() => { setGapEditMinStay(2); setShowGapEditModal(true); }}
-                  style={{
-                    padding: "7px 12px",
-                    borderRadius: "8px",
-                    border: "none",
-                    background: selectedCells.length === 0 || isGapApplying
-                      ? "#E5E7EB"
-                      : "linear-gradient(135deg, #F59E0B 0%, #D97706 100%)",
-                    color: selectedCells.length === 0 || isGapApplying ? "#9CA3AF" : "white",
-                    cursor: selectedCells.length === 0 || isGapApplying ? "not-allowed" : "pointer",
-                    fontWeight: "700",
-                    fontSize: "12px",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    boxShadow: selectedCells.length > 0 && !isGapApplying ? "0 3px 8px rgba(245, 158, 11, 0.24)" : "none",
-                    transition: "all 0.2s"
-                  }}
-                >
-                  Set 2N
-                </button>
-                <button
-                  disabled={selectedCells.length === 0}
-                  onClick={() => { setSelectedCells([]); setSelectedRoom(null); }}
-                  style={{
-                    padding: "7px 12px",
-                    borderRadius: "8px",
-                    border: "1px solid #E5E7EB",
-                    background: "white",
-                    color: selectedCells.length === 0 ? "#9CA3AF" : "#6B7280",
-                    cursor: selectedCells.length === 0 ? "not-allowed" : "pointer",
-                    fontWeight: "700",
-                    fontSize: "12px",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    transition: "all 0.2s"
-                  }}
-                  onMouseEnter={(e) => {
-                    if (selectedCells.length > 0) e.currentTarget.style.background = "#F9FAFB";
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.background = "white";
-                  }}
-                >
-                  Clear
-                </button>
-              </>
-            )}
-
-            <button
-              onClick={toggleCalendarFullscreen}
-              style={{
-                padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                border: isCalendarFullscreen ? "none" : "1px solid #E5E7EB",
-                background: isCalendarFullscreen ? "linear-gradient(135deg, #0F172A 0%, #334155 100%)" : "white",
-                color: isCalendarFullscreen ? "white" : "#4B5563",
-                cursor: "pointer",
-                fontWeight: "600",
-                fontSize: isCalendarFullscreen ? "12px" : "13px",
-                display: "flex",
-                alignItems: "center",
-                gap: isCalendarFullscreen ? "6px" : "8px",
-                boxShadow: isCalendarFullscreen ? "0 8px 16px rgba(15, 23, 42, 0.16)" : "none",
-                transition: "all 0.2s"
-              }}
-              onMouseEnter={(e) => {
-                if (!isCalendarFullscreen) e.currentTarget.style.background = "#F9FAFB";
-              }}
-              onMouseLeave={(e) => {
-                if (!isCalendarFullscreen) e.currentTarget.style.background = "white";
-              }}
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                {isCalendarFullscreen ? (
-                  <>
-                    <polyline points="9 15 3 15 3 21" />
-                    <polyline points="15 9 21 9 21 3" />
-                    <line x1="3" y1="21" x2="9" y2="15" />
-                    <line x1="21" y1="3" x2="15" y2="9" />
-                  </>
-                ) : (
-                  <>
-                    <polyline points="15 3 21 3 21 9" />
-                    <polyline points="9 21 3 21 3 15" />
-                    <line x1="21" y1="3" x2="14" y2="10" />
-                    <line x1="3" y1="21" x2="10" y2="14" />
-                  </>
-                )}
-              </svg>
-              {isCalendarFullscreen ? "Exit Full View" : "Full View"}
-            </button>
 
             <button
               onClick={() => navigate('/price-history')}
               style={{
-                padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                borderRadius: isCalendarFullscreen ? "8px" : "10px",
+                padding: "10px 18px",
+                borderRadius: "10px",
                 border: "1px solid #E5E7EB",
                 background: "white",
                 color: "#4B5563",
                 cursor: "pointer",
                 fontWeight: "600",
-                fontSize: isCalendarFullscreen ? "12px" : "13px",
+                fontSize: "13px",
                 display: "flex",
                 alignItems: "center",
-                gap: isCalendarFullscreen ? "6px" : "8px",
+                gap: "8px",
                 transition: "all 0.2s"
               }}
               onMouseEnter={(e) => e.currentTarget.style.background = "#F9FAFB"}
@@ -7185,58 +6227,22 @@ function BuildingCalendar() {
               </svg>
               Price History
             </button>
-            {showBeds24DetailView && (
-              <button
-                onClick={toggleVacantOnlyMode}
-                style={{
-                  padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                  borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                  border: vacantOnlyMode ? "none" : "1px solid #E5E7EB",
-                  background: vacantOnlyMode
-                    ? "linear-gradient(135deg, #0F766E 0%, #0F766E 45%, #115E59 100%)"
-                    : "white",
-                  color: vacantOnlyMode ? "white" : "#4B5563",
-                  cursor: "pointer",
-                  fontWeight: "600",
-                  fontSize: isCalendarFullscreen ? "12px" : "13px",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: isCalendarFullscreen ? "6px" : "8px",
-                  boxShadow: vacantOnlyMode ? "0 4px 12px rgba(15, 118, 110, 0.22)" : "none",
-                  transition: "all 0.2s"
-                }}
-                onMouseEnter={(e) => {
-                  if (!vacantOnlyMode) e.currentTarget.style.background = "#F9FAFB";
-                }}
-                onMouseLeave={(e) => {
-                  if (!vacantOnlyMode) e.currentTarget.style.background = "white";
-                }}
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M3 10h18" />
-                  <path d="M5 6h14" />
-                  <path d="M7 14h10" />
-                  <path d="M9 18h6" />
-                </svg>
-                {vacantOnlyMode ? "Show All Rooms" : "Vacant Today"}
-              </button>
-            )}
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: isCalendarFullscreen ? "12px" : "20px", flexWrap: "wrap", justifyContent: "flex-end" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "20px" }}>
             {/* 월 표시 */}
             <div
               onClick={() => setShowMonthPicker(true)}
               style={{
-                fontSize: isCalendarFullscreen ? "15px" : "18px",
+                fontSize: "18px",
                 fontWeight: "700",
                 color: "#111827",
                 cursor: "pointer",
-                padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                padding: "10px 18px",
+                borderRadius: "12px",
                 transition: "all 0.2s",
                 display: "flex",
                 alignItems: "center",
-                gap: isCalendarFullscreen ? "6px" : "8px",
+                gap: "8px",
                 background: "#F9FAFB",
                 border: "1px solid #E5E7EB"
               }}
@@ -7256,22 +6262,22 @@ function BuildingCalendar() {
             </div>
 
             {/* 범례 */}
-            <div style={{ display: "flex", gap: isCalendarFullscreen ? "12px" : "16px", fontSize: isCalendarFullscreen ? "11px" : "12px", color: "#6B7280" }}>
-              <span style={{ display: "flex", alignItems: "center", gap: isCalendarFullscreen ? "5px" : "6px" }}>
+            <div style={{ display: "flex", gap: "16px", fontSize: "12px", color: "#6B7280" }}>
+              <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                 <span style={{
-                  width: isCalendarFullscreen ? "12px" : "14px",
-                  height: isCalendarFullscreen ? "12px" : "14px",
-                  borderRadius: isCalendarFullscreen ? "3px" : "4px",
+                  width: "14px",
+                  height: "14px",
+                  borderRadius: "4px",
                   background: PLATFORM_COLORS.Airbnb,
                   boxShadow: "0 2px 4px rgba(255, 56, 92, 0.3)"
                 }}></span>
                 <span style={{ fontWeight: "500" }}>Airbnb</span>
               </span>
-              <span style={{ display: "flex", alignItems: "center", gap: isCalendarFullscreen ? "5px" : "6px" }}>
+              <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                 <span style={{
-                  width: isCalendarFullscreen ? "12px" : "14px",
-                  height: isCalendarFullscreen ? "12px" : "14px",
-                  borderRadius: isCalendarFullscreen ? "3px" : "4px",
+                  width: "14px",
+                  height: "14px",
+                  borderRadius: "4px",
                   background: PLATFORM_COLORS.Booking,
                   boxShadow: "0 2px 4px rgba(0, 53, 128, 0.3)"
                 }}></span>
@@ -7286,14 +6292,13 @@ function BuildingCalendar() {
           background: "white",
           borderRadius: "20px",
           boxShadow: "0 10px 25px rgba(0,0,0,0.05)",
-          overflow: isCalendarFullscreen ? "hidden" : "visible",
-          marginBottom: isCalendarFullscreen ? "0" : "24px",
+          overflow: "hidden",
+          marginBottom: "24px",
           border: "1px solid #E5E7EB",
           display: 'flex',
           flexDirection: 'column',
-          maxHeight: isCalendarFullscreen ? 'none' : undefined,
-          minHeight: isCalendarFullscreen ? '0' : undefined,
-          flex: isCalendarFullscreen ? 1 : undefined
+          maxHeight: '60vh',
+          minHeight: '400px'
         }}>
           {loading ? (
             <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: "#86868B" }}>
@@ -7312,10 +6317,8 @@ function BuildingCalendar() {
             </div>
           ) : (
             <div style={{
-              overflowX: "auto",
-              overflowY: isCalendarFullscreen ? "auto" : "visible",
-              flex: isCalendarFullscreen ? 1 : undefined,
-              minHeight: isCalendarFullscreen ? 0 : undefined,
+              overflow: "auto",
+              flex: 1,
               cursor: isDraggingCalendar ? 'grabbing' : 'grab',
               userSelect: 'none'
             }}
@@ -7331,16 +6334,13 @@ function BuildingCalendar() {
                   display: "flex",
                   borderBottom: "1px solid #E5E7EB",
                   background: "#F9FAFB",
-                  position: isCalendarFullscreen ? 'sticky' : 'relative',
-                  top: isCalendarFullscreen ? 0 : undefined,
-                  zIndex: isCalendarFullscreen ? 100 : 40,
-                  boxShadow: isCalendarFullscreen ? "none" : "0 1px 0 rgba(226, 232, 240, 0.9)",
-                  minHeight: "48px",
-                  flexShrink: 0
+                  position: 'sticky',
+                  top: 0,
+                  zIndex: 100
                 }}>
                   <div style={{
-                    width: showBeds24DetailView ? `${BEDS24_DETAIL_STICKY_WIDTH}px` : "120px",
-                    minWidth: showBeds24DetailView ? `${BEDS24_DETAIL_STICKY_WIDTH}px` : "120px",
+                    width: "120px",
+                    minWidth: "120px",
                     padding: "16px 12px",
                     fontWeight: "700",
                     fontSize: "12px",
@@ -7351,7 +6351,7 @@ function BuildingCalendar() {
                     background: "#F9FAFB",
                     position: 'sticky',
                     left: 0,
-                    zIndex: isCalendarFullscreen ? 110 : 121
+                    zIndex: 110
                   }}>
                     Room
                   </div>
@@ -7363,8 +6363,6 @@ function BuildingCalendar() {
                       const dayOfWeek = date.getDay();
                       const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
                       const isToday = new Date().toDateString() === date.toDateString();
-                      const isHeaderSelected = selectedDateSet.has(dayjs(date).format("YYYY-MM-DD"));
-                      const isPastHeaderDate = date < new Date(new Date().setHours(0, 0, 0, 0));
 
                       return (
                         <div
@@ -7373,31 +6371,15 @@ function BuildingCalendar() {
                             flex: "1 1 0",
                             minWidth: "32px",
                             padding: "10px 2px",
-                            minHeight: "48px",
-                            boxSizing: "border-box",
                             textAlign: "center",
                             fontSize: "12px",
                             fontWeight: isToday ? "800" : "600",
-                            color: isPastHeaderDate
-                              ? "#94A3B8"
-                              : isToday
-                                ? "#3B82F6"
-                                : isWeekend
-                                  ? "#E98B8B"
-                                  : "#4B5563",
-                            background: isHeaderSelected
-                              ? "linear-gradient(180deg, rgba(245,158,11,0.18) 0%, rgba(251,191,36,0.08) 100%)"
-                              : isToday
-                                ? "#EFF6FF"
-                                : isPastHeaderDate
-                                  ? "rgba(248,250,252,0.96)"
-                                  : "#F9FAFB",
+                            color: isToday ? "#3B82F6" : isWeekend ? "#EF4444" : "#4B5563",
+                            background: isToday ? "#EFF6FF" : "transparent",
                             borderRight: "1px solid #F3F4F6",
-                            boxShadow: isHeaderSelected ? "inset 0 -3px 0 #F59E0B" : "none",
                             display: 'flex',
                             flexDirection: 'column',
-                            gap: '2px',
-                            opacity: isPastHeaderDate ? 0.72 : 1
+                            gap: '2px'
                           }}
                         >
                           <div style={{ fontSize: '13px' }}>{day}</div>
@@ -7414,8 +6396,6 @@ function BuildingCalendar() {
                       const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
                       const isToday = new Date().toDateString() === d.date.toDateString();
                       const isNewMonth = i === 0 || d.day === 1;
-                      const isHeaderSelected = selectedDateSet.has(d.dateStr);
-                      const isPastHeaderDate = d.date < new Date(new Date().setHours(0, 0, 0, 0));
 
                       return (
                         <div
@@ -7424,34 +6404,16 @@ function BuildingCalendar() {
                             flex: "1 1 0",
                             minWidth: "32px",
                             padding: "10px 2px",
-                            minHeight: "48px",
-                            boxSizing: "border-box",
                             textAlign: "center",
                             fontSize: "12px",
                             fontWeight: isToday ? "800" : "600",
-                            color: isPastHeaderDate
-                              ? "#94A3B8"
-                              : isToday
-                                ? "#3B82F6"
-                                : isWeekend
-                                  ? "#EF4444"
-                                  : "#4B5563",
-                            background: isHeaderSelected
-                              ? "linear-gradient(180deg, rgba(245,158,11,0.18) 0%, rgba(251,191,36,0.08) 100%)"
-                              : isToday
-                                ? "#EFF6FF"
-                                : isPastHeaderDate
-                                  ? "rgba(248,250,252,0.96)"
-                                : isNewMonth
-                                  ? "#FFFBEB"
-                                  : "#F9FAFB",
+                            color: isToday ? "#3B82F6" : isWeekend ? "#EF4444" : "#4B5563",
+                            background: isToday ? "#EFF6FF" : isNewMonth ? "#FFFBEB" : "transparent",
                             borderRight: "1px solid #F3F4F6",
                             borderLeft: isNewMonth && i > 0 ? "2px solid #F59E0B" : "none",
-                            boxShadow: isHeaderSelected ? "inset 0 -3px 0 #F59E0B" : "none",
                             display: 'flex',
                             flexDirection: 'column',
-                            gap: '2px',
-                            opacity: isPastHeaderDate ? 0.72 : 1
+                            gap: '2px'
                           }}
                         >
                           <div style={{ fontSize: isNewMonth ? "10px" : "13px", color: isNewMonth ? "#D97706" : "inherit" }}>
@@ -7467,13 +6429,13 @@ function BuildingCalendar() {
                 </div>
 
                 {/* 객실 행 */}
-                {visibleRooms.length > 0 ? visibleRooms.map((room, roomIndex) => (
+                {rooms.map((room, roomIndex) => (
                   <div
                     key={room}
                     style={{
                       display: "flex",
                       borderBottom: "1px solid #F3F4F6",
-                      minHeight: showBeds24DetailView ? `${BEDS24_DETAIL_ROW_HEIGHT}px` : priceMode ? "60px" : "52px",
+                      minHeight: priceMode ? "60px" : "52px",
                       position: "relative",
                       transition: 'background 0.2s'
                     }}
@@ -7481,161 +6443,39 @@ function BuildingCalendar() {
                     onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
                   >
                     <div style={{
-                      width: showBeds24DetailView ? `${BEDS24_DETAIL_STICKY_WIDTH}px` : "120px",
-                      minWidth: showBeds24DetailView ? `${BEDS24_DETAIL_STICKY_WIDTH}px` : "120px",
-                      padding: showBeds24DetailView ? "0" : "12px",
+                      width: "120px",
+                      minWidth: "120px",
+                      padding: "12px",
                       fontWeight: "700",
                       fontSize: "13px",
-                      color: "#334155",
-                      borderRight: "1px solid #EDF2F7",
+                      color: "#1F2937",
+                      borderRight: "1px solid #E5E7EB",
                       background: "#FFFFFF",
                       display: "flex",
-                      alignItems: showBeds24DetailView ? "stretch" : "center",
-                      gap: showBeds24DetailView ? "0" : "10px",
-                      flexDirection: showBeds24DetailView ? "row" : "row",
+                      alignItems: "center",
+                      gap: "10px",
                       position: 'sticky',
                       left: 0,
-                      zIndex: isCalendarFullscreen ? 90 : 35,
-                      boxShadow: '1px 0 3px rgba(15,23,42,0.025)'
+                      zIndex: 90,
+                      boxShadow: '2px 0 5px rgba(0,0,0,0.02)'
                     }}>
-                      {showBeds24DetailView ? (
-                        <div style={{
-                          display: "grid",
-                          gridTemplateColumns: `${BEDS24_DETAIL_ROOM_NAME_WIDTH}px 1fr`,
-                          gridTemplateRows: `${BEDS24_DETAIL_PRICE_TRACK_HEIGHT}px ${BEDS24_DETAIL_PRICE_TRACK_HEIGHT}px ${BEDS24_DETAIL_MINSTAY_TRACK_HEIGHT}px ${BEDS24_DETAIL_RESERVATION_TRACK_HEIGHT}px`,
-                          width: "100%",
-                          height: "100%"
-                        }}>
-                          <div style={{
-                            gridColumn: "1 / 2",
-                            gridRow: "1 / 5",
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: priceMode ? "space-between" : "flex-start",
-                            padding: "0 10px",
-                            borderRight: "1px solid #F5F7FA",
-                            color: "#334155",
-                            background: "linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(248,250,252,0.98) 100%)",
-                            gap: "8px",
-                            cursor: priceMode ? "pointer" : "default",
-                            userSelect: "none"
-                          }}
-                          onClick={priceMode ? (e => {
+                      {priceMode && (
+                        <input
+                          type="checkbox"
+                          checked={selectedRooms.includes(room)}
+                          onChange={(e) => {
                             e.stopPropagation();
                             toggleRoomSelection(room);
-                          }) : undefined}
-                          title={priceMode ? `${selectedRooms.includes(room) ? "Deselect" : "Select"} ${getRoomNameEN(room)}` : undefined}
-                          onMouseEnter={priceMode ? (e => {
-                            e.currentTarget.style.background = selectedRooms.includes(room)
-                              ? "linear-gradient(180deg, rgba(219,234,254,0.92) 0%, rgba(239,246,255,0.96) 100%)"
-                              : "linear-gradient(180deg, rgba(248,250,252,1) 0%, rgba(241,245,249,0.98) 100%)";
-                          }) : undefined}
-                          onMouseLeave={priceMode ? (e => {
-                            e.currentTarget.style.background = "linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(248,250,252,0.98) 100%)";
-                          }) : undefined}>
-                            <span>{getRoomNameEN(room)}</span>
-                            {priceMode && (
-                              <input
-                                type="checkbox"
-                                checked={selectedRooms.includes(room)}
-                                readOnly
-                                tabIndex={-1}
-                                style={{
-                                  width: '16px',
-                                  height: '16px',
-                                  cursor: "pointer",
-                                  accentColor: '#3B82F6',
-                                  flexShrink: 0,
-                                  pointerEvents: "none"
-                                }}
-                              />
-                            )}
-                          </div>
-                          <div style={{
-                            display: "flex",
-                            alignItems: "center",
-                            paddingLeft: "10px",
-                            borderTop: "1px solid #F7FAFC",
-                            fontSize: "8.5px",
-                            fontWeight: "700",
-                            color: "#94A3B8",
-                            letterSpacing: "0.025em"
-                          }}>Airbnb</div>
-                          <div style={{
-                            display: "flex",
-                            alignItems: "center",
-                            paddingLeft: "10px",
-                            borderTop: "1px solid #F7FAFC",
-                            fontSize: "8.5px",
-                            fontWeight: "700",
-                            color: "#94A3B8",
-                            letterSpacing: "0.025em"
-                          }}>Booking</div>
-                          <div style={{
-                            display: "flex",
-                            alignItems: "center",
-                            paddingLeft: "10px",
-                            borderTop: "1px solid #F7FAFC",
-                            fontSize: "8.5px",
-                            fontWeight: "700",
-                            color: "#A3B2C4",
-                            letterSpacing: "0.025em"
-                          }}>Min Stay</div>
-                          <div style={{
-                            display: "flex",
-                            alignItems: "center",
-                            paddingLeft: "10px",
-                            borderTop: "1px solid #F7FAFC",
-                            fontSize: "8.5px",
-                            fontWeight: "700",
-                            color: "#A3B2C4",
-                            letterSpacing: "0.025em"
-                          }}>Reservation</div>
-                        </div>
-                      ) : (
-                        <div
+                          }}
                           style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "10px",
-                            minHeight: "18px",
-                            cursor: priceMode ? "pointer" : "default",
-                            userSelect: "none",
-                            padding: priceMode ? "4px 6px" : "0",
-                            margin: priceMode ? "-4px -6px" : "0",
-                            borderRadius: priceMode ? "8px" : "0",
-                            transition: "background 0.15s ease"
+                            width: '16px',
+                            height: '16px',
+                            cursor: "pointer",
+                            accentColor: '#3B82F6'
                           }}
-                          onClick={priceMode ? (e => {
-                            e.stopPropagation();
-                            toggleRoomSelection(room);
-                          }) : undefined}
-                          title={priceMode ? `${selectedRooms.includes(room) ? "Deselect" : "Select"} ${getRoomNameEN(room)}` : undefined}
-                          onMouseEnter={priceMode ? (e => {
-                            e.currentTarget.style.background = "rgba(241,245,249,0.95)";
-                          }) : undefined}
-                          onMouseLeave={priceMode ? (e => {
-                            e.currentTarget.style.background = "transparent";
-                          }) : undefined}
-                        >
-                          {priceMode && (
-                            <input
-                              type="checkbox"
-                              checked={selectedRooms.includes(room)}
-                              readOnly
-                              tabIndex={-1}
-                              style={{
-                                width: '18px',
-                                height: '18px',
-                                cursor: "pointer",
-                                accentColor: '#3B82F6',
-                                pointerEvents: "none"
-                              }}
-                            />
-                          )}
-                          <span>{getRoomNameEN(room)}</span>
-                        </div>
+                        />
                       )}
+                      {getRoomNameEN(room)}
                     </div>
                     <div style={{
                       position: "relative",
@@ -7682,31 +6522,28 @@ function BuildingCalendar() {
                         // display-only fallback: active room 설정 실패 시 해당 날짜의 실제 가격 데이터가
                         // 있는 roomId 기준 사용. 없으면 전체 roomInfos. 뭘 선택하든 roomInfos 기준 처리.
                         const displayRoomInfos = getDisplayUnitInfosForDate(room, dateStr);
-                        const allRoomInfosForDate = BUILDING_ROOMS[calendarBuilding]?.filter(r => r.name === room) || [];
                         const pendingPriceCell = pendingPriceCellMap[cellKey];
                         const isPendingPriceCell = !!pendingPriceCell;
-                        const mergedChannelPrices = getMergedRoomChannelPrices({
-                          primaryUnitInfos: displayRoomInfos,
-                          fallbackUnitInfos: allRoomInfosForDate,
-                          roomPrices,
-                          dateKey
-                        });
-                        let airbnbPrice = mergedChannelPrices.airbnbPrice;
-                        let bookingPrice = mergedChannelPrices.bookingPrice;
+                        let airbnbPrice = 0;
+                        let bookingPrice = 0;
                         let minStay = 0;  // 0은 "아직 가격 없음" 의미
-                        let hasError = mergedChannelPrices.hasError;
-                        let errorMsg = mergedChannelPrices.errorMsg;
+                        let hasError = false;
+                        let errorMsg = "";
 
                         displayRoomInfos.forEach(info => {
                           const roomPriceData = roomPrices[info.roomId];
-                          if (roomPriceData?.dates?.error && !hasError) {
+                          if (roomPriceData?.dates?.error) {
                             hasError = true;
                             errorMsg = roomPriceData.dates.error;
                           }
 
                           const priceInfo = roomPriceData?.dates?.[dateKey];
                           if (priceInfo) {
+                            const ap = parseFloat(priceInfo.p1) || 0;  // Airbnb 가격(p1)
+                            const bp = parseFloat(priceInfo.p2) || 0;  // Booking 가격(p2)
                             const ms = parseInt(priceInfo.m, 10); // 문자열/NaN이면 무시하고 1박 기준으로 처리하지 않음
+                            if (ap > 0) airbnbPrice = ap;
+                            if (bp > 0) bookingPrice = bp;
                             if (Number.isFinite(ms) && ms >= 1 && ms < INACTIVE_MINSTAY_THRESHOLD && (minStay === 0 || ms < minStay)) minStay = ms;
                           }
                         });
@@ -7743,17 +6580,6 @@ function BuildingCalendar() {
                             isInQuickSelectionRange = true;
                           }
                         }
-                        const isHoveredSelectableCell = showBeds24DetailView &&
-                          !priceMode &&
-                          !gapEditMode &&
-                          canQuickBookSelect &&
-                          !isInQuickSelectionRange &&
-                          !isSelectionStart &&
-                          !isDragging &&
-                          hoveredDay === dateStr &&
-                          hoveredRoom === room;
-                        const isDetailSelectionVisible = showBeds24DetailView &&
-                          (isSelected || isSelectionStart || isInQuickSelectionRange || isHoveredSelectableCell);
 
                         return (
                           <div
@@ -7788,30 +6614,24 @@ function BuildingCalendar() {
                                 : isInQuickSelectionRange
                                   ? "rgba(245, 158, 11, 0.15)"
                                   : isSelected
-                                    ? (gapEditMode
-                                      ? "rgba(139, 92, 246, 0.22)"
-                                      : showBeds24DetailView
-                                        ? "linear-gradient(180deg, rgba(245, 158, 11, 0.18) 0%, rgba(251, 191, 36, 0.1) 100%)"
-                                        : "rgba(245, 158, 11, 0.3)")
+                                    ? (gapEditMode ? "rgba(139, 92, 246, 0.35)" : "rgba(245, 158, 11, 0.3)")
                                     : isToday
                                       ? "rgba(59, 130, 246, 0.05)"
-                                      : isPastDate
-                                        ? "rgba(248,250,252,0.96)"
+                                      : (isPastDate && (priceMode || gapEditMode || selectionStart))
+                                        ? "#F9FAFB"
                                         : canSelect
                                           ? "#FFFFFF"
                                           : "transparent",
                               cursor: canSelect ? "pointer" : "default",
                               display: "flex",
                               flexDirection: "column",
-                              alignItems: showBeds24DetailView ? "stretch" : "center",
-                              justifyContent: showBeds24DetailView ? "stretch" : "center",
+                              alignItems: "center",
+                              justifyContent: "center",
                               transition: "all 0.1s ease",
                               position: "relative",
-                              opacity: isPastDate ? (showBeds24DetailView ? 0.64 : 0.72) : 1,
+                              opacity: isPastDate && (priceMode || gapEditMode || selectionStart) ? 0.5 : 1,
                               zIndex: isSelectionStart || isInQuickSelectionRange || isSelected ? 5 : 1,
-                              outline: showBeds24DetailView
-                                ? "none"
-                                : isSelected
+                              outline: isSelected
                                 ? (gapEditMode ? "2px solid #8B5CF6" : "2px solid #F59E0B")
                                 : "none",
                               outlineOffset: "-2px"
@@ -7831,7 +6651,7 @@ function BuildingCalendar() {
                                     applyCellSelection(room, dateStr, dragAction);
                                 }
                               }
-                              if (!showBeds24DetailView && canSelect && !isSelected && !isInQuickSelectionRange && !isSelectionStart && !isDragging) {
+                              if (canSelect && !isSelected && !isInQuickSelectionRange && !isSelectionStart && !isDragging) {
                                 e.currentTarget.style.background = gapEditMode ? "rgba(139, 92, 246, 0.1)" : "rgba(245, 158, 11, 0.08)";
                               }
                             }}
@@ -7840,138 +6660,14 @@ function BuildingCalendar() {
                                 setHoveredDay(null);
                                 setHoveredRoom(null);
                               }
-                              if (!showBeds24DetailView && canSelect && !isSelected && !isInQuickSelectionRange && !isSelectionStart) {
+                              if (canSelect && !isSelected && !isInQuickSelectionRange && !isSelectionStart) {
                                 e.currentTarget.style.background = isToday ? "rgba(59, 130, 246, 0.05)" : "#FFFFFF";
                               }
                             }}
-                            title={(priceMode || showBeds24DetailView) && (airbnbPrice || bookingPrice || minStay)
-                              ? `Airbnb: ¥${airbnbPrice.toLocaleString()}\nBooking: ¥${bookingPrice.toLocaleString()}${priceMode ? " (Auto-sync)" : ""}\nMin Stay: ${minStay || 0} nights${isPendingPriceCell ? "\nStatus: Pending sync" : ""}`
-                              : (isPastDate && priceMode ? "Cannot edit past dates" : "")}
+                            title={priceMode && airbnbPrice ? `Airbnb: ¥${airbnbPrice.toLocaleString()}\nBooking: ¥${bookingPrice.toLocaleString()} (Auto-sync)\nMin Stay: ${minStay} nights${isPendingPriceCell ? "\nStatus: Pending sync" : ""}` : (isPastDate && priceMode ? "Cannot edit past dates" : "")}
                           >
-                            {showBeds24DetailView && (
-                              <div style={{
-                                display: "grid",
-                                gridTemplateRows: `${BEDS24_DETAIL_PRICE_TRACK_HEIGHT}px ${BEDS24_DETAIL_PRICE_TRACK_HEIGHT}px ${BEDS24_DETAIL_MINSTAY_TRACK_HEIGHT}px ${BEDS24_DETAIL_RESERVATION_TRACK_HEIGHT}px`,
-                                width: "100%",
-                                height: "100%"
-                              }}>
-                                <div style={{
-                                  display: "flex",
-                                  alignItems: "center",
-                                  justifyContent: "center",
-                                  borderTop: "1px solid rgba(226, 232, 240, 0.9)",
-                                  background: "rgba(255,255,255,0.78)",
-                                  color: isPendingPriceCell ? "#4C51BF" : "#E15B74",
-                                  fontSize: "13.5px",
-                                  fontWeight: "400",
-                                  letterSpacing: "0",
-                                  fontFamily: CALENDAR_NUMERIC_FONT_FAMILY,
-                                  fontVariantNumeric: "tabular-nums lining-nums",
-                                  fontFeatureSettings: '"tnum" 1, "lnum" 1'
-                                }}>
-                                  {formatCalendarPriceShort(airbnbPrice)}
-                                </div>
-                                <div style={{
-                                  display: "flex",
-                                  alignItems: "center",
-                                  justifyContent: "center",
-                                  borderTop: "1px solid rgba(226, 232, 240, 0.9)",
-                                  background: "rgba(255,255,255,0.72)",
-                                  color: "#5B84E5",
-                                  fontSize: "13.5px",
-                                  fontWeight: "400",
-                                  letterSpacing: "0",
-                                  fontFamily: CALENDAR_NUMERIC_FONT_FAMILY,
-                                  fontVariantNumeric: "tabular-nums lining-nums",
-                                  fontFeatureSettings: '"tnum" 1, "lnum" 1'
-                                }}>
-                                  {formatCalendarPriceShort(bookingPrice)}
-                                </div>
-                                <div style={{
-                                  display: "flex",
-                                  alignItems: "center",
-                                  justifyContent: "center",
-                                  borderTop: "1px solid rgba(226, 232, 240, 0.9)",
-                                  background: isGap
-                                    ? "linear-gradient(135deg, rgba(254,226,226,0.82) 0%, rgba(254,202,202,0.72) 100%)"
-                                    : minStay === 1
-                                      ? "linear-gradient(135deg, rgba(209,250,229,0.74) 0%, rgba(167,243,208,0.62) 100%)"
-                                      : "rgba(248,250,252,0.72)",
-                                  color: isGap
-                                    ? "#DC6A6A"
-                                    : minStay === 1
-                                      ? "#2F8F73"
-                                      : "#94A3B8",
-                                  fontSize: "8.5px",
-                                  fontWeight: "700",
-                                  letterSpacing: "0.02em"
-                                }}
-                                title={minStay > 0
-                                  ? (() => {
-                                      const _gi = (!isFullyOccupied && minStay >= 2) ? getCheckInGapInfo(room, dateStr) : null;
-                                      return _gi
-                                        ? `nights:${_gi.availableNightsFromDate} gap:${_gi.isOneNightMinStayGap} roomId:${_gi.resolvedRoomId} curr:${_gi.currentDateStatus}/${_gi.currentDateReason} prev:${_gi.previousDateStr} ${_gi.previousDateStatus}/${_gi.previousDateReason} next:${_gi.nextDateStr} ${_gi.nextDateStatus}/${_gi.nextDateReason}`
-                                        : `minStay:${minStay}`;
-                                    })()
-                                  : undefined}
-                                >
-                                  {minStay > 0 ? minStay : "—"}
-                                </div>
-                                <div style={{
-                                  position: "relative",
-                                  borderTop: "1px solid rgba(226, 232, 240, 0.95)",
-                                  background: hasReservation
-                                    ? "linear-gradient(180deg, rgba(248,250,252,0.9) 0%, rgba(241,245,249,0.96) 100%)"
-                                    : "rgba(255,255,255,0.92)"
-                                }}>
-                                  {!hasReservation && canQuickBookSelect && (
-                                    <div style={{
-                                      position: "absolute",
-                                      inset: 0,
-                                      display: "flex",
-                                      alignItems: "center",
-                                      justifyContent: "center",
-                                      pointerEvents: "none",
-                                      zIndex: 1
-                                    }}>
-                                      <div style={{
-                                        width: "20px",
-                                        height: "20px",
-                                        borderRadius: "999px",
-                                        border: "1px dashed rgba(148, 163, 184, 0.22)",
-                                        background: "rgba(148, 163, 184, 0.04)",
-                                        color: "rgba(100, 116, 139, 0.35)",
-                                        display: "flex",
-                                        alignItems: "center",
-                                        justifyContent: "center",
-                                        fontSize: "13px",
-                                        fontWeight: "700",
-                                        lineHeight: 1,
-                                        boxShadow: "none"
-                                      }}>
-                                        +
-                                      </div>
-                                    </div>
-                                  )}
-                                  {pricesLoading && airbnbPrice === 0 && bookingPrice === 0 && !hasError && (
-                                    <div style={{
-                                      position: "absolute",
-                                      top: "6px",
-                                      left: "50%",
-                                      transform: "translateX(-50%)",
-                                      fontSize: "9px",
-                                      fontWeight: "700",
-                                      color: "#94A3B8",
-                                      pointerEvents: "none"
-                                    }}>
-                                      ...
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            )}
                             {/* Price Display - Enhanced Readability */}
-                            {!showBeds24DetailView && priceMode && !hasBlockingReservation && airbnbPrice > 0 && (
+                            {priceMode && !hasBlockingReservation && airbnbPrice > 0 && (
                               <div style={{
                                 display: "flex",
                                 flexDirection: "column",
@@ -7989,10 +6685,7 @@ function BuildingCalendar() {
                                   fontWeight: "800",
                                   textAlign: "center",
                                   lineHeight: "1",
-                                  letterSpacing: "-0.02em",
-                                  fontFamily: CALENDAR_NUMERIC_FONT_FAMILY,
-                                  fontVariantNumeric: "tabular-nums lining-nums",
-                                  fontFeatureSettings: '"tnum" 1, "lnum" 1'
+                                  letterSpacing: "-0.5px"
                                 }}>
                                   {`${(airbnbPrice / 1000).toFixed(airbnbPrice % 1000 === 0 ? 0 : 1)}K`}
                                 </div>
@@ -8051,7 +6744,7 @@ function BuildingCalendar() {
                               </div>
                             )}
                             {/* 가격 로딩 표시 */}
-                            {!showBeds24DetailView && priceMode && !hasReservation && airbnbPrice === 0 && pricesLoading && !hasError && (
+                            {priceMode && !hasReservation && airbnbPrice === 0 && pricesLoading && !hasError && (
                               <div style={{
                                 fontSize: "10px",
                                 fontWeight: "700",
@@ -8061,33 +6754,15 @@ function BuildingCalendar() {
                                 ...
                               </div>
                             )}
-                            {isDetailSelectionVisible && (
-                              <div
-                                style={{
-                                  position: "absolute",
-                                  inset: 0,
-                                  pointerEvents: "none",
-                                  background: isSelectionStart
-                                    ? "linear-gradient(180deg, rgba(245, 158, 11, 0.26) 0%, rgba(251, 191, 36, 0.16) 100%)"
-                                    : isSelected
-                                      ? (gapEditMode
-                                        ? "linear-gradient(180deg, rgba(139, 92, 246, 0.2) 0%, rgba(196, 181, 253, 0.12) 100%)"
-                                        : "linear-gradient(180deg, rgba(245, 158, 11, 0.22) 0%, rgba(251, 191, 36, 0.14) 100%)")
-                                    : isInQuickSelectionRange
-                                      ? "rgba(245, 158, 11, 0.14)"
-                                      : "rgba(245, 158, 11, 0.08)",
-                                  boxShadow: isSelectionStart
-                                    ? "inset 0 0 0 2px #F59E0B, inset 0 0 0 1px rgba(251,191,36,0.65)"
-                                    : isSelected
-                                      ? (gapEditMode
-                                        ? "inset 0 0 0 2px #8B5CF6, inset 0 0 0 1px rgba(196,181,253,0.55)"
-                                        : "inset 0 0 0 2px #F59E0B, inset 0 0 0 1px rgba(251,191,36,0.7)")
-                                    : isInQuickSelectionRange
-                                      ? "inset 0 0 0 2px rgba(245, 158, 11, 0.55)"
-                                      : "inset 0 0 0 2px rgba(245, 158, 11, 0.45)",
-                                  zIndex: 2
-                                }}
-                              />
+                            {isSelected && (
+                              <div style={{
+                                width: '6px',
+                                height: '6px',
+                                borderRadius: '50%',
+                                backgroundColor: "#F59E0B",
+                                position: "absolute",
+                                bottom: '4px'
+                              }}></div>
                             )}
                           </div>
                         );
@@ -8099,24 +6774,11 @@ function BuildingCalendar() {
                       )}
                     </div>
                   </div>
-                )) : (
-                  <div style={{
-                    padding: "28px 24px",
-                    color: "#64748B",
-                    fontSize: "13px",
-                    fontWeight: "600",
-                    background: "linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(248,250,252,0.96) 100%)",
-                    borderBottom: "1px solid #F3F4F6"
-                  }}>
-                    No rooms are vacant today.
-                  </div>
-                )}
+                ))}
               </div>
             </div>
           )}
         </div>
-        </div>
-        )}
 
         {/* 건물 통계 섹션 (전체 보기 아닌 경우만) - Premium Design */}
             {selectedBuilding !== "전체" && (
@@ -8167,49 +6829,15 @@ function BuildingCalendar() {
                 <div style={{ fontSize: "12px", color: "#9CA3AF", marginTop: "4px" }}>of {rooms.length} total rooms</div>
               </div>
               <div style={{
-                background: "linear-gradient(135deg, #FFFFFF 0%, #F0FDFA 100%)",
+                background: "white",
                 borderRadius: "16px",
-                padding: "18px 20px",
-                border: "1px solid #CCFBF1",
-                boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
-              }}>
-                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "8px" }}>Future Vacancy <span style={{ fontSize: "10px", color: "#9CA3AF" }}>(visible range)</span></div>
-                <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}>
-                  <span style={{ fontSize: "28px", fontWeight: "800", color: "#0F766E" }}>{futureVacancySummary.vacantRoomNights}</span>
-                  <span style={{ fontSize: "12px", fontWeight: "700", color: "#5EEAD4" }}>room nights</span>
-                </div>
-                <div style={{ fontSize: "12px", color: "#9CA3AF", marginTop: "4px" }}>
-                  {futureVacancySummary.days > 0
-                    ? `${futureVacancySummary.days} days from today · avg ${futureVacancySummary.avgVacantRooms.toFixed(1)} rooms/day`
-                    : "No future dates in current view"}
-                </div>
-                <div style={{ fontSize: "11px", color: "#94A3B8", marginTop: "3px" }}>
-                  {futureVacancySummary.totalRoomNights} total room nights checked
-                </div>
-              </div>
-              <div style={{
-                background: "linear-gradient(135deg, #FFFFFF 0%, #F8FAFC 100%)",
-                borderRadius: "16px",
-                padding: "18px 20px",
+                padding: "20px",
                 border: "1px solid #E5E7EB",
                 boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
               }}>
-                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "10px" }}>Rate Summary</div>
-                <div style={{ display: "grid", gap: "9px" }}>
-                  <div>
-                    <div style={{ fontSize: "11px", color: "#9CA3AF", fontWeight: "700", letterSpacing: "0.04em", textTransform: "uppercase", marginBottom: "3px" }}>Avg. Daily Rate</div>
-                    <div style={{ fontSize: "26px", fontWeight: "700", color: "#8B5CF6" }}>{formatPrice(singleAnalysis.avgPrice)}</div>
-                    <div style={{ fontSize: "11px", color: "#9CA3AF", marginTop: "2px" }}>Revenue per night incl. OTA fees</div>
-                  </div>
-                  <div style={{ height: "1px", background: "#E5E7EB" }}></div>
-                  <div>
-                    <div style={{ fontSize: "11px", color: "#9CA3AF", fontWeight: "700", letterSpacing: "0.04em", textTransform: "uppercase", marginBottom: "3px" }}>Airbnb Price Range</div>
-                    <div style={{ fontSize: "20px", fontWeight: "700", color: "#EF4444" }}>
-                      {singleAnalysis.minPrice >= 0 ? `${formatPrice(singleAnalysis.minPrice)} ~ ${formatPrice(singleAnalysis.maxPrice)}` : "-"}
-                    </div>
-                    <div style={{ fontSize: "11px", color: "#9CA3AF", marginTop: "2px" }}>Available rooms only</div>
-                  </div>
-                </div>
+                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "8px" }}>Avg. Daily Rate</div>
+                <div style={{ fontSize: "28px", fontWeight: "700", color: "#8B5CF6" }}>{formatPrice(singleAnalysis.avgPrice)}</div>
+                <div style={{ fontSize: "12px", color: "#9CA3AF", marginTop: "4px" }}>Net revenue per night</div>
               </div>
               <div style={{
                 background: "white",
@@ -8218,76 +6846,22 @@ function BuildingCalendar() {
                 border: "1px solid #E5E7EB",
                 boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
               }}>
-                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "8px" }}>Est. Revenue <span style={{ fontSize: "10px", color: "#9CA3AF" }}>(incl. OTA fees)</span></div>
+                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "8px" }}>Est. Net Revenue <span style={{ fontSize: "10px", color: "#9CA3AF" }}>(excl. OTA fees)</span></div>
                 <div style={{ fontSize: "28px", fontWeight: "700", color: "#10B981" }}>{formatPrice(singleAnalysis.totalRevenue)}</div>
                 <div style={{ fontSize: "12px", color: "#9CA3AF", marginTop: "4px" }}>{reservations.length} reservations</div>
               </div>
               <div style={{
-                background: "linear-gradient(135deg, #FFFFFF 0%, #F8FAFC 100%)",
+                background: "white",
                 borderRadius: "16px",
-                padding: "18px 20px",
+                padding: "20px",
                 border: "1px solid #E5E7EB",
                 boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
               }}>
-                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "10px" }}>OTA Fees <span style={{ fontSize: "10px", color: "#9CA3AF" }}>(visible range)</span></div>
-                <div style={{ display: "grid", gap: "7px" }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "7px", fontSize: "12px", fontWeight: "600", color: "#64748B" }}>
-                      <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: PLATFORM_COLORS.Airbnb }}></span>
-                      Airbnb
-                    </span>
-                    <span style={{ fontSize: "15px", fontWeight: "700", color: "#E15B74" }}>{formatPrice(commissionSummary.airbnb)}</span>
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "7px", fontSize: "12px", fontWeight: "600", color: "#64748B" }}>
-                      <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: PLATFORM_COLORS.Booking }}></span>
-                      Booking
-                    </span>
-                    <span style={{ fontSize: "15px", fontWeight: "700", color: "#5B84E5" }}>{formatPrice(commissionSummary.booking)}</span>
-                  </div>
-                  <div style={{ height: "1px", background: "#E5E7EB", margin: "2px 0" }}></div>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ fontSize: "12px", fontWeight: "700", color: "#334155" }}>Total</span>
-                    <span style={{ fontSize: "18px", fontWeight: "800", color: "#0F172A" }}>{formatPrice(commissionSummary.total)}</span>
-                  </div>
+                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "8px" }}>Price Range <span style={{ fontSize: "10px", color: "#9CA3AF" }}>(Airbnb)</span></div>
+                <div style={{ fontSize: "20px", fontWeight: "700", color: "#EF4444" }}>
+                  {singleAnalysis.minPrice >= 0 ? `${formatPrice(singleAnalysis.minPrice)} ~ ${formatPrice(singleAnalysis.maxPrice)}` : "-"}
                 </div>
-              </div>
-              <div style={{
-                background: "linear-gradient(135deg, #FFFFFF 0%, #F8FAFC 100%)",
-                borderRadius: "16px",
-                padding: "18px 20px",
-                border: "1px solid #E5E7EB",
-                boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
-              }}>
-                <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "10px" }}>Reservations <span style={{ fontSize: "10px", color: "#9CA3AF" }}>(arrival date)</span></div>
-                <div style={{ display: "grid", gap: "7px" }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "7px", fontSize: "12px", fontWeight: "600", color: "#64748B" }}>
-                      <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: PLATFORM_COLORS.Airbnb }}></span>
-                      Airbnb
-                    </span>
-                    <span style={{ fontSize: "15px", fontWeight: "700", color: "#E15B74" }}>{arrivalCountSummary.airbnb}</span>
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "7px", fontSize: "12px", fontWeight: "600", color: "#64748B" }}>
-                      <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: PLATFORM_COLORS.Booking }}></span>
-                      Booking
-                    </span>
-                    <span style={{ fontSize: "15px", fontWeight: "700", color: "#5B84E5" }}>{arrivalCountSummary.booking}</span>
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "7px", fontSize: "12px", fontWeight: "600", color: "#64748B" }}>
-                      <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: PLATFORM_COLORS.Direct }}></span>
-                      Direct
-                    </span>
-                    <span style={{ fontSize: "15px", fontWeight: "700", color: "#00A7D8" }}>{arrivalCountSummary.direct}</span>
-                  </div>
-                  <div style={{ height: "1px", background: "#E5E7EB", margin: "2px 0" }}></div>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                    <span style={{ fontSize: "12px", fontWeight: "700", color: "#334155" }}>Total</span>
-                    <span style={{ fontSize: "18px", fontWeight: "800", color: "#0F172A" }}>{arrivalCountSummary.total}</span>
-                  </div>
-                </div>
+                <div style={{ fontSize: "12px", color: "#9CA3AF", marginTop: "4px" }}>Available rooms only</div>
               </div>
             </div>
           </div>

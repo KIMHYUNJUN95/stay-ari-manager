@@ -46,3 +46,11 @@ Use official Beds24 documentation as the primary source of truth for any Beds24-
 ## Notes
 - A webhook trigger does not automatically guarantee that the webhook payload contains the full data needed by the UI or cache.
 - Effective behavior in Beds24 can come from more than one rules layer, so verify what the endpoint actually returns before adding frontend fallbacks.
+
+## Repository Reminders
+- In this repository, "active roomId" for certain dual-room buildings is inferred from Beds24 calendar data and local project rules. Beds24 does not provide a native "active room" flag for this project-specific use case.
+- The project currently treats high `minStay` values such as `50` or `99` as an internal inactive-room convention. This is a repository rule, not a Beds24 official meaning. If an inactive roomId still has a normal `minStay` such as `2`, the app can misidentify that roomId as active.
+- Before debugging blackout placement, active-room mapping, or price sync issues on dual-room buildings, first verify the actual Beds24 calendar values for each roomId, especially `minStay`, overrides, and linked room dependencies.
+- Beds24 official docs confirm that linked Daily Prices can update other linked prices when one price changes. Source: `https://wiki.beds24.com/index.php/Category:Daily_Prices`
+- Beds24 official docs also confirm that "Use prices and restrictions from another room" applies Daily Prices and all Calendar restrictions from the source room. Source: `https://wiki.beds24.com/index.php/Setting/roomspricefromroom`
+- Therefore, if two Beds24 roomIds are linked or use prices/restrictions from another room, changing the main room price in our app can legitimately update the linked or dependent room in Beds24. Treat this as expected Beds24 behavior unless the Beds24 dependency settings are confirmed to be absent.
