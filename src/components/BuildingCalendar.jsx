@@ -1,4 +1,4 @@
-﻿import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { collection, getDocs, query, where, addDoc, writeBatch, doc, onSnapshot } from "firebase/firestore";
 import { useNavigate } from 'react-router-dom';
 import { db, auth } from '../firebase';
@@ -265,10 +265,17 @@ function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose,
         });
         Object.assign(allDatesData, datesData);
 
+        const activeRoomIds = new Set();
+        priceInfos.forEach(p => {
+          const activeInfos = getModalActiveRoomInfosForDate(roomName, p.date);
+          activeInfos.forEach(info => activeRoomIds.add(info.roomId));
+        });
         const roomInfos = BUILDING_ROOMS[building]?.filter(r => r.name === roomName) || [];
+        const finalRoomIds = activeRoomIds.size > 0 ? Array.from(activeRoomIds) : roomInfos.map(info => info.roomId);
+
         return {
           roomName,
-          roomIds: roomInfos.map(info => info.roomId),
+          roomIds: finalRoomIds,
           dates: datesData
         };
       }).filter(update => update.roomIds.length > 0 && Object.keys(update.dates).length > 0);
@@ -994,7 +1001,7 @@ const getMergedRoomChannelPrices = ({
   };
 };
 
-const BEDS24_DETAIL_ROW_HEIGHT = 112;
+const BEDS24_DETAIL_ROW_HEIGHT = 82;
 const BEDS24_DETAIL_PRICE_TRACK_HEIGHT = 30;
 const BEDS24_DETAIL_MINSTAY_TRACK_HEIGHT = 22;
 const BEDS24_DETAIL_RESERVATION_TRACK_HEIGHT = 30;
@@ -2881,18 +2888,16 @@ function BuildingCalendar() {
 
     if (nextStatus === "completed" || nextStatus === "failed" || nextStatus === "partial_failed") {
       clearPendingPriceJob(jobId);
-      if (!data.coalescedIntoJobId && !data.supersededByJobId) {
-        if (nextStatus === "completed") {
-          setPriceJobToast({ status: "success", message: `Price update completed. (${existingJob.roomCount} rooms)` });
-        } else if (nextStatus === "partial_failed") {
-          const failList = (data.failedRoomIds || []).join(", ");
-          setPriceJobToast({ status: "partial", message: failList ? `Partially completed. Failed roomId: ${failList}` : "Partially completed. Please review the affected rooms." });
-        } else {
-          setPriceJobToast({ status: "error", message: `Price update failed: ${data.error || "Unknown error"}` });
-        }
-        if (existingJob.building) {
-          fetchPricesRef.current && fetchPricesRef.current(true, existingJob.building);
-        }
+      if (nextStatus === "completed") {
+        setPriceJobToast({ status: "success", message: `Price update completed. (${existingJob.roomCount} rooms)` });
+      } else if (nextStatus === "partial_failed") {
+        const failList = (data.failedRoomIds || []).join(", ");
+        setPriceJobToast({ status: "partial", message: failList ? `Partially completed. Failed roomId: ${failList}` : "Partially completed. Please review the affected rooms." });
+      } else {
+        setPriceJobToast({ status: "error", message: `Price update failed: ${data.error || "Unknown error"}` });
+      }
+      if (existingJob.building) {
+        fetchPricesRef.current && fetchPricesRef.current(true, existingJob.building);
       }
       return;
     }
@@ -7502,13 +7507,13 @@ function BuildingCalendar() {
                         <div style={{
                           display: "grid",
                           gridTemplateColumns: `${BEDS24_DETAIL_ROOM_NAME_WIDTH}px 1fr`,
-                          gridTemplateRows: `${BEDS24_DETAIL_PRICE_TRACK_HEIGHT}px ${BEDS24_DETAIL_PRICE_TRACK_HEIGHT}px ${BEDS24_DETAIL_MINSTAY_TRACK_HEIGHT}px ${BEDS24_DETAIL_RESERVATION_TRACK_HEIGHT}px`,
+                          gridTemplateRows: `${BEDS24_DETAIL_PRICE_TRACK_HEIGHT}px ${BEDS24_DETAIL_MINSTAY_TRACK_HEIGHT}px ${BEDS24_DETAIL_RESERVATION_TRACK_HEIGHT}px`,
                           width: "100%",
                           height: "100%"
                         }}>
                           <div style={{
                             gridColumn: "1 / 2",
-                            gridRow: "1 / 5",
+                            gridRow: "1 / 4",
                             display: "flex",
                             alignItems: "center",
                             justifyContent: priceMode ? "space-between" : "flex-start",
@@ -7561,16 +7566,6 @@ function BuildingCalendar() {
                             color: "#94A3B8",
                             letterSpacing: "0.025em"
                           }}>Airbnb</div>
-                          <div style={{
-                            display: "flex",
-                            alignItems: "center",
-                            paddingLeft: "10px",
-                            borderTop: "1px solid #F7FAFC",
-                            fontSize: "8.5px",
-                            fontWeight: "700",
-                            color: "#94A3B8",
-                            letterSpacing: "0.025em"
-                          }}>Booking</div>
                           <div style={{
                             display: "flex",
                             alignItems: "center",
@@ -7844,14 +7839,14 @@ function BuildingCalendar() {
                                 e.currentTarget.style.background = isToday ? "rgba(59, 130, 246, 0.05)" : "#FFFFFF";
                               }
                             }}
-                            title={(priceMode || showBeds24DetailView) && (airbnbPrice || bookingPrice || minStay)
-                              ? `Airbnb: ¥${airbnbPrice.toLocaleString()}\nBooking: ¥${bookingPrice.toLocaleString()}${priceMode ? " (Auto-sync)" : ""}\nMin Stay: ${minStay || 0} nights${isPendingPriceCell ? "\nStatus: Pending sync" : ""}`
+                            title={(priceMode || showBeds24DetailView) && (airbnbPrice || minStay)
+                              ? `Airbnb: ¥${airbnbPrice.toLocaleString()}\nMin Stay: ${minStay || 0} nights${isPendingPriceCell ? "\nStatus: Pending sync" : ""}`
                               : (isPastDate && priceMode ? "Cannot edit past dates" : "")}
                           >
                             {showBeds24DetailView && (
                               <div style={{
                                 display: "grid",
-                                gridTemplateRows: `${BEDS24_DETAIL_PRICE_TRACK_HEIGHT}px ${BEDS24_DETAIL_PRICE_TRACK_HEIGHT}px ${BEDS24_DETAIL_MINSTAY_TRACK_HEIGHT}px ${BEDS24_DETAIL_RESERVATION_TRACK_HEIGHT}px`,
+                                gridTemplateRows: `${BEDS24_DETAIL_PRICE_TRACK_HEIGHT}px ${BEDS24_DETAIL_MINSTAY_TRACK_HEIGHT}px ${BEDS24_DETAIL_RESERVATION_TRACK_HEIGHT}px`,
                                 width: "100%",
                                 height: "100%"
                               }}>
@@ -7870,22 +7865,6 @@ function BuildingCalendar() {
                                   fontFeatureSettings: '"tnum" 1, "lnum" 1'
                                 }}>
                                   {formatCalendarPriceShort(airbnbPrice)}
-                                </div>
-                                <div style={{
-                                  display: "flex",
-                                  alignItems: "center",
-                                  justifyContent: "center",
-                                  borderTop: "1px solid rgba(226, 232, 240, 0.9)",
-                                  background: "rgba(255,255,255,0.72)",
-                                  color: "#5B84E5",
-                                  fontSize: "13.5px",
-                                  fontWeight: "400",
-                                  letterSpacing: "0",
-                                  fontFamily: CALENDAR_NUMERIC_FONT_FAMILY,
-                                  fontVariantNumeric: "tabular-nums lining-nums",
-                                  fontFeatureSettings: '"tnum" 1, "lnum" 1'
-                                }}>
-                                  {formatCalendarPriceShort(bookingPrice)}
                                 </div>
                                 <div style={{
                                   display: "flex",

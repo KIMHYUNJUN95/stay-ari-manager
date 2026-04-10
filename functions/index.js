@@ -3980,10 +3980,19 @@ async function processPriceJob(jobId) {
                     console.log(`[PriceJob ${jobId}] 배치 ${b + 1}/${batches.length} 성공 (${batchRoomIds.length}개 roomId, non-array response)`);
                 }
             } catch (err) {
-                // HTTP-level 실패 (429 등) — 해당 배치 roomId 전체 failed 기록
+                // HTTP-level 실패 (429, 네트워크 에러 등) — 일시적 오류는 재시도 (queued), 치명적 오류만 failed 기록
                 const errorStr = String(err?.message || err?.response?.data?.error || "").toLowerCase();
-                const isRateLimit = err?.isRateLimit || err?.response?.status === 429 || errorStr.includes("limit exceeded") || errorStr.includes("too many requests");
-                if (isRateLimit) {
+                const errStatus = err?.response?.status;
+                const errCode = err?.code;
+                
+                const isRateLimit = err?.isRateLimit || errStatus === 429 || errorStr.includes("limit exceeded") || errorStr.includes("too many requests");
+                const isTransient = [500, 502, 503, 504].includes(errStatus) || 
+                                    ["ECONNABORTED", "ECONNRESET", "ETIMEDOUT", "ENOTFOUND"].includes(errCode) || 
+                                    errorStr.includes("timeout") || 
+                                    errorStr.includes("network error") ||
+                                    errorStr.includes("low credit");
+
+                if (isRateLimit || isTransient) {
                     const remainingRoomIds = batches.slice(b).flat().map(String);
                     const remainingRoomIdSet = new Set(remainingRoomIds);
                     const remainingRoomUpdates = effectiveRoomUpdates.filter((item) => remainingRoomIdSet.has(String(item.roomId)));
@@ -3997,10 +4006,10 @@ async function processPriceJob(jobId) {
                         error: null,
                         cooldownDeferredAt: admin.firestore.FieldValue.serverTimestamp()
                     });
-                    console.warn(`[PriceJob ${jobId}] rate limited; requeued ${remainingRoomIds.length} remaining roomIds`);
+                    console.warn(`[PriceJob ${jobId}] transient error (${err.message}); requeued ${remainingRoomIds.length} remaining roomIds`);
                     return {
                         skipped: true,
-                        reason: "beds24_api_cooldown"
+                        reason: isRateLimit ? "beds24_api_cooldown" : "transient_api_error"
                     };
                 }
                 for (const rid of batchRoomIds) {
