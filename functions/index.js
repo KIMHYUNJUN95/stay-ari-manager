@@ -5528,16 +5528,27 @@ exports.createBooking = onRequest({ cors: true, memory: "1GiB", timeoutSeconds: 
             }),
             { merge: true }
         );
-        if (!isBlock) {
-            try {
-                await scheduleOutputUpdates([buildReservationOutputImpact(newBookingEnriched)]);
-            } catch (e) {
-                console.warn("[createBooking] Output update failed:", e.message);
-            }
-            await refreshHomeDashboardSummarySafe(companyId || DEFAULT_COMPANY_ID, "manual_create_booking", "createBooking");
-        }
+        // ★ 핵심 작업(Beds24 + Firestore) 완료 → 즉시 응답
         console.log(`[createBooking] 예약 생성 성공: bookingId=${newBookingId}`);
         res.json({ success: true, bookingId: newBookingId });
+
+        // 후처리: fire-and-forget (응답 후 백그라운드 실행, 실패해도 사용자 응답 영향 없음)
+        if (!isBlock) {
+            void (async () => {
+                try {
+                    await scheduleOutputUpdates([buildReservationOutputImpact(newBookingEnriched)]);
+                    console.log(`[createBooking] BG: scheduleOutputUpdates 완료 bookingId=${newBookingId}`);
+                } catch (e) {
+                    console.warn("[createBooking] BG: scheduleOutputUpdates 실패:", e.message);
+                }
+                try {
+                    await refreshHomeDashboardSummarySafe(companyId || DEFAULT_COMPANY_ID, "manual_create_booking", "createBooking");
+                    console.log(`[createBooking] BG: refreshHomeDashboard 완료`);
+                } catch (e) {
+                    console.warn("[createBooking] BG: refreshHomeDashboard 실패:", e.message);
+                }
+            })();
+        }
     } catch (e) {
         console.error("createBooking Error:", e.message);
         res.status(500).json({ success: false, error: e.message });
