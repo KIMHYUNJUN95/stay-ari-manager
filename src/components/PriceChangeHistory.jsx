@@ -213,6 +213,21 @@ function PriceChangeHistory() {
         let result = logs;
         const validDateFrom = getValidatedDateFilter(deferredDateFromFilter);
         const validDateTo = getValidatedDateFilter(deferredDateToFilter);
+
+        // 방어 필터: 실제 가격 변동이 없는 로그 제외 (minStay/numAvail 단독 변경 잔존 데이터 대응)
+        result = result.filter(log => {
+            // priceSnapshot이 있으면 그 안에 oldPrice != newPrice 항목이 하나라도 있어야 함
+            if (Array.isArray(log.priceSnapshot) && log.priceSnapshot.length > 0) {
+                return log.priceSnapshot.some(p => p.oldPrice !== p.newPrice);
+            }
+            // priceSnapshot 없어도 oldPrice/newPrice 필드가 다르면 유지
+            if (log.oldPrice != null && log.newPrice != null) {
+                return log.oldPrice !== log.newPrice;
+            }
+            // 가격 정보가 전혀 없는 로그는 제외
+            return false;
+        });
+
         if (buildingFilter !== "all") {
             result = result.filter(log => log.building === buildingFilter);
         }

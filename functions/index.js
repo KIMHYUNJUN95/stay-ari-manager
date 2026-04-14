@@ -4203,45 +4203,50 @@ async function processPriceJob(jobId) {
             const baseRoomIds = successRoomIds.length > 0 ? successRoomIds : roomIds.map(String);
             const roomNames = [...new Set(baseRoomIds.map(rid => roomIdToName[rid] || rid))];
 
-            // 4. priceSnapshot (성공 객실만, 실패 객실은 포함하지 않음)
-            const priceSnapshot = [];
+            // 4. priceSnapshot — 실제 가격이 변경된 항목만 (oldPrice != newPrice)
+            const priceSnapshotAll = [];
             successRoomIds.forEach(rid => {
                 const roomUpdate = roomUpdateByRoomId[rid];
-                const roomName = roomUpdate?.roomName || roomIdToName[rid] || rid;
+                const rName = roomUpdate?.roomName || roomIdToName[rid] || rid;
                 Object.keys(roomUpdate?.dates || {}).sort().forEach(dKey => {
-                    priceSnapshot.push({
+                    priceSnapshotAll.push({
                         date: toDateStr(dKey),
-                        room: roomName,
+                        room: rName,
                         oldPrice: oldPricesByRoom[rid]?.[dKey] || 0,
                         newPrice: parseInt(roomUpdate?.dates?.[dKey]?.p1) || 0
                     });
                 });
             });
-            const avgOldPrice = priceSnapshot.length > 0
-                ? Math.round(priceSnapshot.reduce((s, p) => s + p.oldPrice, 0) / priceSnapshot.length) : 0;
-            const avgNewPrice = priceSnapshot.length > 0
-                ? Math.round(priceSnapshot.reduce((s, p) => s + p.newPrice, 0) / priceSnapshot.length) : 0;
+            // 가격 변동 없는 날짜(minStay/numAvail만 변경된 경우) 제외
+            const priceSnapshot = priceSnapshotAll.filter(p => p.oldPrice !== p.newPrice);
 
-            await db.collection("price_change_logs").add({
-                companyId: jobCompanyId || null,
-                jobId,
-                building: building || "unknown",
-                rooms: roomNames,
-                dateFrom,
-                dateTo,
-                totalDays: sortedDateKeys.length,
-                dates: mergedDates,
-                priceSnapshot,
-                oldPrice: avgOldPrice,
-                newPrice: avgNewPrice,
-                success: finalStatus === "completed",
-                errorMessage: failedRoomIds.length > 0 ? `${failedRoomIds.length}개 roomId 실패: ${failedRoomIds.join(", ")}` : null,
-                worker: jobWorker || "System (Queue)",
-                workerEmail: jobWorkerEmail || null,
-                origin: "queue_worker",
-                timestamp: admin.firestore.FieldValue.serverTimestamp(),
-                details: results.map(r => ({ room: roomIdToName[String(r.roomId)] || String(r.roomId), success: r.success, error: r.error || null }))
-            });
+            // 실제 가격 변동이 없으면 로그 skip
+            if (priceSnapshot.length === 0) {
+                console.log(`[PriceJob ${jobId}] 가격 변동 없음 (minStay/재고만 변경), price_change_logs skip`);
+            } else {
+                const avgOldPrice = Math.round(priceSnapshot.reduce((s, p) => s + p.oldPrice, 0) / priceSnapshot.length);
+                const avgNewPrice = Math.round(priceSnapshot.reduce((s, p) => s + p.newPrice, 0) / priceSnapshot.length);
+                await db.collection("price_change_logs").add({
+                    companyId: jobCompanyId || null,
+                    jobId,
+                    building: building || "unknown",
+                    rooms: roomNames,
+                    dateFrom,
+                    dateTo,
+                    totalDays: sortedDateKeys.length,
+                    dates: mergedDates,
+                    priceSnapshot,
+                    oldPrice: avgOldPrice,
+                    newPrice: avgNewPrice,
+                    success: finalStatus === "completed",
+                    errorMessage: failedRoomIds.length > 0 ? `${failedRoomIds.length}개 roomId 실패: ${failedRoomIds.join(", ")}` : null,
+                    worker: jobWorker || "System (Queue)",
+                    workerEmail: jobWorkerEmail || null,
+                    origin: "queue_worker",
+                    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                    details: results.map(r => ({ room: roomIdToName[String(r.roomId)] || String(r.roomId), success: r.success, error: r.error || null }))
+                });
+            }
         } catch (logErr) {
             console.error(`[PriceJob ${jobId}] 로그 저장 실패:`, logErr.message);
         }
@@ -4956,30 +4961,32 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
                 priceDiffs.sort((a, b) => a.date.localeCompare(b.date));
             }
 
-            // Write price_change_logs with companyId and price diffs
-            try {
-                const logData = {
-                    companyId,
-                    timestamp: admin.firestore.FieldValue.serverTimestamp(),
-                    building,
-                    rooms: [roomName],
-                    roomId: roomIdStr,
-                    success: true,
-                    worker: "Beds24 System",
-                    origin: "Beds24 External Change",
-                    notes: `Beds24 detected a price or inventory change for room ${roomName}.`
-                };
-                if (priceDiffs.length > 0) {
-                    logData.priceSnapshot = priceDiffs;
-                    logData.oldPrice = Math.round(priceDiffs.reduce((s, d) => s + d.oldPrice, 0) / priceDiffs.length);
-                    logData.newPrice = Math.round(priceDiffs.reduce((s, d) => s + d.newPrice, 0) / priceDiffs.length);
-                    logData.dateFrom = priceDiffs[0].date;
-                    logData.dateTo = priceDiffs[priceDiffs.length - 1].date;
-                    logData.totalDays = priceDiffs.length;
+            // Write price_change_logs — 가격 변동이 있을 때만 기록 (minStay/numAvail 단독 변경은 제외)
+            if (priceDiffs.length > 0) {
+                try {
+                    const logData = {
+                        companyId,
+                        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                        building,
+                        rooms: [roomName],
+                        roomId: roomIdStr,
+                        success: true,
+                        worker: "Beds24 System",
+                        origin: "Beds24 External Change",
+                        notes: `Beds24 detected a price change for room ${roomName}.`,
+                        priceSnapshot: priceDiffs,
+                        oldPrice: Math.round(priceDiffs.reduce((s, d) => s + d.oldPrice, 0) / priceDiffs.length),
+                        newPrice: Math.round(priceDiffs.reduce((s, d) => s + d.newPrice, 0) / priceDiffs.length),
+                        dateFrom: priceDiffs[0].date,
+                        dateTo: priceDiffs[priceDiffs.length - 1].date,
+                        totalDays: priceDiffs.length
+                    };
+                    await db.collection("price_change_logs").add(logData);
+                } catch (logErr) {
+                    console.error("[priceWebhook] price_change_logs write failed:", logErr.message);
                 }
-                await db.collection("price_change_logs").add(logData);
-            } catch (logErr) {
-                console.error("[priceWebhook] price_change_logs write failed:", logErr.message);
+            } else {
+                console.log(`[priceWebhook] 가격 변동 없음 (minStay/numAvail 변경만), 로그 skip: ${building} ${roomName}`);
             }
 
             try {
