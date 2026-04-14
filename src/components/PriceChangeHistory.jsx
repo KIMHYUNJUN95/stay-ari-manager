@@ -477,7 +477,16 @@ function PriceChangeHistory() {
         return { total, beds24, admin, converted };
     }, [filteredLogs, attributedConversions]);
 
+    // ─── 보기 모드 ───────────────────────────────────────────────────────────
+    // 롤백 방법: 아래 useState 기본값을 'comfortable'로 변경하면 Compact UI 비활성화
+    // Compact 분기를 완전 제거하려면 viewMode 관련 코드(toggle 버튼 + isCompact 분기)를 삭제
+    const [viewMode, setViewMode] = useState('comfortable');
+    const isCompact = viewMode === 'compact';
+
+    // Comfortable 모드 그리드 컬럼
     const COL = '72px 54px minmax(110px,140px) minmax(80px,110px) 126px 118px 1fr';
+    // Compact 모드 그리드 컬럼: Time | OK | Building | Room | Period | Type | Before | After | Δ%
+    const COL_COMPACT = '58px 28px minmax(90px,1fr) minmax(70px,90px) 96px 74px 72px 72px 52px';
 
     const colHeaderStyle = {
         fontSize: '11px', fontWeight: '600', color: '#8E8E93',
@@ -495,6 +504,84 @@ function PriceChangeHistory() {
         }}>{label}</button>
     );
 
+    // ─── Compact 모드 Expanded Snapshot (행 단위 테이블) ───────────────────────
+    const renderSnapshotCompact = (log, uniquePriceSnapshot, isBeds24) => (
+        <div style={{ padding: '0 12px 6px 12px', background: '#FAFAFA', borderTop: '1px solid #EBEBEB' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '11px' }}>
+                <thead>
+                    <tr style={{ background: '#F5F5F7' }}>
+                        <th style={{ padding: '3px 6px', textAlign: 'left', color: '#8E8E93', fontWeight: '600', width: '72px' }}>Date</th>
+                        <th style={{ padding: '3px 6px', textAlign: 'left', color: '#8E8E93', fontWeight: '600' }}>Room</th>
+                        <th style={{ padding: '3px 6px', textAlign: 'right', color: '#8E8E93', fontWeight: '600', width: '72px' }}>Before</th>
+                        <th style={{ padding: '3px 6px', textAlign: 'right', color: '#8E8E93', fontWeight: '600', width: '72px' }}>After</th>
+                        <th style={{ padding: '3px 6px', textAlign: 'right', color: '#8E8E93', fontWeight: '600', width: '52px' }}>Δ%</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {uniquePriceSnapshot.map((snap, sidx) => {
+                        const d = snap.newPrice - snap.oldPrice;
+                        const pct = snap.oldPrice > 0 ? Math.round(d / snap.oldPrice * 100) : null;
+                        return (
+                            <tr key={sidx} style={{ borderBottom: '1px solid #F2F2F7', background: sidx % 2 === 0 ? '#FFFFFF' : '#FAFAFA' }}>
+                                <td style={{ padding: '3px 6px', color: '#0071E3', fontVariantNumeric: 'tabular-nums', fontSize: '11px' }}>
+                                    {snap.date ? snap.date.slice(5).replace('-', '/') : '-'}
+                                </td>
+                                <td style={{ padding: '3px 6px', color: '#3C3C43', fontSize: '11px' }}>
+                                    {snap.room ? getRoomName(snap.room) : '-'}
+                                </td>
+                                <td style={{ padding: '3px 6px', textAlign: 'right', color: '#AEAEB2', fontVariantNumeric: 'tabular-nums', textDecoration: 'line-through', fontSize: '11px' }}>
+                                    {formatPrice(snap.oldPrice)}
+                                </td>
+                                <td style={{ padding: '3px 6px', textAlign: 'right', fontWeight: '700', fontVariantNumeric: 'tabular-nums', fontSize: '12px', color: d > 0 ? '#FF3B30' : d < 0 ? '#34C759' : '#1D1D1F' }}>
+                                    {formatPrice(snap.newPrice)}
+                                </td>
+                                <td style={{ padding: '3px 6px', textAlign: 'right', fontSize: '11px', fontWeight: '600', color: pct == null ? '#C7C7CC' : pct > 0 ? '#FF3B30' : pct < 0 ? '#34C759' : '#8E8E93' }}>
+                                    {pct == null ? '-' : `${pct > 0 ? '+' : ''}${pct}%`}
+                                </td>
+                            </tr>
+                        );
+                    })}
+                </tbody>
+            </table>
+            <div style={{ fontSize: '10px', color: '#AEAEB2', padding: '3px 6px 2px', textAlign: 'right' }}>
+                by {getWorkerDisplay(log)}{log.workerEmail ? ` · ${log.workerEmail}` : ''}
+            </div>
+        </div>
+    );
+
+    // ─── Comfortable 모드 Expanded Snapshot (카드 그리드) ────────────────────
+    const renderSnapshotComfortable = (log, uniquePriceSnapshot, isBeds24) => (
+        <div style={{ padding: '16px 20px 20px', background: '#F5F5F7', borderTop: '1px solid #E5E5EA' }}>
+            <div style={{ fontSize: '11px', fontWeight: '600', color: '#8E8E93', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                {isBeds24 ? 'Detected Changes' : 'Price Snapshot by Date'}
+                {log.adjustMode === 'percent' && log.percentValue && (
+                    <span style={{ background: Number(log.percentValue) > 0 ? '#FFF2F0' : '#F0FFF4', color: Number(log.percentValue) > 0 ? '#FF3B30' : '#34C759', padding: '2px 8px', borderRadius: '4px', fontSize: '11px', fontWeight: '600' }}>
+                        {Number(log.percentValue) > 0 ? '+' : ''}{log.percentValue}%
+                    </span>
+                )}
+                <span style={{ marginLeft: 'auto', fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
+                    by {getWorkerDisplay(log)}{log.workerEmail ? ` · ${log.workerEmail}` : ''}
+                </span>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(148px, 1fr))', gap: '8px' }}>
+                {uniquePriceSnapshot.map((snap, sidx) => (
+                    <div key={sidx} style={{ background: '#FFFFFF', borderRadius: '10px', padding: '10px 12px', border: '1px solid #E5E5EA' }}>
+                        <div style={{ fontSize: '11px', fontWeight: '600', color: '#0071E3', marginBottom: '5px', display: 'flex', justifyContent: 'space-between' }}>
+                            <span>{snap.date ? snap.date.slice(5).replace('-', '/') : '-'}</span>
+                            {snap.room && <span style={{ color: '#AEAEB2', fontWeight: '400' }}>{getRoomName(snap.room)}</span>}
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                            <span style={{ fontSize: '12px', color: '#AEAEB2', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums' }}>{formatPrice(snap.oldPrice)}</span>
+                            <span style={{ color: '#D1D1D6', fontSize: '10px' }}>→</span>
+                            <span style={{ fontSize: '13px', fontWeight: '700', fontVariantNumeric: 'tabular-nums', color: snap.newPrice > snap.oldPrice ? '#FF3B30' : snap.newPrice < snap.oldPrice ? '#34C759' : '#1D1D1F' }}>{formatPrice(snap.newPrice)}</span>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+
+    // ─── 행 렌더러 (Comfortable / Compact 분기) ──────────────────────────────
     const renderRows = (rows) => rows.map((log, idx) => {
         const period = extractPeriodFromDates(log);
         const isExpanded = expandedId === log.id;
@@ -506,6 +593,76 @@ function PriceChangeHistory() {
         const priceDelta = log.oldPrice > 0 && log.newPrice != null
             ? Math.round((log.newPrice - log.oldPrice) / log.oldPrice * 100) : null;
 
+        // ── Compact 행 ────────────────────────────────────────────────────────
+        if (isCompact) {
+            const zebraBase = idx % 2 === 0 ? '#FFFFFF' : '#FAFAFA';
+            return (
+                <React.Fragment key={log.id}>
+                    <div
+                        onClick={() => hasSnapshot && setExpandedId(isExpanded ? null : log.id)}
+                        onMouseEnter={e => { e.currentTarget.style.background = '#EFF6FF'; }}
+                        onMouseLeave={e => { e.currentTarget.style.background = isExpanded ? '#EFF6FF' : zebraBase; }}
+                        style={{
+                            display: 'grid', gridTemplateColumns: COL_COMPACT, alignItems: 'center',
+                            padding: '0 12px', gap: '0 6px', height: '30px',
+                            borderTop: '1px solid #F2F2F7',
+                            borderLeft: `2px solid ${isBeds24 ? '#FF9F0A' : 'transparent'}`,
+                            cursor: hasSnapshot ? 'pointer' : 'default',
+                            background: isExpanded ? '#EFF6FF' : zebraBase,
+                            transition: 'background 0.1s'
+                        }}
+                    >
+                        {/* Time */}
+                        <span style={{ fontSize: '11px', color: '#8E8E93', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+                            {formatTimestamp(log.timestamp)}
+                        </span>
+                        {/* Status */}
+                        <span style={{ fontSize: '10px', fontWeight: '700', color: log.success !== false ? '#34C759' : '#FF3B30', textAlign: 'center' }}>
+                            {log.success !== false ? '✓' : '✗'}
+                        </span>
+                        {/* Building */}
+                        <span style={{ fontSize: '12px', fontWeight: '500', color: '#1D1D1F', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {getBuildingName(log.building)}
+                        </span>
+                        {/* Room */}
+                        <span style={{ fontSize: '11px', color: '#3C3C43', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {getRoomTitle(log)}
+                        </span>
+                        {/* Period */}
+                        <span style={{ fontSize: '11px', color: '#0071E3', fontVariantNumeric: 'tabular-nums', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {formatDateRange(period.dateFrom, period.dateTo)}
+                            {period.totalDays > 0 && <span style={{ color: '#AEAEB2', marginLeft: '2px' }}>{period.totalDays}d</span>}
+                        </span>
+                        {/* Type */}
+                        <span style={{ fontSize: '10px', fontWeight: '600', color: ct.color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {ct.label}
+                        </span>
+                        {/* Before */}
+                        <span style={{ fontSize: '11px', color: '#AEAEB2', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                            {log.oldPrice != null ? formatPrice(log.oldPrice) : '—'}
+                        </span>
+                        {/* After */}
+                        <span style={{ fontSize: '12px', fontWeight: '700', fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap', color: log.newPrice > log.oldPrice ? '#FF3B30' : log.newPrice < log.oldPrice ? '#34C759' : '#1D1D1F' }}>
+                            {log.newPrice != null ? formatPrice(log.newPrice) : '—'}
+                        </span>
+                        {/* Delta % */}
+                        <span style={{ fontSize: '11px', fontWeight: '600', textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap',
+                            color: priceDelta == null ? '#C7C7CC' : priceDelta > 0 ? '#FF3B30' : priceDelta < 0 ? '#34C759' : '#8E8E93' }}>
+                            {priceDelta == null ? '—' : `${priceDelta > 0 ? '+' : ''}${priceDelta}%`}
+                            {hasSnapshot && <span style={{ color: '#C7C7CC', marginLeft: '3px', display: 'inline-block', transition: 'transform 0.15s', transform: isExpanded ? 'rotate(90deg)' : 'none' }}>›</span>}
+                        </span>
+                    </div>
+                    {log.success === false && errorMsg && (
+                        <div style={{ padding: '3px 12px 4px', fontSize: '11px', color: '#FF3B30', background: '#FFF2F0', borderTop: '1px solid #FFE5E5' }}>
+                            {errorMsg}
+                        </div>
+                    )}
+                    {isExpanded && hasSnapshot && renderSnapshotCompact(log, uniquePriceSnapshot, isBeds24)}
+                </React.Fragment>
+            );
+        }
+
+        // ── Comfortable 행 (기존 코드 그대로) ─────────────────────────────────
         return (
             <React.Fragment key={log.id}>
                 <div
@@ -580,56 +737,33 @@ function PriceChangeHistory() {
                         )}
                     </div>
                 </div>
-
-                {/* Error */}
                 {log.success === false && errorMsg && (
                     <div style={{ padding: '6px 20px 8px', fontSize: '12px', color: '#FF3B30', background: '#FFF2F0', borderTop: '1px solid #FFE5E5' }}>
                         {errorMsg}
                     </div>
                 )}
-
-                {/* Expanded Snapshot */}
-                {isExpanded && hasSnapshot && (
-                    <div style={{ padding: '16px 20px 20px', background: '#F5F5F7', borderTop: '1px solid #E5E5EA' }}>
-                        <div style={{ fontSize: '11px', fontWeight: '600', color: '#8E8E93', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            {isBeds24 ? 'Detected Changes' : 'Price Snapshot by Date'}
-                            {log.adjustMode === 'percent' && log.percentValue && (
-                                <span style={{ background: Number(log.percentValue) > 0 ? '#FFF2F0' : '#F0FFF4', color: Number(log.percentValue) > 0 ? '#FF3B30' : '#34C759', padding: '2px 8px', borderRadius: '4px', fontSize: '11px', fontWeight: '600' }}>
-                                    {Number(log.percentValue) > 0 ? '+' : ''}{log.percentValue}%
-                                </span>
-                            )}
-                            <span style={{ marginLeft: 'auto', fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
-                                by {getWorkerDisplay(log)}{log.workerEmail ? ` · ${log.workerEmail}` : ''}
-                            </span>
-                        </div>
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(148px, 1fr))', gap: '8px' }}>
-                            {uniquePriceSnapshot.map((snap, sidx) => (
-                                <div key={sidx} style={{ background: '#FFFFFF', borderRadius: '10px', padding: '10px 12px', border: '1px solid #E5E5EA' }}>
-                                    <div style={{ fontSize: '11px', fontWeight: '600', color: '#0071E3', marginBottom: '5px', display: 'flex', justifyContent: 'space-between' }}>
-                                        <span>{snap.date ? snap.date.slice(5).replace('-', '/') : '-'}</span>
-                                        {snap.room && <span style={{ color: '#AEAEB2', fontWeight: '400' }}>{getRoomName(snap.room)}</span>}
-                                    </div>
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                                        <span style={{ fontSize: '12px', color: '#AEAEB2', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums' }}>{formatPrice(snap.oldPrice)}</span>
-                                        <span style={{ color: '#D1D1D6', fontSize: '10px' }}>→</span>
-                                        <span style={{ fontSize: '13px', fontWeight: '700', fontVariantNumeric: 'tabular-nums', color: snap.newPrice > snap.oldPrice ? '#FF3B30' : snap.newPrice < snap.oldPrice ? '#34C759' : '#1D1D1F' }}>{formatPrice(snap.newPrice)}</span>
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    </div>
-                )}
+                {isExpanded && hasSnapshot && renderSnapshotComfortable(log, uniquePriceSnapshot, isBeds24)}
             </React.Fragment>
         );
     });
 
-    const groupHeaderStyle = (sub = false) => ({
-        padding: sub ? '6px 20px' : '8px 20px',
-        background: sub ? '#F9F9F9' : '#F2F2F7',
-        borderTop: '1px solid #E5E5EA',
-        borderBottom: '1px solid #E5E5EA',
-        display: 'flex', alignItems: 'center', gap: '8px'
-    });
+    const groupHeaderStyle = (sub = false) => (
+        isCompact
+            ? {
+                padding: sub ? '2px 12px' : '3px 12px',
+                background: sub ? '#F5F5F7' : '#EBEBEB',
+                borderTop: '1px solid #E0E0E0',
+                borderBottom: '1px solid #E0E0E0',
+                display: 'flex', alignItems: 'center', gap: '6px', height: '22px'
+            }
+            : {
+                padding: sub ? '6px 20px' : '8px 20px',
+                background: sub ? '#F9F9F9' : '#F2F2F7',
+                borderTop: '1px solid #E5E5EA',
+                borderBottom: '1px solid #E5E5EA',
+                display: 'flex', alignItems: 'center', gap: '8px'
+            }
+    );
 
     return (
         <div style={{
@@ -778,6 +912,25 @@ function PriceChangeHistory() {
                     {filteredLogs.length} of {logs.length}
                 </span>
 
+                {/* View Mode toggle */}
+                <div style={{
+                    display: 'inline-flex', alignItems: 'center',
+                    background: '#E5E5EA', borderRadius: '10px', padding: '3px', gap: '2px'
+                }}>
+                    {['comfortable', 'compact'].map(mode => (
+                        <button key={mode} onClick={() => setViewMode(mode)} style={{
+                            padding: '5px 11px', borderRadius: '8px', border: 'none', cursor: 'pointer',
+                            background: viewMode === mode ? '#FFFFFF' : 'transparent',
+                            color: viewMode === mode ? '#1D1D1F' : '#6E6E73',
+                            fontSize: '12px', fontWeight: viewMode === mode ? '600' : '400',
+                            boxShadow: viewMode === mode ? '0 1px 4px rgba(0,0,0,0.14)' : 'none',
+                            transition: 'all 0.15s', whiteSpace: 'nowrap'
+                        }}>
+                            {mode === 'comfortable' ? 'Comfortable' : 'Compact'}
+                        </button>
+                    ))}
+                </div>
+
                 {/* Group By segment control — pushed right */}
                 <div style={{
                     marginLeft: 'auto',
@@ -892,32 +1045,53 @@ function PriceChangeHistory() {
                     boxShadow: '0 1px 4px rgba(0,0,0,0.06), 0 0 0 0.5px rgba(0,0,0,0.06)',
                     overflow: 'hidden'
                 }}>
-                    {/* Column headers */}
-                    <div style={{
-                        display: 'grid', gridTemplateColumns: COL,
-                        padding: '9px 20px', gap: '0 8px',
-                        borderBottom: '1px solid #E5E5EA',
-                        background: '#FAFAFA'
-                    }}>
-                        <span style={colHeaderStyle}>Time</span>
-                        <span style={colHeaderStyle}>Status</span>
-                        <span style={colHeaderStyle}>Building</span>
-                        <span style={colHeaderStyle}>Room</span>
-                        <span style={colHeaderStyle}>Period</span>
-                        <span style={colHeaderStyle}>Type</span>
-                        <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Price Change</span>
-                    </div>
+                    {/* Column headers — Compact */}
+                    {isCompact && (
+                        <div style={{
+                            display: 'grid', gridTemplateColumns: COL_COMPACT,
+                            padding: '0 12px', gap: '0 6px', height: '26px', alignItems: 'center',
+                            borderBottom: '1px solid #E5E5EA', background: '#F5F5F7',
+                            position: 'sticky', top: 0, zIndex: 1
+                        }}>
+                            <span style={colHeaderStyle}>Time</span>
+                            <span style={colHeaderStyle}>OK</span>
+                            <span style={colHeaderStyle}>Building</span>
+                            <span style={colHeaderStyle}>Room</span>
+                            <span style={colHeaderStyle}>Period</span>
+                            <span style={colHeaderStyle}>Type</span>
+                            <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Before</span>
+                            <span style={{ ...colHeaderStyle, textAlign: 'right' }}>After</span>
+                            <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Δ%</span>
+                        </div>
+                    )}
+                    {/* Column headers — Comfortable */}
+                    {!isCompact && (
+                        <div style={{
+                            display: 'grid', gridTemplateColumns: COL,
+                            padding: '9px 20px', gap: '0 8px',
+                            borderBottom: '1px solid #E5E5EA',
+                            background: '#FAFAFA'
+                        }}>
+                            <span style={colHeaderStyle}>Time</span>
+                            <span style={colHeaderStyle}>Status</span>
+                            <span style={colHeaderStyle}>Building</span>
+                            <span style={colHeaderStyle}>Room</span>
+                            <span style={colHeaderStyle}>Period</span>
+                            <span style={colHeaderStyle}>Type</span>
+                            <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Price Change</span>
+                        </div>
+                    )}
 
                     {/* Rows — By Date */}
                     {groupBy === 'date' && groupedLogs.map(([dateKey, dateLogs]) => (
                         <React.Fragment key={dateKey}>
                             <div style={groupHeaderStyle()}>
-                                <span style={{ fontSize: '12px', fontWeight: '600', color: '#3C3C43' }}>
-                                    {formatDateFull(dateKey)}
+                                <span style={{ fontSize: isCompact ? '11px' : '12px', fontWeight: '600', color: '#3C3C43' }}>
+                                    {isCompact ? `${dateKey} · ${dateLogs.length} change${dateLogs.length !== 1 ? 's' : ''}` : formatDateFull(dateKey)}
                                 </span>
-                                <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
+                                {!isCompact && <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
                                     {dateLogs.length} change{dateLogs.length !== 1 ? 's' : ''}
-                                </span>
+                                </span>}
                             </div>
                             {renderRows(dateLogs)}
                         </React.Fragment>
@@ -927,12 +1101,12 @@ function PriceChangeHistory() {
                     {groupBy === 'building' && groupedByBuilding.map(([building, buildingLogs]) => (
                         <React.Fragment key={building}>
                             <div style={groupHeaderStyle()}>
-                                <span style={{ fontSize: '12px', fontWeight: '600', color: '#3C3C43' }}>
-                                    {getBuildingName(building)}
+                                <span style={{ fontSize: isCompact ? '11px' : '12px', fontWeight: '600', color: '#3C3C43' }}>
+                                    {isCompact ? `${getBuildingName(building)} · ${buildingLogs.length} record${buildingLogs.length !== 1 ? 's' : ''}` : getBuildingName(building)}
                                 </span>
-                                <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
+                                {!isCompact && <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
                                     {buildingLogs.length} record{buildingLogs.length !== 1 ? 's' : ''}
-                                </span>
+                                </span>}
                             </div>
                             {renderRows(buildingLogs)}
                         </React.Fragment>
@@ -942,22 +1116,24 @@ function PriceChangeHistory() {
                     {groupBy === 'building+date' && groupedByBuildingDate.map(([building, dateGroups]) => (
                         <React.Fragment key={building}>
                             <div style={groupHeaderStyle()}>
-                                <span style={{ fontSize: '12px', fontWeight: '700', color: '#1D1D1F' }}>
-                                    {getBuildingName(building)}
+                                <span style={{ fontSize: isCompact ? '11px' : '12px', fontWeight: '700', color: '#1D1D1F' }}>
+                                    {isCompact
+                                        ? `${getBuildingName(building)} · ${dateGroups.reduce((s, [, rows]) => s + rows.length, 0)} records`
+                                        : getBuildingName(building)}
                                 </span>
-                                <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
+                                {!isCompact && <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
                                     {dateGroups.reduce((s, [, rows]) => s + rows.length, 0)} records
-                                </span>
+                                </span>}
                             </div>
                             {dateGroups.map(([dateKey, dateLogs]) => (
                                 <React.Fragment key={dateKey}>
                                     <div style={groupHeaderStyle(true)}>
                                         <span style={{ fontSize: '11px', fontWeight: '500', color: '#6E6E73' }}>
-                                            {formatDateFull(dateKey)}
+                                            {isCompact ? `${dateKey} · ${dateLogs.length}` : formatDateFull(dateKey)}
                                         </span>
-                                        <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
+                                        {!isCompact && <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
                                             {dateLogs.length} change{dateLogs.length !== 1 ? 's' : ''}
-                                        </span>
+                                        </span>}
                                     </div>
                                     {renderRows(dateLogs)}
                                 </React.Fragment>
