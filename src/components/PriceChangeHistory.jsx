@@ -371,8 +371,8 @@ function PriceChangeHistory() {
     const getRoomTitle = (log) => {
         if (Array.isArray(log.rooms) && log.rooms.length > 0) {
             const names = log.rooms.map(getRoomName);
-            if (names.length <= 2) return names.join(", ");
-            return `${names.slice(0, 2).join(", ")} +${names.length - 2}`;
+            if (names.length === 1) return names[0];
+            return `${names[0]} +${names.length - 1}`;
         }
         return getRoomName(log.room);
     };
@@ -477,11 +477,11 @@ function PriceChangeHistory() {
         return { total, beds24, admin, converted };
     }, [filteredLogs, attributedConversions]);
 
-    // 그리드 컬럼: Time | OK | Building | Room | Period | Type | Before | After | Δ%
-    const COL = '58px 28px minmax(90px,1fr) minmax(70px,90px) 96px 74px 72px 72px 52px';
+    // 그리드 컬럼: Time | OK | Building | Room | Period | Type | Modifier | Before | After | Δ%
+    const COL = '54px 24px 132px 108px 156px 122px 150px 84px 84px 54px';
 
     const colHeaderStyle = {
-        fontSize: '11px', fontWeight: '600', color: '#8E8E93',
+        fontSize: '12px', fontWeight: '600', color: '#8E8E93',
         textTransform: 'uppercase', letterSpacing: '0.04em', userSelect: 'none'
     };
 
@@ -496,47 +496,55 @@ function PriceChangeHistory() {
         }}>{label}</button>
     );
 
-    // ─── Compact 모드 Expanded Snapshot (행 단위 테이블) ───────────────────────
+    // ─── Expanded Snapshot: 오른쪽 정렬 표 대신 아래쪽 세로 카드 리스트 ─────────────
     const renderSnapshotCompact = (log, uniquePriceSnapshot, isBeds24) => (
-        <div style={{ padding: '0 12px 6px 12px', background: '#FAFAFA', borderTop: '1px solid #EBEBEB' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '11px' }}>
-                <thead>
-                    <tr style={{ background: '#F5F5F7' }}>
-                        <th style={{ padding: '3px 6px', textAlign: 'left', color: '#8E8E93', fontWeight: '600', width: '72px' }}>Date</th>
-                        <th style={{ padding: '3px 6px', textAlign: 'left', color: '#8E8E93', fontWeight: '600' }}>Room</th>
-                        <th style={{ padding: '3px 6px', textAlign: 'right', color: '#8E8E93', fontWeight: '600', width: '72px' }}>Before</th>
-                        <th style={{ padding: '3px 6px', textAlign: 'right', color: '#8E8E93', fontWeight: '600', width: '72px' }}>After</th>
-                        <th style={{ padding: '3px 6px', textAlign: 'right', color: '#8E8E93', fontWeight: '600', width: '52px' }}>Δ%</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {uniquePriceSnapshot.map((snap, sidx) => {
-                        const d = snap.newPrice - snap.oldPrice;
-                        const pct = snap.oldPrice > 0 ? Math.round(d / snap.oldPrice * 100) : null;
-                        return (
-                            <tr key={sidx} style={{ borderBottom: '1px solid #F2F2F7', background: sidx % 2 === 0 ? '#FFFFFF' : '#FAFAFA' }}>
-                                <td style={{ padding: '3px 6px', color: '#0071E3', fontVariantNumeric: 'tabular-nums', fontSize: '11px' }}>
+        <div style={{ padding: '8px 10px 10px', background: '#FAFAFA', borderTop: '1px solid #EBEBEB' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                {uniquePriceSnapshot.map((snap, sidx) => {
+                    const d = snap.newPrice - snap.oldPrice;
+                    const pct = snap.oldPrice > 0 ? Math.round(d / snap.oldPrice * 100) : null;
+                    return (
+                        <div
+                            key={sidx}
+                            style={{
+                                background: '#FFFFFF',
+                                border: `1px solid ${isBeds24 ? '#FFE7BF' : '#E5E7EB'}`,
+                                borderRadius: '8px',
+                                padding: '7px 9px'
+                            }}
+                        >
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', flexWrap: 'wrap' }}>
+                                <span style={{ fontSize: '12px', fontWeight: '700', color: '#334155', fontVariantNumeric: 'tabular-nums' }}>
                                     {snap.date ? snap.date.slice(5).replace('-', '/') : '-'}
-                                </td>
-                                <td style={{ padding: '3px 6px', color: '#3C3C43', fontSize: '11px' }}>
+                                </span>
+                                <span style={{ fontSize: '12px', color: '#475569' }}>
                                     {snap.room ? getRoomName(snap.room) : '-'}
-                                </td>
-                                <td style={{ padding: '3px 6px', textAlign: 'right', color: '#AEAEB2', fontVariantNumeric: 'tabular-nums', textDecoration: 'line-through', fontSize: '11px' }}>
+                                </span>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                <span style={{ fontSize: '12px', color: '#94A3B8', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums' }}>
                                     {formatPrice(snap.oldPrice)}
-                                </td>
-                                <td style={{ padding: '3px 6px', textAlign: 'right', fontWeight: '700', fontVariantNumeric: 'tabular-nums', fontSize: '12px', color: d > 0 ? '#FF3B30' : d < 0 ? '#34C759' : '#1D1D1F' }}>
+                                </span>
+                                <span style={{ fontSize: '12px', color: '#94A3B8' }}>→</span>
+                                <span style={{ fontSize: '13px', fontWeight: '700', color: d > 0 ? '#16A34A' : d < 0 ? '#DC2626' : '#1D1D1F', fontVariantNumeric: 'tabular-nums' }}>
                                     {formatPrice(snap.newPrice)}
-                                </td>
-                                <td style={{ padding: '3px 6px', textAlign: 'right', fontSize: '11px', fontWeight: '600', color: pct == null ? '#C7C7CC' : pct > 0 ? '#FF3B30' : pct < 0 ? '#34C759' : '#8E8E93' }}>
+                                </span>
+                                <span
+                                    style={{
+                                        fontSize: '11px',
+                                        fontWeight: '700',
+                                        padding: '1px 7px',
+                                        borderRadius: '999px',
+                                        color: pct == null ? '#64748B' : pct > 0 ? '#166534' : pct < 0 ? '#B91C1C' : '#64748B',
+                                        background: pct == null ? '#E2E8F0' : pct > 0 ? '#DCFCE7' : pct < 0 ? '#FEE2E2' : '#E2E8F0'
+                                    }}
+                                >
                                     {pct == null ? '-' : `${pct > 0 ? '+' : ''}${pct}%`}
-                                </td>
-                            </tr>
-                        );
-                    })}
-                </tbody>
-            </table>
-            <div style={{ fontSize: '10px', color: '#AEAEB2', padding: '3px 6px 2px', textAlign: 'right' }}>
-                by {getWorkerDisplay(log)}{log.workerEmail ? ` · ${log.workerEmail}` : ''}
+                                </span>
+                            </div>
+                        </div>
+                    );
+                })}
             </div>
         </div>
     );
@@ -547,6 +555,7 @@ function PriceChangeHistory() {
         const isExpanded = expandedId === log.id;
         const uniquePriceSnapshot = getUniquePriceSnapshot(log);
         const hasSnapshot = uniquePriceSnapshot.length > 0;
+        const changedCellsCount = hasSnapshot ? uniquePriceSnapshot.length : 1;
         const isBeds24 = log.origin?.includes("Beds24") || log.origin?.includes("외부");
         const ct = getChangeTypeLabel(log);
         const errorMsg = log.errorMessage || log.error;
@@ -562,7 +571,7 @@ function PriceChangeHistory() {
                     onMouseLeave={e => { e.currentTarget.style.background = isExpanded ? '#EFF6FF' : zebraBase; }}
                     style={{
                         display: 'grid', gridTemplateColumns: COL, alignItems: 'center',
-                        padding: '0 12px', gap: '0 6px', height: '30px',
+                        padding: '0 10px', gap: '0 6px', minHeight: '40px',
                         borderTop: '1px solid #F2F2F7',
                         borderLeft: `2px solid ${isBeds24 ? '#FF9F0A' : 'transparent'}`,
                         cursor: hasSnapshot ? 'pointer' : 'default',
@@ -570,39 +579,48 @@ function PriceChangeHistory() {
                         transition: 'background 0.1s'
                     }}
                 >
-                    <span style={{ fontSize: '11px', color: '#8E8E93', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+                    <span style={{ fontSize: '12px', color: '#8E8E93', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
                         {formatTimestamp(log.timestamp)}
                     </span>
-                    <span style={{ fontSize: '10px', fontWeight: '700', color: log.success !== false ? '#34C759' : '#FF3B30', textAlign: 'center' }}>
+                    <span style={{ fontSize: '11px', fontWeight: '700', color: log.success !== false ? '#34C759' : '#FF3B30', textAlign: 'center' }}>
                         {log.success !== false ? '✓' : '✗'}
                     </span>
-                    <span style={{ fontSize: '12px', fontWeight: '500', color: '#1D1D1F', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    <span style={{ fontSize: '13px', fontWeight: '500', color: '#1D1D1F', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {getBuildingName(log.building)}
                     </span>
-                    <span style={{ fontSize: '11px', color: '#3C3C43', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    <span style={{ fontSize: '12px', color: '#3C3C43', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {getRoomTitle(log)}
                     </span>
-                    <span style={{ fontSize: '11px', color: '#0071E3', fontVariantNumeric: 'tabular-nums', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {formatDateRange(period.dateFrom, period.dateTo)}
-                        {period.totalDays > 0 && <span style={{ color: '#AEAEB2', marginLeft: '2px' }}>{period.totalDays}d</span>}
+                    <span style={{ fontSize: '12px', color: '#0071E3', fontVariantNumeric: 'tabular-nums', overflow: 'visible', textOverflow: 'clip', whiteSpace: 'normal', lineHeight: 1.2 }}>
+                        <span>{formatDateRange(period.dateFrom, period.dateTo)}</span>
+                        {period.totalDays > 0 && <span style={{ color: '#AEAEB2', marginLeft: '4px' }}>{period.totalDays}d</span>}
+                        {changedCellsCount > 0 && <span style={{ color: '#64748B', marginLeft: '6px', fontWeight: '600' }}>{changedCellsCount} cells</span>}
                     </span>
-                    <span style={{ fontSize: '10px', fontWeight: '600', color: ct.color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    <span style={{ fontSize: '12px', fontWeight: '600', color: ct.color, overflow: 'visible', textOverflow: 'clip', whiteSpace: 'normal', lineHeight: 1.2 }}>
                         {ct.label}
                     </span>
-                    <span style={{ fontSize: '11px', color: '#AEAEB2', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                    <span style={{ display: 'flex', flexDirection: 'column', lineHeight: 1.2, overflow: 'hidden' }}>
+                        <span style={{ fontSize: '12px', fontWeight: '600', color: '#1F2937', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {getWorkerDisplay(log)}
+                        </span>
+                        <span style={{ fontSize: '11px', color: '#6B7280', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {log.workerEmail || '-'}
+                        </span>
+                    </span>
+                    <span style={{ fontSize: '12px', color: '#AEAEB2', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap' }}>
                         {log.oldPrice != null ? formatPrice(log.oldPrice) : '—'}
                     </span>
-                    <span style={{ fontSize: '12px', fontWeight: '700', fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap', color: log.newPrice > log.oldPrice ? '#FF3B30' : log.newPrice < log.oldPrice ? '#34C759' : '#1D1D1F' }}>
+                    <span style={{ fontSize: '13px', fontWeight: '700', fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap', color: log.newPrice > log.oldPrice ? '#16A34A' : log.newPrice < log.oldPrice ? '#DC2626' : '#1D1D1F' }}>
                         {log.newPrice != null ? formatPrice(log.newPrice) : '—'}
                     </span>
-                    <span style={{ fontSize: '11px', fontWeight: '600', textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap',
-                        color: priceDelta == null ? '#C7C7CC' : priceDelta > 0 ? '#FF3B30' : priceDelta < 0 ? '#34C759' : '#8E8E93' }}>
+                    <span style={{ fontSize: '12px', fontWeight: '600', textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap',
+                        color: priceDelta == null ? '#C7C7CC' : priceDelta > 0 ? '#16A34A' : priceDelta < 0 ? '#DC2626' : '#8E8E93' }}>
                         {priceDelta == null ? '—' : `${priceDelta > 0 ? '+' : ''}${priceDelta}%`}
                         {hasSnapshot && <span style={{ color: '#C7C7CC', marginLeft: '3px', display: 'inline-block', transition: 'transform 0.15s', transform: isExpanded ? 'rotate(90deg)' : 'none' }}>›</span>}
                     </span>
                 </div>
                 {log.success === false && errorMsg && (
-                    <div style={{ padding: '3px 12px 4px', fontSize: '11px', color: '#FF3B30', background: '#FFF2F0', borderTop: '1px solid #FFE5E5' }}>
+                    <div style={{ padding: '4px 10px', fontSize: '12px', color: '#FF3B30', background: '#FFF2F0', borderTop: '1px solid #FFE5E5' }}>
                         {errorMsg}
                     </div>
                 )}
@@ -612,22 +630,22 @@ function PriceChangeHistory() {
     });
 
     const groupHeaderStyle = (sub = false) => ({
-        padding: sub ? '2px 12px' : '3px 12px',
+        padding: sub ? '3px 10px' : '4px 10px',
         background: sub ? '#F5F5F7' : '#EBEBEB',
         borderTop: '1px solid #E0E0E0',
         borderBottom: '1px solid #E0E0E0',
-        display: 'flex', alignItems: 'center', gap: '6px', height: '22px'
+        display: 'flex', alignItems: 'center', gap: '6px', height: '26px'
     });
 
     return (
         <div style={{
-            padding: '14px 20px',
+            padding: '12px 14px',
             background: '#F5F5F7',
             minHeight: '100vh',
             fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif'
         }}>
             {/* Header */}
-            <div style={{ marginBottom: '10px', display: 'flex', alignItems: 'baseline', gap: '12px' }}>
+            <div style={{ marginBottom: '10px', display: 'flex', alignItems: 'baseline', gap: '10px' }}>
                 <h1 style={{ fontSize: '20px', fontWeight: '700', color: '#1D1D1F', margin: 0, letterSpacing: '-0.3px' }}>
                     Price History
                 </h1>
@@ -835,7 +853,7 @@ function PriceChangeHistory() {
                     {/* Column headers */}
                     <div style={{
                         display: 'grid', gridTemplateColumns: COL,
-                        padding: '0 12px', gap: '0 6px', height: '26px', alignItems: 'center',
+                        padding: '0 10px', gap: '0 6px', height: '30px', alignItems: 'center',
                         borderBottom: '1px solid #E5E5EA', background: '#F5F5F7',
                         position: 'sticky', top: 0, zIndex: 1
                     }}>
@@ -845,6 +863,7 @@ function PriceChangeHistory() {
                         <span style={colHeaderStyle}>Room</span>
                         <span style={colHeaderStyle}>Period</span>
                         <span style={colHeaderStyle}>Type</span>
+                        <span style={colHeaderStyle}>Modifier</span>
                         <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Before</span>
                         <span style={{ ...colHeaderStyle, textAlign: 'right' }}>After</span>
                         <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Δ%</span>
@@ -854,7 +873,7 @@ function PriceChangeHistory() {
                     {groupBy === 'date' && groupedLogs.map(([dateKey, dateLogs]) => (
                         <React.Fragment key={dateKey}>
                             <div style={groupHeaderStyle()}>
-                                <span style={{ fontSize: '11px', fontWeight: '600', color: '#3C3C43' }}>
+                                <span style={{ fontSize: '12px', fontWeight: '600', color: '#3C3C43' }}>
                                     {`${dateKey} · ${dateLogs.length} change${dateLogs.length !== 1 ? 's' : ''}`}
                                 </span>
                             </div>
@@ -866,7 +885,7 @@ function PriceChangeHistory() {
                     {groupBy === 'building' && groupedByBuilding.map(([building, buildingLogs]) => (
                         <React.Fragment key={building}>
                             <div style={groupHeaderStyle()}>
-                                <span style={{ fontSize: '11px', fontWeight: '600', color: '#3C3C43' }}>
+                                <span style={{ fontSize: '12px', fontWeight: '600', color: '#3C3C43' }}>
                                     {`${getBuildingName(building)} · ${buildingLogs.length} record${buildingLogs.length !== 1 ? 's' : ''}`}
                                 </span>
                             </div>
@@ -878,14 +897,14 @@ function PriceChangeHistory() {
                     {groupBy === 'building+date' && groupedByBuildingDate.map(([building, dateGroups]) => (
                         <React.Fragment key={building}>
                             <div style={groupHeaderStyle()}>
-                                <span style={{ fontSize: '11px', fontWeight: '700', color: '#1D1D1F' }}>
+                                <span style={{ fontSize: '12px', fontWeight: '700', color: '#1D1D1F' }}>
                                     {`${getBuildingName(building)} · ${dateGroups.reduce((s, [, rows]) => s + rows.length, 0)} records`}
                                 </span>
                             </div>
                             {dateGroups.map(([dateKey, dateLogs]) => (
                                 <React.Fragment key={dateKey}>
                                     <div style={groupHeaderStyle(true)}>
-                                        <span style={{ fontSize: '11px', fontWeight: '500', color: '#6E6E73' }}>
+                                        <span style={{ fontSize: '12px', fontWeight: '500', color: '#6E6E73' }}>
                                             {`${dateKey} · ${dateLogs.length}`}
                                         </span>
                                     </div>
