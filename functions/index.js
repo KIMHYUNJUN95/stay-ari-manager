@@ -5650,7 +5650,7 @@ exports.updateBooking = onRequest({ cors: true }, async (req, res) => {
 // 예약 취소/삭제 (Beds24 -> Firebase)
 // ==========================================
 // ★ 예약 취소 - V2 마이그레이션 완료
-exports.cancelBooking = onRequest({ cors: true }, async (req, res) => {
+exports.cancelBooking = onRequest({ cors: true, memory: "1GiB", timeoutSeconds: 120 }, async (req, res) => {
     try {
         const { bookId, companyId, reason, cancelledBy, staffId, operatorId } = req.body;
         if (!companyId) return res.status(400).json({ success: false, error: "Missing companyId" });
@@ -5748,17 +5748,28 @@ exports.cancelBooking = onRequest({ cors: true }, async (req, res) => {
             }),
             { merge: true }
         );
-        if (!isInventoryOverrideBlock) {
-            try {
-                const cancelledDoc = { ...existingData, id: String(bookId), bookId: String(bookId), status: "cancelled", cancelTime: new Date().toISOString() };
-                await scheduleOutputUpdates([buildReservationOutputImpact(cancelledDoc)]);
-            } catch (e) {
-                console.warn("[cancelBooking] Output update failed:", e.message);
-            }
-            await refreshHomeDashboardSummarySafe(companyId, "manual_cancel_booking", "cancelBooking");
-        }
+        // ★ 핵심 작업(Beds24 취소 + Firestore 업데이트) 완료 → 즉시 응답
         console.log(`[cancelBooking] 예약 취소 완료: bookId=${bookId}`);
         res.json({ success: true });
+
+        // 후처리: fire-and-forget (응답 후 백그라운드 실행, 실패해도 사용자 응답 영향 없음)
+        if (!isInventoryOverrideBlock) {
+            void (async () => {
+                try {
+                    const cancelledDoc = { ...existingData, id: String(bookId), bookId: String(bookId), status: "cancelled", cancelTime: new Date().toISOString() };
+                    await scheduleOutputUpdates([buildReservationOutputImpact(cancelledDoc)]);
+                    console.log(`[cancelBooking] BG: scheduleOutputUpdates 완료 bookId=${bookId}`);
+                } catch (e) {
+                    console.warn("[cancelBooking] BG: scheduleOutputUpdates 실패:", e.message);
+                }
+                try {
+                    await refreshHomeDashboardSummarySafe(companyId, "manual_cancel_booking", "cancelBooking");
+                    console.log(`[cancelBooking] BG: refreshHomeDashboard 완료`);
+                } catch (e) {
+                    console.warn("[cancelBooking] BG: refreshHomeDashboard 실패:", e.message);
+                }
+            })();
+        }
     } catch (e) {
         console.error("cancelBooking Error:", e.message);
         res.status(500).json({ success: false, error: e.message });
