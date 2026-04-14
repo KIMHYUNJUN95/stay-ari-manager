@@ -5355,7 +5355,7 @@ async function clearBeds24BlackoutOverride({ roomId, arrival, departure, restore
 }
 
 // ★ 예약 생성 - V2 마이그레이션 완료 (roomId 직접 수신)
-exports.createBooking = onRequest({ cors: true }, async (req, res) => {
+exports.createBooking = onRequest({ cors: true, memory: "1GiB", timeoutSeconds: 120 }, async (req, res) => {
     try {
         // roomId를 직접 받음 (프론트엔드에서 전송)
         const { companyId, building, blockSegments, roomId, room, arrival, departure, guestName, numAdult, numChild, guestPhone, guestEmail, source, price, comments, staffId, operatorId, isBlock: requestedBlock } = req.body;
