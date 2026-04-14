@@ -2722,6 +2722,7 @@ function BuildingCalendar() {
 
   // 캘린더 드래그 스크롤 참조
   const calendarRef = React.useRef(null);
+  const calendarHeaderRowRef = useRef(null);
   const [isDraggingCalendar, setIsDraggingCalendar] = useState(false);
   const [startX, setStartX] = useState(0);
   const [scrollLeft, setScrollLeft] = useState(0);
@@ -3249,6 +3250,145 @@ function BuildingCalendar() {
 
   // 롤링 뷰용 (다른 곳에서 사용)
   const rollingDays = viewMode === "rolling" ? displayDays : [];
+
+  const renderCalendarDateHeader = (headerRef = null) => (
+    <div
+      ref={headerRef}
+      style={{
+        display: "flex",
+        borderBottom: "1px solid #E5E7EB",
+        background: "#F9FAFB",
+        position: "relative",
+        minHeight: "48px",
+        flexShrink: 0
+      }}
+    >
+      <div style={{
+        width: showBeds24DetailView ? `${BEDS24_DETAIL_STICKY_WIDTH}px` : "120px",
+        minWidth: showBeds24DetailView ? `${BEDS24_DETAIL_STICKY_WIDTH}px` : "120px",
+        padding: "16px 12px",
+        fontWeight: "700",
+        fontSize: "12px",
+        color: "#4B5563",
+        textTransform: "uppercase",
+        letterSpacing: "0.5px",
+        borderRight: "1px solid #E5E7EB",
+        background: "#F9FAFB",
+        position: "sticky",
+        left: 0,
+        zIndex: 121
+      }}>
+        Room
+      </div>
+      {viewMode === "monthly" ? (
+        Array.from({ length: daysInMonth }, (_, i) => {
+          const day = i + 1;
+          const date = new Date(year, month, day);
+          const dayOfWeek = date.getDay();
+          const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+          const isToday = new Date().toDateString() === date.toDateString();
+          const isHeaderSelected = selectedDateSet.has(dayjs(date).format("YYYY-MM-DD"));
+          const isPastHeaderDate = date < new Date(new Date().setHours(0, 0, 0, 0));
+
+          return (
+            <div
+              key={day}
+              style={{
+                flex: "1 1 0",
+                minWidth: "32px",
+                padding: "10px 2px",
+                minHeight: "48px",
+                boxSizing: "border-box",
+                textAlign: "center",
+                fontSize: "12px",
+                fontWeight: isToday ? "800" : "600",
+                color: isPastHeaderDate
+                  ? "#94A3B8"
+                  : isToday
+                    ? "#3B82F6"
+                    : isWeekend
+                      ? "#E98B8B"
+                      : "#4B5563",
+                background: isHeaderSelected
+                  ? "linear-gradient(180deg, rgba(245,158,11,0.18) 0%, rgba(251,191,36,0.08) 100%)"
+                  : isToday
+                    ? "#EFF6FF"
+                    : isPastHeaderDate
+                      ? "rgba(248,250,252,0.96)"
+                      : "#F9FAFB",
+                borderRight: "1px solid #F3F4F6",
+                boxShadow: isHeaderSelected ? "inset 0 -3px 0 #F59E0B" : "none",
+                display: "flex",
+                flexDirection: "column",
+                gap: "2px",
+                opacity: isPastHeaderDate ? 0.72 : 1
+              }}
+            >
+              <div style={{ fontSize: "13px" }}>{day}</div>
+              <div style={{ fontSize: "9px", opacity: 0.7 }}>
+                {["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"][dayOfWeek]}
+              </div>
+            </div>
+          );
+        })
+      ) : (
+        rollingDays.map((d, i) => {
+          const dayOfWeek = d.date.getDay();
+          const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+          const isToday = new Date().toDateString() === d.date.toDateString();
+          const isNewMonth = i === 0 || d.day === 1;
+          const isHeaderSelected = selectedDateSet.has(d.dateStr);
+          const isPastHeaderDate = d.date < new Date(new Date().setHours(0, 0, 0, 0));
+
+          return (
+            <div
+              key={d.dateStr}
+              style={{
+                flex: "1 1 0",
+                minWidth: "32px",
+                padding: "10px 2px",
+                minHeight: "48px",
+                boxSizing: "border-box",
+                textAlign: "center",
+                fontSize: "12px",
+                fontWeight: isToday ? "800" : "600",
+                color: isPastHeaderDate
+                  ? "#94A3B8"
+                  : isToday
+                    ? "#3B82F6"
+                    : isWeekend
+                      ? "#EF4444"
+                      : "#4B5563",
+                background: isHeaderSelected
+                  ? "linear-gradient(180deg, rgba(245,158,11,0.18) 0%, rgba(251,191,36,0.08) 100%)"
+                  : isToday
+                    ? "#EFF6FF"
+                    : isPastHeaderDate
+                      ? "rgba(248,250,252,0.96)"
+                      : isNewMonth
+                        ? "#FFFBEB"
+                        : "#F9FAFB",
+                borderRight: "1px solid #F3F4F6",
+                borderLeft: isNewMonth && i > 0 ? "2px solid #F59E0B" : "none",
+                boxShadow: isHeaderSelected ? "inset 0 -3px 0 #F59E0B" : "none",
+                display: "flex",
+                flexDirection: "column",
+                gap: "2px",
+                opacity: isPastHeaderDate ? 0.72 : 1
+              }}
+            >
+              <div style={{ fontSize: isNewMonth ? "10px" : "13px", color: isNewMonth ? "#D97706" : "inherit" }}>
+                {isNewMonth ? `${d.month + 1}/${d.day}` : d.day}
+              </div>
+              <div style={{ fontSize: "9px", opacity: 0.7 }}>
+                {["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"][dayOfWeek]}
+              </div>
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
 
   const gapCoverageDays = useMemo(() => {
     if (displayDays.length === 0) return [];
@@ -8017,10 +8157,10 @@ function BuildingCalendar() {
                   display: "flex",
                   borderBottom: "1px solid #E5E7EB",
                   background: "#F9FAFB",
-                  position: isCalendarFullscreen ? 'sticky' : 'relative',
-                  top: isCalendarFullscreen ? 0 : undefined,
-                  zIndex: isCalendarFullscreen ? 100 : 40,
-                  boxShadow: isCalendarFullscreen ? "none" : "0 1px 0 rgba(226, 232, 240, 0.9)",
+                  position: 'sticky',
+                  top: 0,
+                  zIndex: isCalendarFullscreen ? 100 : 120,
+                  boxShadow: "0 1px 0 rgba(226, 232, 240, 0.9)",
                   minHeight: "48px",
                   flexShrink: 0
                 }}>
@@ -8884,13 +9024,19 @@ function BuildingCalendar() {
             </h3>
             <div style={{
               display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
-              gap: "16px"
+              gridTemplateColumns: isMobile ? "1fr" : "1.2fr 1.2fr 1fr 1fr",
+              gap: "12px",
+              alignItems: "stretch"
             }}>
               <div style={{
+                order: 8,
+                alignSelf: "start",
+                gridColumn: isMobile ? "auto" : "3",
+                gridRow: isMobile ? "auto" : "2",
                 background: "white",
                 borderRadius: "16px",
-                padding: "20px",
+                padding: "14px 16px",
+                minHeight: "132px",
                 border: "1px solid #E5E7EB",
                 boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
               }}>
@@ -8899,9 +9045,14 @@ function BuildingCalendar() {
                 <div style={{ fontSize: "12px", color: "#9CA3AF", marginTop: "4px" }}>Reserved / Total room nights</div>
               </div>
               <div style={{
+                order: 9,
+                alignSelf: "start",
+                gridColumn: isMobile ? "auto" : "4",
+                gridRow: isMobile ? "auto" : "3",
                 background: "white",
                 borderRadius: "16px",
-                padding: "20px",
+                padding: "14px 16px",
+                minHeight: "132px",
                 border: "1px solid #E5E7EB",
                 boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
               }}>
@@ -8912,9 +9063,13 @@ function BuildingCalendar() {
                 <div style={{ fontSize: "12px", color: "#9CA3AF", marginTop: "4px" }}>of {rooms.length} total rooms</div>
               </div>
               <div style={{
+                order: 3,
+                gridColumn: isMobile ? "auto" : "3",
+                gridRow: isMobile ? "auto" : "3",
                 background: "linear-gradient(135deg, #FFFFFF 0%, #F0FDFA 100%)",
                 borderRadius: "16px",
-                padding: "18px 20px",
+                padding: "14px 16px",
+                minHeight: "132px",
                 border: "1px solid #CCFBF1",
                 boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
               }}>
@@ -8933,27 +9088,31 @@ function BuildingCalendar() {
                 </div>
               </div>
               <div style={{
+                order: 5,
+                gridColumn: isMobile ? "auto" : "span 2",
+                gridRow: isMobile ? "auto" : "1 / span 3",
                 background: "linear-gradient(135deg, #FFFFFF 0%, #F8FAFC 100%)",
                 borderRadius: "16px",
-                padding: "18px 20px",
+                padding: "14px 16px",
                 border: "1px solid #E5E7EB",
-                boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
+                boxShadow: "0 2px 8px rgba(0,0,0,0.04)",
+                boxSizing: "border-box"
               }}>
                 <div style={{ fontSize: "13px", color: "#6B7280", fontWeight: "500", marginBottom: "10px" }}>Rate Summary</div>
-                <div style={{ display: "grid", gap: "9px" }}>
+                <div style={{ display: "grid", gap: "9px", padding: "0 2px", boxSizing: "border-box" }}>
                   <div>
                     <div style={{ fontSize: "11px", color: "#9CA3AF", fontWeight: "700", letterSpacing: "0.04em", textTransform: "uppercase", marginBottom: "3px" }}>Booked ADR</div>
                     <div style={{ fontSize: "26px", fontWeight: "700", color: "#8B5CF6" }}>{formatPrice(singleAnalysis.avgPrice)}</div>
                     <div style={{ fontSize: "11px", color: "#9CA3AF", marginTop: "2px" }}>Realized booked rate (incl. OTA fees)</div>
                   </div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
-                    <div style={{ background: "#F8FAFC", border: "1px solid #E2E8F0", borderRadius: "10px", padding: "8px 10px" }}>
+                    <div style={{ background: "#F8FAFC", border: "1px solid #E2E8F0", borderRadius: "10px", padding: "8px 10px", boxSizing: "border-box" }}>
                       <div style={{ fontSize: "10px", color: "#94A3B8", fontWeight: "700", letterSpacing: "0.04em", textTransform: "uppercase" }}>Displayed Avg Price</div>
                       <div style={{ fontSize: "16px", fontWeight: "700", color: "#334155", marginTop: "3px" }}>
                         {(weekdayWeekendRateSummary.weekdayCells + weekdayWeekendRateSummary.weekendCells) > 0 ? formatPrice(displayedAvgPrice) : "-"}
                       </div>
                     </div>
-                    <div style={{ background: "#FFFBEB", border: "1px solid #FDE68A", borderRadius: "10px", padding: "8px 10px" }}>
+                    <div style={{ background: "#FFFBEB", border: "1px solid #FDE68A", borderRadius: "10px", padding: "8px 10px", boxSizing: "border-box" }}>
                       <div style={{ fontSize: "10px", color: "#B45309", fontWeight: "700", letterSpacing: "0.04em", textTransform: "uppercase" }}>Gap (Displayed - Booked)</div>
                       <div style={{ fontSize: "16px", fontWeight: "700", color: displayedVsBookedGap >= 0 ? "#B45309" : "#1D4ED8", marginTop: "3px" }}>
                         {`${displayedVsBookedGap >= 0 ? "+" : "-"}${formatPrice(Math.abs(displayedVsBookedGap))}`}
@@ -8961,20 +9120,20 @@ function BuildingCalendar() {
                     </div>
                   </div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
-                    <div style={{ background: "#F8FAFC", border: "1px solid #E2E8F0", borderRadius: "10px", padding: "8px 10px" }}>
+                    <div style={{ background: "#F8FAFC", border: "1px solid #E2E8F0", borderRadius: "10px", padding: "8px 10px", boxSizing: "border-box" }}>
                       <div style={{ fontSize: "10px", color: "#94A3B8", fontWeight: "700", letterSpacing: "0.04em", textTransform: "uppercase" }}>Weekday ADR</div>
                       <div style={{ fontSize: "16px", fontWeight: "700", color: "#334155", marginTop: "3px" }}>
                         {weekdayWeekendRateSummary.weekdayCells > 0 ? formatPrice(weekdayWeekendRateSummary.weekdayAvg) : "-"}
                       </div>
                     </div>
-                    <div style={{ background: "#FFF7F7", border: "1px solid #FEE2E2", borderRadius: "10px", padding: "8px 10px" }}>
+                    <div style={{ background: "#FFF7F7", border: "1px solid #FEE2E2", borderRadius: "10px", padding: "8px 10px", boxSizing: "border-box" }}>
                       <div style={{ fontSize: "10px", color: "#F87171", fontWeight: "700", letterSpacing: "0.04em", textTransform: "uppercase" }}>Weekend ADR (Fri-Sun)</div>
                       <div style={{ fontSize: "16px", fontWeight: "700", color: "#B91C1C", marginTop: "3px" }}>
                         {weekdayWeekendRateSummary.weekendCells > 0 ? formatPrice(weekdayWeekendRateSummary.weekendAvg) : "-"}
                       </div>
                     </div>
                   </div>
-                  <div style={{ height: "1px", background: "#E5E7EB" }}></div>
+                  <div style={{ height: "1px", background: "#E5E7EB", margin: "0 2px" }}></div>
                   <div>
                     <div style={{ fontSize: "11px", color: "#9CA3AF", fontWeight: "700", letterSpacing: "0.04em", textTransform: "uppercase", marginBottom: "3px" }}>Airbnb Price Range</div>
                     <div style={{ fontSize: "20px", fontWeight: "700", color: "#EF4444" }}>
@@ -8982,12 +9141,35 @@ function BuildingCalendar() {
                     </div>
                     <div style={{ fontSize: "11px", color: "#9CA3AF", marginTop: "2px" }}>Available rooms only</div>
                   </div>
+                  <div style={{ height: "1px", background: "#E5E7EB", margin: "0 2px" }}></div>
+                  <div style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                    gap: "8px"
+                  }}>
+                    <div style={{ background: "#F8FAFC", border: "1px solid #E2E8F0", borderRadius: "9px", padding: "7px 9px", boxSizing: "border-box" }}>
+                      <div style={{ fontSize: "10px", color: "#94A3B8", fontWeight: "700", textTransform: "uppercase" }}>Vacant Nights</div>
+                      <div style={{ fontSize: "15px", fontWeight: "800", color: "#0F766E", marginTop: "2px" }}>
+                        {singleAnalysis.vacantNights ?? 0}
+                      </div>
+                    </div>
+                    <div style={{ background: "#F8FAFC", border: "1px solid #E2E8F0", borderRadius: "9px", padding: "7px 9px", boxSizing: "border-box" }}>
+                      <div style={{ fontSize: "10px", color: "#94A3B8", fontWeight: "700", textTransform: "uppercase" }}>Displayed Cells</div>
+                      <div style={{ fontSize: "15px", fontWeight: "800", color: "#334155", marginTop: "2px" }}>
+                        {weekdayWeekendRateSummary.weekdayCells + weekdayWeekendRateSummary.weekendCells}
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
               <div style={{
+                order: 4,
+                gridColumn: isMobile ? "auto" : "4",
+                gridRow: isMobile ? "auto" : "2",
                 background: "white",
                 borderRadius: "16px",
-                padding: "20px",
+                padding: "14px 16px",
+                minHeight: "132px",
                 border: "1px solid #E5E7EB",
                 boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
               }}>
@@ -8996,9 +9178,13 @@ function BuildingCalendar() {
                 <div style={{ fontSize: "12px", color: "#9CA3AF", marginTop: "4px" }}>{reservations.length} reservations</div>
               </div>
               <div style={{
+                order: 6,
+                alignSelf: "start",
+                gridColumn: isMobile ? "auto" : "3",
+                gridRow: isMobile ? "auto" : "1",
                 background: "linear-gradient(135deg, #FFFFFF 0%, #F8FAFC 100%)",
                 borderRadius: "16px",
-                padding: "18px 20px",
+                padding: "14px 16px",
                 border: "1px solid #E5E7EB",
                 boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
               }}>
@@ -9026,9 +9212,13 @@ function BuildingCalendar() {
                 </div>
               </div>
               <div style={{
+                order: 7,
+                alignSelf: "start",
+                gridColumn: isMobile ? "auto" : "4",
+                gridRow: isMobile ? "auto" : "1",
                 background: "linear-gradient(135deg, #FFFFFF 0%, #F8FAFC 100%)",
                 borderRadius: "16px",
-                padding: "18px 20px",
+                padding: "14px 16px",
                 border: "1px solid #E5E7EB",
                 boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
               }}>
