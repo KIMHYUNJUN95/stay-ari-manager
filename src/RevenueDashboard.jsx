@@ -428,11 +428,66 @@ const RevenueDashboard = () => {
         ? currentRange
         : getDateRange(comparePeriod, isNonPeriodMode);
 
+      const resolveCustomQueryRange = (config) => {
+        const formatDate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+        if (verifiedConfig?.dateMode === DATE_MODES.YEAR) return getYearRange(config.year);
+        if (verifiedConfig?.dateMode === DATE_MODES.MONTH) return getMonthRange(config.year, config.month);
+        if (verifiedConfig?.dateMode === DATE_MODES.PERIOD) {
+          const periodInfo = getPeriodInfo(config.period);
+          const lastDay = new Date(periodInfo.endYear, periodInfo.endMonth, 0).getDate();
+          return {
+            startDate: `${periodInfo.startYear}-${String(periodInfo.startMonth).padStart(2, '0')}-01`,
+            endDate: `${periodInfo.endYear}-${String(periodInfo.endMonth).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`
+          };
+        }
+        if (verifiedConfig?.dateMode === DATE_MODES.WEEK) {
+          if (config.startDate) {
+            const baseDate = parseLocalDate(config.startDate);
+            const dayOfWeek = baseDate.getDay();
+            const monday = new Date(baseDate);
+            monday.setDate(baseDate.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
+            const sunday = new Date(monday);
+            sunday.setDate(monday.getDate() + 6);
+            return {
+              startDate: formatDate(monday),
+              endDate: formatDate(sunday)
+            };
+          }
+          return getWeekRange(selectedWeekDate);
+        }
+        if (verifiedConfig?.dateMode === DATE_MODES.DAY) {
+          if (config.startDate) {
+            return { startDate: config.startDate, endDate: config.startDate };
+          }
+          return getDayRange(selectedDay);
+        }
+        if (verifiedConfig?.dateMode === DATE_MODES.CUSTOM) {
+          return { startDate: config.startDate, endDate: config.endDate };
+        }
+        return getDateRange(selectedPeriod, false);
+      };
+
+      const currentQueryRange = viewMode === 'custom_compare' && verifiedConfig
+        ? resolveCustomQueryRange(verifiedConfig.target)
+        : currentRange;
+      const compareQueryRange = viewMode === 'custom_compare' && verifiedConfig
+        ? resolveCustomQueryRange(verifiedConfig.compare)
+        : compareRange;
+      const queryStart = currentQueryRange.startDate < compareQueryRange.startDate
+        ? currentQueryRange.startDate
+        : compareQueryRange.startDate;
+      const queryEnd = currentQueryRange.endDate > compareQueryRange.endDate
+        ? currentQueryRange.endDate
+        : compareQueryRange.endDate;
+
       // 전체 데이터 가져오기 (2023년부터)
       const q = query(
         collection(db, "reservations"),
         where("companyId", "==", companyId),
-        where("status", "==", "confirmed")
+        where("status", "==", "confirmed"),
+        where("departure", ">", queryStart),
+        where("arrival", "<=", queryEnd)
       );
 
       const snapshot = await getDocs(q);

@@ -198,11 +198,35 @@ const CountryOccupancyDashboard = () => {
       }
 
       // confirmed 예약만 로드 (취소/문의/블랙아웃 제외)
-      const q = query(
-        collection(db, "reservations"),
-        where("companyId", "==", companyId),
-        where("status", "==", "confirmed")
-      );
+      const periodToday = new Date();
+      let queryStartDate = null;
+      let queryEndDate = null;
+
+      if (selectedPeriod === 'thisYear') {
+        const year = periodToday.getFullYear();
+        queryStartDate = `${year}-01-01`;
+        queryEndDate = `${year}-12-31`;
+      } else if (selectedPeriod === 'thisMonth') {
+        const year = periodToday.getFullYear();
+        const month = String(periodToday.getMonth() + 1).padStart(2, '0');
+        const lastDay = new Date(year, periodToday.getMonth() + 1, 0).getDate();
+        queryStartDate = `${year}-${month}-01`;
+        queryEndDate = `${year}-${month}-${String(lastDay).padStart(2, '0')}`;
+      }
+
+      const q = queryStartDate && queryEndDate
+        ? query(
+          collection(db, "reservations"),
+          where("companyId", "==", companyId),
+          where("status", "==", "confirmed"),
+          where("arrival", ">=", queryStartDate),
+          where("arrival", "<=", queryEndDate)
+        )
+        : query(
+          collection(db, "reservations"),
+          where("companyId", "==", companyId),
+          where("status", "==", "confirmed")
+        );
 
       const snapshot = await getDocs(q);
 

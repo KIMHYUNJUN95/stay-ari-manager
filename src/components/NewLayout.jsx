@@ -6,7 +6,6 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { signOut } from "firebase/auth";
 import { auth } from '../firebase';
 import { useUser } from '../contexts/UserContext';
-import NotificationBell from './NotificationBell';
 import { Haptics, ImpactStyle } from '@capacitor/haptics';
 import { Capacitor } from '@capacitor/core';
 
@@ -761,9 +760,8 @@ const NewLayout = ({ children, onSync, syncing }) => {
           {/* 가운데: 페이지 타이틀 (절대 중앙) */}
           <span style={styles.mobileHeaderTitle}>{pageTitle}</span>
 
-          {/* 오른쪽: 알림벨 */}
+          {/* 오른쪽 여백: 제목 중앙 정렬 유지 */}
           <div style={styles.mobileHeaderRight}>
-            <NotificationBell />
           </div>
         </header>
       )}
@@ -912,7 +910,6 @@ const NewLayout = ({ children, onSync, syncing }) => {
               </div>
             </div>
             <div style={styles.headerRight}>
-              <NotificationBell />
               <div style={styles.userSection} onClick={() => navigate('/my-profile')} title="Go to My Profile">
                 <div style={styles.userInfo}>
                   <span style={styles.userName}>{userData?.fullName || 'User'}</span>
@@ -1109,7 +1106,6 @@ const styles = {
   headerRight: { display: 'flex', alignItems: 'center', gap: '16px' },
   userSection: {
     display: 'flex', alignItems: 'center', gap: '12px',
-    paddingLeft: '16px', borderLeft: '1px solid #E5E7EB',
     cursor: 'pointer', transition: 'all 0.2s ease',
   },
   userInfo: { display: 'flex', flexDirection: 'column', alignItems: 'flex-end' },

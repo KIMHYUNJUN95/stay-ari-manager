@@ -1,13 +1,16 @@
-import React, { useState, useEffect, useMemo, useDeferredValue } from 'react';
-import { collection, query, where, orderBy, limit, getDocs } from "firebase/firestore";
+import React, { useState, useEffect, useMemo, useDeferredValue, useCallback } from 'react';
+import { collection, query, where, orderBy, limit, getDocs, startAfter } from "firebase/firestore";
 import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
 import { BUILDING_NAMES_EN, ACTIVE_BUILDING_ORDER } from '../constants/buildingData';
+import { buildPriceAttributionResult } from '../utils/priceAttribution';
 
 function PriceChangeHistory() {
     const { companyId } = useUser();
     const [logs, setLogs] = useState([]);
+    const [reservations, setReservations] = useState([]);
     const [loading, setLoading] = useState(true);
+    const [reservationsLoading, setReservationsLoading] = useState(true);
     const [expandedId, setExpandedId] = useState(null);
     const [buildingFilter, setBuildingFilter] = useState("all");
     const [originFilter, setOriginFilter] = useState("all");
@@ -16,6 +19,10 @@ function PriceChangeHistory() {
     const [dateToFilter, setDateToFilter] = useState("");
     const deferredDateFromFilter = useDeferredValue(dateFromFilter);
     const deferredDateToFilter = useDeferredValue(dateToFilter);
+    const showConversionOnly = originFilter === "conversion";
+    const HISTORY_REFRESH_INTERVAL_MS = 30000;
+    const HISTORY_PAGE_SIZE = 1000;
+    const HISTORY_MAX_PAGES = 12;
 
     const getTokyoDateKey = (ts) => {
         if (!ts) return "Unknown";
@@ -58,30 +65,149 @@ function PriceChangeHistory() {
 
     const getTokyoTodayKey = () => getTokyoDateKey(new Date());
 
-    useEffect(() => {
+    const fetchLogs = useCallback(async ({ silent = false } = {}) => {
         if (!companyId) return;
-        const fetchLogs = async () => {
-            try {
-                const q = query(
-                    collection(db, "price_change_logs"),
+        if (!silent) setLoading(true);
+        try {
+            let collected = [];
+            let lastDoc = null;
+
+            for (let page = 0; page < HISTORY_MAX_PAGES; page += 1) {
+                const constraints = [
                     where("companyId", "==", companyId),
                     orderBy("timestamp", "desc"),
-                    limit(500)
-                );
+                    limit(HISTORY_PAGE_SIZE)
+                ];
+                if (lastDoc) constraints.push(startAfter(lastDoc));
+
+                const q = query(collection(db, "price_change_logs"), ...constraints);
                 const snapshot = await getDocs(q);
-                const data = snapshot.docs.map(doc => ({
-                    id: doc.id,
-                    ...doc.data()
-                }));
-                setLogs(data);
-            } catch (error) {
-                console.error("Error fetching price logs:", error);
-            } finally {
-                setLoading(false);
+                if (snapshot.empty) break;
+
+                collected = collected.concat(
+                    snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }))
+                );
+
+                if (snapshot.docs.length < HISTORY_PAGE_SIZE) break;
+                lastDoc = snapshot.docs[snapshot.docs.length - 1];
+            }
+
+            const data = collected.sort((a, b) => {
+                const aMs = a?.timestamp?.toMillis?.() || 0;
+                const bMs = b?.timestamp?.toMillis?.() || 0;
+                return bMs - aMs;
+            });
+            setLogs(data);
+        } catch (error) {
+            console.error("Error fetching price logs:", error);
+        } finally {
+            setLoading(false);
+        }
+    }, [companyId]);
+
+    const fetchReservations = useCallback(async ({ silent = false } = {}) => {
+        if (!companyId) return;
+        if (!silent) setReservationsLoading(true);
+        try {
+            // 최신 예약 우선 조회 (bookDate 인덱스가 없으면 fallback)
+            let collected = [];
+            try {
+                let lastDoc = null;
+                for (let page = 0; page < HISTORY_MAX_PAGES; page += 1) {
+                    const constraints = [
+                        where("companyId", "==", companyId),
+                        where("status", "==", "confirmed"),
+                        where("bookDate", ">=", "2026-04-11"),
+                        orderBy("bookDate", "desc"),
+                        limit(HISTORY_PAGE_SIZE)
+                    ];
+                    if (lastDoc) constraints.push(startAfter(lastDoc));
+
+                    const newestQuery = query(collection(db, "reservations"), ...constraints);
+                    const snapshot = await getDocs(newestQuery);
+                    if (snapshot.empty) break;
+
+                    collected = collected.concat(
+                        snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }))
+                    );
+
+                    if (snapshot.docs.length < HISTORY_PAGE_SIZE) break;
+                    lastDoc = snapshot.docs[snapshot.docs.length - 1];
+                }
+            } catch (indexedQueryError) {
+                console.warn("Reservation newest query fallback:", indexedQueryError?.message || indexedQueryError);
+                collected = [];
+                let lastDoc = null;
+                for (let page = 0; page < HISTORY_MAX_PAGES; page += 1) {
+                    const constraints = [
+                        where("companyId", "==", companyId),
+                        where("status", "==", "confirmed"),
+                        limit(HISTORY_PAGE_SIZE)
+                    ];
+                    if (lastDoc) constraints.push(startAfter(lastDoc));
+
+                    const fallbackQuery = query(collection(db, "reservations"), ...constraints);
+                    const snapshot = await getDocs(fallbackQuery);
+                    if (snapshot.empty) break;
+
+                    collected = collected.concat(
+                        snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }))
+                    );
+
+                    if (snapshot.docs.length < HISTORY_PAGE_SIZE) break;
+                    lastDoc = snapshot.docs[snapshot.docs.length - 1];
+                }
+            }
+
+            const dedupedMap = new Map();
+            collected.forEach((row) => {
+                if (!row?.id) return;
+                dedupedMap.set(row.id, row);
+            });
+            const data = Array.from(dedupedMap.values());
+            setReservations(data);
+        } catch (error) {
+            console.error("Error fetching reservations for attribution:", error);
+        } finally {
+            setReservationsLoading(false);
+        }
+    }, [companyId]);
+
+    useEffect(() => {
+        if (!companyId) return;
+        let disposed = false;
+
+        const refreshAll = async ({ silent = true } = {}) => {
+            if (disposed) return;
+            await Promise.all([
+                fetchLogs({ silent }),
+                fetchReservations({ silent })
+            ]);
+        };
+
+        refreshAll({ silent: false });
+
+        const intervalId = setInterval(() => {
+            refreshAll({ silent: true });
+        }, HISTORY_REFRESH_INTERVAL_MS);
+
+        const handleFocus = () => refreshAll({ silent: true });
+        const handleVisibility = () => {
+            if (document.visibilityState === "visible") {
+                refreshAll({ silent: true });
             }
         };
-        fetchLogs();
-    }, [companyId]);
+
+        window.addEventListener("focus", handleFocus);
+        document.addEventListener("visibilitychange", handleVisibility);
+
+        return () => {
+            disposed = true;
+            clearInterval(intervalId);
+            window.removeEventListener("focus", handleFocus);
+            document.removeEventListener("visibilitychange", handleVisibility);
+        };
+    }, [companyId, fetchLogs, fetchReservations]);
 
     const filteredLogs = useMemo(() => {
         let result = logs;
@@ -95,6 +221,8 @@ function PriceChangeHistory() {
                 result = result.filter(log => log.origin?.includes("Beds24") || log.origin?.includes("외부"));
             } else if (originFilter === "admin") {
                 result = result.filter(log => log.origin === "관리자 대시보드" || log.origin === "queue_worker");
+            } else if (originFilter === "conversion") {
+                // conversion 전용 뷰에서는 가격 로그 필터를 추가로 좁히지 않음
             }
         }
         if (validDateFrom || validDateTo) {
@@ -282,12 +410,57 @@ function PriceChangeHistory() {
         return log.worker || "System";
     };
 
+    const attributedConversions = useMemo(() => {
+        const { conversionList } = buildPriceAttributionResult({
+            interventions: filteredLogs,
+            reservations,
+            defaultWindowHours: 48,
+            minInterventionDate: "2026-04-11",
+            minBookingDate: "2026-04-11"
+        });
+        return conversionList;
+    }, [filteredLogs, reservations]);
+
+    const conversionRows = useMemo(() => (
+        attributedConversions.map((item) => {
+            const reservation = item.reservation || {};
+            const intervention = item.intervention || {};
+            return {
+                key: `${item.reservationKey}:${item.appliedAtMs}`,
+                bookingAtMs: item.bookingCreatedAtMs,
+                interventionAtMs: item.appliedAtMs,
+                building: reservation.building || intervention.building || "Unknown",
+                room: reservation.room || "-",
+                guestName: reservation.guestName || "Guest",
+                arrival: reservation.arrival || "-",
+                departure: reservation.departure || "-",
+                totalPrice: reservation.totalPrice ?? reservation.price ?? 0,
+                hoursToBooking: item.hoursToBooking,
+                windowHours: item.windowHours
+            };
+        })
+    ), [attributedConversions]);
+
+    const formatDateTime = (ms) => {
+        if (!Number.isFinite(ms)) return "-";
+        return new Date(ms).toLocaleString("en-US", {
+            timeZone: "Asia/Tokyo",
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+            hour12: false
+        });
+    };
+
     const stats = useMemo(() => {
         const total = filteredLogs.length;
         const beds24 = filteredLogs.filter(l => l.origin?.includes("Beds24") || l.origin?.includes("외부")).length;
         const admin = filteredLogs.filter(l => l.origin === "관리자 대시보드" || l.origin === "queue_worker").length;
-        return { total, beds24, admin };
-    }, [filteredLogs]);
+        const converted = attributedConversions.length;
+        return { total, beds24, admin, converted };
+    }, [filteredLogs, attributedConversions]);
 
     const COL = '72px 54px minmax(110px,140px) minmax(80px,110px) 126px 118px 1fr';
 
@@ -456,7 +629,7 @@ function PriceChangeHistory() {
                     Price History
                 </h1>
                 <p style={{ fontSize: '13px', color: '#8E8E93', margin: 0, fontWeight: '400' }}>
-                    {stats.total} records&nbsp;&nbsp;·&nbsp;&nbsp;{stats.admin} admin&nbsp;&nbsp;·&nbsp;&nbsp;{stats.beds24} Beds24
+                    {stats.total} records&nbsp;&nbsp;·&nbsp;&nbsp;{stats.admin} admin&nbsp;&nbsp;·&nbsp;&nbsp;{stats.beds24} Beds24&nbsp;&nbsp;·&nbsp;&nbsp;{stats.converted} converted
                 </p>
             </div>
 
@@ -495,6 +668,7 @@ function PriceChangeHistory() {
                     <option value="all">All Sources</option>
                     <option value="admin">Admin</option>
                     <option value="beds24">Beds24</option>
+                    <option value="conversion">Price Conversions</option>
                 </select>
 
                 <div style={{
@@ -601,8 +775,91 @@ function PriceChangeHistory() {
                 </div>
             </div>
 
+            {showConversionOnly && (
+            <div style={{
+                background: '#FFFFFF',
+                borderRadius: '14px',
+                boxShadow: '0 1px 4px rgba(0,0,0,0.06), 0 0 0 0.5px rgba(0,0,0,0.06)',
+                overflow: 'hidden',
+                marginBottom: '16px'
+            }}>
+                <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '8px',
+                    padding: '12px 16px',
+                    borderBottom: '1px solid #E5E5EA',
+                    background: '#F8FAFC'
+                }}>
+                    <div style={{ fontSize: '14px', fontWeight: '700', color: '#0F172A' }}>
+                        Price-Driven Booking Conversions
+                    </div>
+                    <div style={{ fontSize: '12px', color: '#64748B' }}>
+                        {reservationsLoading ? 'Loading reservations...' : `${conversionRows.length} matched bookings`}
+                    </div>
+                </div>
+                {reservationsLoading ? (
+                    <div style={{ padding: '18px 16px', fontSize: '13px', color: '#94A3B8' }}>
+                        Calculating attribution...
+                    </div>
+                ) : conversionRows.length === 0 ? (
+                    <div style={{ padding: '18px 16px', fontSize: '13px', color: '#94A3B8' }}>
+                        No matched booking found for current filters (rule: same room/date overlap and booking within 48h after price change).
+                    </div>
+                ) : (
+                    <div style={{ maxHeight: '320px', overflowY: 'auto' }}>
+                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
+                            <thead style={{ position: 'sticky', top: 0, zIndex: 1, background: '#FFFFFF' }}>
+                                <tr>
+                                    <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Booked At</th>
+                                    <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Building / Room</th>
+                                    <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Guest / Stay</th>
+                                    <th style={{ padding: '8px 10px', textAlign: 'right', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Revenue</th>
+                                    <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Intervention At</th>
+                                    <th style={{ padding: '8px 10px', textAlign: 'right', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Lag</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {conversionRows.map((row) => (
+                                    <tr key={row.key} style={{ borderBottom: '1px solid #F1F5F9' }}>
+                                        <td style={{ padding: '8px 10px', color: '#0F172A', fontVariantNumeric: 'tabular-nums' }}>{formatDateTime(row.bookingAtMs)}</td>
+                                        <td style={{ padding: '8px 10px', color: '#0F172A' }}>
+                                            <div style={{ fontWeight: '600' }}>{getBuildingName(row.building)}</div>
+                                            <div style={{ fontSize: '11px', color: '#64748B' }}>{getRoomName(row.room)}</div>
+                                        </td>
+                                        <td style={{ padding: '8px 10px', color: '#0F172A' }}>
+                                            <div style={{ fontWeight: '600' }}>{row.guestName}</div>
+                                            <div style={{ fontSize: '11px', color: '#64748B' }}>{row.arrival} ~ {row.departure}</div>
+                                        </td>
+                                        <td style={{ padding: '8px 10px', textAlign: 'right', color: '#0F172A', fontWeight: '700', fontVariantNumeric: 'tabular-nums' }}>
+                                            {formatPrice(row.totalPrice)}
+                                        </td>
+                                        <td style={{ padding: '8px 10px', color: '#0F172A', fontVariantNumeric: 'tabular-nums' }}>{formatDateTime(row.interventionAtMs)}</td>
+                                        <td style={{ padding: '8px 10px', textAlign: 'right' }}>
+                                            <span style={{
+                                                display: 'inline-block',
+                                                fontSize: '11px',
+                                                fontWeight: '700',
+                                                color: '#047857',
+                                                background: '#ECFDF5',
+                                                padding: '2px 8px',
+                                                borderRadius: '999px'
+                                            }}>
+                                                {row.hoursToBooking}h / {row.windowHours}h
+                                            </span>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+            </div>
+            )}
+
             {/* Table */}
-            {loading ? (
+            {!showConversionOnly && (loading ? (
                 <div style={{ padding: '80px', textAlign: 'center', color: '#AEAEB2', fontSize: '14px' }}>
                     Loading...
                 </div>
@@ -693,7 +950,7 @@ function PriceChangeHistory() {
                         </React.Fragment>
                     ))}
                 </div>
-            )}
+            ))}
         </div>
     );
 }

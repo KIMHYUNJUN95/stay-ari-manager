@@ -143,14 +143,13 @@ const OccupancyRateDashboard = () => {
       const q = query(
         collection(db, "reservations"),
         where("companyId", "==", companyId),
-        where("arrival", "<=", latestMonth.end)  // arrival 기준
+        where("status", "==", "confirmed"),
+        where("departure", ">", oldestMonth.start),
+        where("arrival", "<=", latestMonth.end)
       );
 
       const snapshot = await getDocs(q);
-      // 취소된 예약만 제외 (confirmed 예약만 가동률에 포함)
-      const allReservations = snapshot.docs
-        .map(d => d.data())
-        .filter(r => r.status === "confirmed");
+      const allReservations = snapshot.docs.map(d => d.data());
 
       console.log(`📊 가동률 계산: 총 ${allReservations.length}건의 confirmed 예약 데이터 조회됨`);
       console.log(`📅 조회 기간: ${oldestMonth.start} ~ ${latestMonth.end}`);

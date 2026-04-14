@@ -1092,6 +1092,84 @@ function PerformanceDashboard({ targetMonth, setTargetMonth, companyId }) {
   const [modalData, setModalData] = useState(null);
   const [modalTitle, setModalTitle] = useState("");
 
+  const getMonthBounds = (monthKey) => {
+    const [yearStr, monthStr] = String(monthKey || "").split("-");
+    const year = Number(yearStr);
+    const month = Number(monthStr);
+
+    if (!year || !month) {
+      return { start: "", next: "" };
+    }
+
+    const start = `${yearStr}-${monthStr}-01`;
+    const nextYear = month === 12 ? year + 1 : year;
+    const nextMonth = month === 12 ? 1 : month + 1;
+    const next = `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`;
+
+    return { start, next };
+  };
+
+  const mapSnapshotDocs = (snapshot) =>
+    snapshot.docs.map((reservationDoc) => ({
+      id: reservationDoc.id,
+      ...reservationDoc.data()
+    }));
+
+  const fetchPerformanceReservations = async () => {
+    const { start, next } = getMonthBounds(targetMonth);
+
+    if (!start || !next) {
+      return [];
+    }
+
+    const reservationsRef = collection(db, "reservations");
+
+    if (viewMode === "confirmed") {
+      const confirmedSnapshot = await getDocs(query(
+        reservationsRef,
+        where("companyId", "==", companyId),
+        where("status", "==", "confirmed"),
+        where("bookDate", ">=", start),
+        where("bookDate", "<", next)
+      ));
+
+      return mapSnapshotDocs(confirmedSnapshot);
+    }
+
+    const cancelledSnapshots = await Promise.all([
+      getDocs(query(
+        reservationsRef,
+        where("companyId", "==", companyId),
+        where("status", "==", "cancelled"),
+        where("cancelTime", ">=", start),
+        where("cancelTime", "<", next)
+      )),
+      getDocs(query(
+        reservationsRef,
+        where("companyId", "==", companyId),
+        where("status", "==", "cancelled"),
+        where("modified", ">=", start),
+        where("modified", "<", next)
+      )),
+      getDocs(query(
+        reservationsRef,
+        where("companyId", "==", companyId),
+        where("status", "==", "blackout"),
+        where("modified", ">=", start),
+        where("modified", "<", next)
+      ))
+    ]);
+
+    const mergedReservations = new Map();
+    cancelledSnapshots.forEach((snapshot) => {
+      mapSnapshotDocs(snapshot).forEach((reservation) => {
+        mergedReservations.set(reservation.id, reservation);
+      });
+    });
+
+    return Array.from(mergedReservations.values());
+  };
+
   const fetchData = async () => {
     console.log(`🚀 [VERSION 2026-02-02-Fix-v5] Fetching Dashboard: ${targetMonth}, ${viewMode}`);
 
@@ -1102,48 +1180,15 @@ function PerformanceDashboard({ targetMonth, setTargetMonth, companyId }) {
 
     // Firestore 쿼리 최적화: status로 먼저 필터링
     // ★ Cancelled 모드: "cancelled"와 "blackout" 둘 다 가져오기 (블락/점검 키워드 포함)
-    let q;
-    if (viewMode === "cancelled") {
-      q = query(
-        collection(db, "reservations"),
-        where("companyId", "==", companyId),
-        where("status", "in", ["cancelled", "blackout"])
-      );
-    } else {
-      q = query(
-        collection(db, "reservations"),
-        where("companyId", "==", companyId),
-        where("status", "==", "confirmed")
-      );
-    }
+    const reservations = await fetchPerformanceReservations();
+    console.log(`[PerformanceDashboard] ${targetMonth} ${viewMode}: ${reservations.length}`);
+    /*
 
-    const snapshot = await getDocs(q);
     console.log(`📦 Total ${viewMode} reservations in Firestore: ${snapshot.docs.length}`);
 
     // 클라이언트에서 날짜 필터링 (중복 제거 없이 모든 데이터 포함)
-    const allData = snapshot.docs.map((doc) => doc.data());
 
     // ★ Helper: 날짜(YYYY-MM) 추출 함수 (String, Timestamp, Date 모두 지원)
-    const getYearMonth = (val) => {
-      try {
-        if (!val) return null;
-        if (typeof val === 'string') return val.substring(0, 7);
-        if (val.toDate && typeof val.toDate === 'function') { // Firestore Timestamp
-          const d = val.toDate();
-          const y = d.getFullYear();
-          const m = String(d.getMonth() + 1).padStart(2, '0');
-          return `${y}-${m}`;
-        }
-        if (val instanceof Date) {
-          const y = val.getFullYear();
-          const m = String(val.getMonth() + 1).padStart(2, '0');
-          return `${y}-${m}`;
-        }
-      } catch (e) {
-        console.error("Date parsing error:", val, e);
-      }
-      return null;
-    };
 
     // ★ 디버깅: 1월과 2월 취소 데이터 비교
     if (viewMode === "cancelled" && allData.length > 0) {
@@ -1203,6 +1248,7 @@ function PerformanceDashboard({ targetMonth, setTargetMonth, companyId }) {
 
     console.log(`📅 ${targetMonth}월 ${viewMode} 필터링 결과: ${reservations.length}건 (전체: ${allData.length}건)`);
 
+    */
     let total = 0;
     const bCount = {};
     const pCount = { Airbnb: 0, Booking: 0 };

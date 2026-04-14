@@ -15,6 +15,7 @@ const { NOTION_PAGES, syncNotionSalesDashboard, syncNotionOccupancyDashboard, sy
 const { computeRevenueDashboardData } = require("./modules/revenueDashboardData");
 const { getMonthlyRevenueChartUrl, getBuildingRevenueChartUrl } = require("./modules/chartImage");
 const { sendSameDayBookingAlert } = require("./modules/sameDayBookingAlert");
+const { markHomeDashboardSummaryDirty, refreshHomeDashboardSummary, processDirtyHomeDashboardSummaries } = require("./modules/homeDashboardSummary");
 const { sendCancelAlert } = require("./modules/cancelAlert"); // cancelAlert.js 수정 시 Functions 재배포
 
 if (!admin.apps.length) {
@@ -1411,6 +1412,17 @@ async function upsertReservations(list, {
         }
     }
     if (count % batchLimit !== 0) { await batch.commit(); }
+    if (count > 0) {
+        try {
+            await markHomeDashboardSummaryDirty(db, {
+                companyId,
+                reason: syncMode || "reservation_upsert",
+                source: syncSource || "reservation_upsert"
+            });
+        } catch (summaryErr) {
+            console.warn("[HomeDashboardSummary] mark dirty failed after upsert:", summaryErr.message);
+        }
+    }
     return {
         upsertedCount: count,
         ...summarizeReservationIntegrity(enrichedList)
@@ -1509,6 +1521,18 @@ async function fullReservationReconcile(list, syncRangeStart = null, syncRangeEn
         syncMode: "reconcile"
     });
 
+    if (cancelledCount > 0) {
+        try {
+            await markHomeDashboardSummaryDirty(db, {
+                companyId,
+                reason: "reconcile_cancelled",
+                source: syncSource || "reservation_reconcile"
+            });
+        } catch (summaryErr) {
+            console.warn("[HomeDashboardSummary] mark dirty failed after reconcile cancel:", summaryErr.message);
+        }
+    }
+
     return {
         cancelledCount,
         ...upsertResult
@@ -1522,6 +1546,22 @@ async function saveBookings(list, syncRangeStart = null, syncRangeEnd = null, co
         return incrementalReservationSync(list, companyId, syncSource);
     }
     return fullReservationReconcile(list, syncRangeStart, syncRangeEnd, companyId, syncSource);
+}
+
+async function refreshHomeDashboardSummarySafe(companyId, reason, source) {
+    if (!companyId) return;
+    try {
+        await refreshHomeDashboardSummary(db, {
+            companyId,
+            buildingRooms: BUILDING_ROOMS,
+            excludedBuildingName: HOME_DASHBOARD_EXCLUDED_BUILDING,
+            referenceOnlyBuildingName: HOME_DASHBOARD_REFERENCE_ONLY_BUILDING,
+            reason,
+            source
+        });
+    } catch (summaryErr) {
+        console.warn("[HomeDashboardSummary] refresh failed:", summaryErr.message);
+    }
 }
 
 
@@ -1569,6 +1609,7 @@ exports.syncBeds24 = onRequest({ cors: true, timeoutSeconds: 540, memory: '512Mi
         } catch (e) {
             console.warn("[Manual Quick Sync] Output update failed:", e.message);
         }
+        await refreshHomeDashboardSummarySafe(companyId, "manual_quick_sync", "syncBeds24");
         res.json({
             success: true,
             message: `${syncVariant === "incremental" ? "변경분" : "빠른"} 동기화 완료! ${result.upsertedCount}건 저장됨`,
@@ -1655,6 +1696,7 @@ exports.syncBeds24Full = onRequest({ cors: true, timeoutSeconds: 900, memory: '1
         } catch (e) {
             console.warn("[Manual Full Sync] Output update failed:", e.message);
         }
+        await refreshHomeDashboardSummarySafe(companyId, "manual_full_sync", "syncBeds24Full");
         res.json({ success: true, message: `전체 동기화 완료! ${result.upsertedCount}건 저장됨 (2023년~향후 24개월)`, ...result, companyId });
     } catch (e) {
         console.error("Full Sync Failed:", e.message);
@@ -1666,6 +1708,52 @@ exports.syncBeds24Full = onRequest({ cors: true, timeoutSeconds: 900, memory: '1
             errorMessage: e.message
         });
         res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+exports.refreshHomeDashboardSummary = onRequest({ cors: true, timeoutSeconds: 180, memory: "512MiB" }, async (req, res) => {
+    try {
+        if (req.method !== "POST") {
+            return res.status(400).json({ success: false, error: "POST required" });
+        }
+
+        const companyId = req.body?.companyId || DEFAULT_COMPANY_ID;
+        const summary = await refreshHomeDashboardSummary(db, {
+            companyId,
+            buildingRooms: BUILDING_ROOMS,
+            excludedBuildingName: HOME_DASHBOARD_EXCLUDED_BUILDING,
+            referenceOnlyBuildingName: HOME_DASHBOARD_REFERENCE_ONLY_BUILDING,
+            reason: req.body?.reason || "manual_request",
+            source: req.body?.source || "refreshHomeDashboardSummary"
+        });
+
+        return res.json({
+            success: true,
+            companyId,
+            computedAtMs: summary.computedAtMs,
+            reservationCount: summary.sourceReservationCount
+        });
+    } catch (error) {
+        console.error("[HomeDashboardSummary] manual refresh failed:", error.message);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+exports.scheduledRefreshHomeDashboardSummary = onSchedule({
+    schedule: "*/5 * * * *",
+    timeZone: "Asia/Tokyo",
+    timeoutSeconds: 240,
+    memory: "512MiB"
+}, async () => {
+    const results = await processDirtyHomeDashboardSummaries(db, {
+        buildingRooms: BUILDING_ROOMS,
+        excludedBuildingName: HOME_DASHBOARD_EXCLUDED_BUILDING,
+        referenceOnlyBuildingName: HOME_DASHBOARD_REFERENCE_ONLY_BUILDING,
+        limit: 10
+    });
+
+    if (results.length > 0) {
+        console.log("[HomeDashboardSummary] scheduled refresh results:", JSON.stringify(results));
     }
 });
 
@@ -3085,6 +3173,9 @@ const BUILDING_ROOMS = {
     "사노시": [{ roomId: "481152", name: "사노" }]
 };
 
+const HOME_DASHBOARD_EXCLUDED_BUILDING = PROPERTIES.find((property) => property.disabled)?.name || "";
+const HOME_DASHBOARD_REFERENCE_ONLY_BUILDING = PROPERTIES[PROPERTIES.length - 1]?.name || "";
+
 const {
     sendSyncAlert,
     buildAndSendSlackDailyReport,
@@ -3930,12 +4021,29 @@ async function processPriceJob(jobId) {
                                 oldPricesByRoom[rid] = {};
                                 Object.keys(roomDates).forEach(dKey => { oldPricesByRoom[rid][dKey] = parseFloat(roomData.dates[dKey]?.p1) || 0; });
                                 roomData.lastManualUpdate = admin.firestore.FieldValue.serverTimestamp();
+                                // 상세 변동 이력(lm)을 위한 현재 시각 (Tokyo/Seoul)
+                                const nowFormatted = dayjs().utcOffset(9).format("MM-DD HH:mm");
+                                
                                 Object.entries(roomDates).forEach(([dKey, values]) => {
                                     if (!roomData.dates[dKey]) roomData.dates[dKey] = {};
+                                    
+                                    // 이전 가격 수집 (p1 기준)
+                                    const oldP1 = parseFloat(roomData.dates[dKey].p1) || 0;
+                                    const newP1 = values.p1 !== undefined ? parseFloat(values.p1) : oldP1;
+
                                     if (values.p1 !== undefined) roomData.dates[dKey].p1 = String(values.p1);
                                     if (values.p2 !== undefined) roomData.dates[dKey].p2 = String(values.p2);
                                     if (values.p3 !== undefined) roomData.dates[dKey].p3 = String(values.p3);
-                                    // minStay excluded from price job cache patch (setMinStay handles its own cache)
+                                    
+                                    // 가격 변동이 있을 경우 상세 메타데이터(lm) 저장
+                                    if (values.p1 !== undefined && oldP1 !== newP1) {
+                                        roomData.dates[dKey].lm = {
+                                            u: jobData.worker || "Admin",
+                                            t: nowFormatted,
+                                            o: oldP1,
+                                            n: newP1
+                                        };
+                                    }
                                 });
                                 await roomDocRef.set(roomData, { merge: true });
                             } catch (cacheErr) {
@@ -3966,11 +4074,25 @@ async function processPriceJob(jobId) {
                             oldPricesByRoom[rid] = {};
                             Object.keys(dates).forEach(dKey => { oldPricesByRoom[rid][dKey] = parseFloat(roomData.dates[dKey]?.p1) || 0; });
                             roomData.lastManualUpdate = admin.firestore.FieldValue.serverTimestamp();
+                            const nowFormatted = dayjs().utcOffset(9).format("MM-DD HH:mm");
                             Object.entries(dates).forEach(([dKey, values]) => {
                                 if (!roomData.dates[dKey]) roomData.dates[dKey] = {};
+                                
+                                const oldP1 = parseFloat(roomData.dates[dKey].p1) || 0;
+                                const newP1 = values.p1 !== undefined ? parseFloat(values.p1) : oldP1;
+
                                 if (values.p1 !== undefined) roomData.dates[dKey].p1 = String(values.p1);
                                 if (values.p2 !== undefined) roomData.dates[dKey].p2 = String(values.p2);
                                 if (values.p3 !== undefined) roomData.dates[dKey].p3 = String(values.p3);
+
+                                if (values.p1 !== undefined && oldP1 !== newP1) {
+                                    roomData.dates[dKey].lm = {
+                                        u: jobData.worker || "Admin",
+                                        t: nowFormatted,
+                                        o: oldP1,
+                                        n: newP1
+                                    };
+                                }
                             });
                             await roomDocRef.set(roomData, { merge: true });
                         } catch (cacheErr) {
@@ -4640,6 +4762,29 @@ async function syncSingleRoomPriceCache(building, roomId, roomName, { reason = "
     const { fromDate, toDate, datesObj } = liveSnapshot;
 
     const roomDocRef = db.collection("price_sync").doc(building).collection("rooms").doc(String(roomId));
+    
+    // 주황색 점(lm) 정보 보존을 위해 기존 데이터 가져오기 (v2.1)
+    const oldSnap = await roomDocRef.get();
+    if (oldSnap.exists) {
+        const oldDates = oldSnap.data()?.dates || {};
+        Object.keys(datesObj).forEach(dKey => {
+                        const oldP1 = parseFloat(oldDates[dKey]?.p1) || 0;
+            const newP1 = parseFloat(datesObj[dKey].p1) || 0;
+
+            if (oldP1 !== 0 && newP1 !== 0 && oldP1 !== newP1) {
+                datesObj[dKey].lm = {
+                    u: "Beds24",
+                    t: dayjs().utcOffset(9).format("MM-DD HH:mm"),
+                    o: oldP1,
+                    n: newP1,
+                    s: "beds24"
+                };
+            } else if (oldDates[dKey]?.lm) {
+                datesObj[dKey].lm = oldDates[dKey].lm;
+            }
+        });
+    }
+
     await roomDocRef.set({
         roomName,
         roomId: String(roomId),
@@ -4794,13 +4939,14 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
             }
 
             // Build price diff from old cache vs new sync data
+            // oldDates가 없어도(첫 sync, 캐시 만료 등) newDates 기준으로 diff 계산
             let priceDiffs = [];
-            if (syncResult?.success && syncResult.newDates && oldDates) {
+            if (syncResult?.success && syncResult.newDates) {
                 const tokyoToday = dayjs().utcOffset(9).format("YYYYMMDD");
                 const diffLimit = dayjs().utcOffset(9).add(12, "month").format("YYYYMMDD");
                 for (const [dk, newVal] of Object.entries(syncResult.newDates)) {
                     if (dk < tokyoToday || dk > diffLimit) continue;
-                    const oldVal = oldDates[dk];
+                    const oldVal = oldDates?.[dk]; // optional: oldDates 없으면 undefined → oldP1 = 0
                     const oldP1 = parseFloat(oldVal?.p1) || 0;
                     const newP1 = parseFloat(newVal?.p1) || 0;
                     if (oldP1 !== newP1 && (oldP1 > 0 || newP1 > 0)) {
@@ -5388,6 +5534,7 @@ exports.createBooking = onRequest({ cors: true }, async (req, res) => {
             } catch (e) {
                 console.warn("[createBooking] Output update failed:", e.message);
             }
+            await refreshHomeDashboardSummarySafe(companyId || DEFAULT_COMPANY_ID, "manual_create_booking", "createBooking");
         }
         console.log(`[createBooking] 예약 생성 성공: bookingId=${newBookingId}`);
         res.json({ success: true, bookingId: newBookingId });
@@ -5479,6 +5626,7 @@ exports.updateBooking = onRequest({ cors: true }, async (req, res) => {
         } catch (e) {
             console.warn("[updateBooking] Output update failed:", e.message);
         }
+        await refreshHomeDashboardSummarySafe(companyId, "manual_update_booking", "updateBooking");
         res.json({ success: true });
 
     } catch (e) {
@@ -5596,6 +5744,7 @@ exports.cancelBooking = onRequest({ cors: true }, async (req, res) => {
             } catch (e) {
                 console.warn("[cancelBooking] Output update failed:", e.message);
             }
+            await refreshHomeDashboardSummarySafe(companyId, "manual_cancel_booking", "cancelBooking");
         }
         console.log(`[cancelBooking] 예약 취소 완료: bookId=${bookId}`);
         res.json({ success: true });
@@ -6113,8 +6262,8 @@ async function runNotionDashboardSync() {
 exports.scheduledNotionDashboardSync = onSchedule({
     schedule: "0 9 * * *",
     timeZone: "Asia/Tokyo",
-    timeoutSeconds: 120,
-    memory: "256MiB"
+    timeoutSeconds: 540,
+    memory: "1GiB"
 }, async () => {
     try {
         await runNotionDashboardSync();

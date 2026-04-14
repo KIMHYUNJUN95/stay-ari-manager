@@ -1,8 +1,8 @@
 // src/components/TodaySummaryDashboard.jsx
 // 대기업 수준 메인 대시보드 - 각 기능과 100% 데이터 일치
 
-import React, { useState, useEffect, useMemo } from 'react';
-import { collection, query, where, onSnapshot } from "firebase/firestore";
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { collection, query, where, onSnapshot, doc, getDocs } from "firebase/firestore";
 import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
 
@@ -22,6 +22,19 @@ const BUILDING_ROOMS = {
   "사노시": ["사노"],
   "다카다노바바": ["201호", "301호", "401호", "501호", "601호", "701호", "801호", "901호"]
 };
+
+const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || "https://us-central1-my-booking-app-3f0e7.cloudfunctions.net";
+const EMPTY_REVENUE_DATA = { currentMonth: 0, lastMonth: 0 };
+const EMPTY_PERFORMANCE_DATA = {
+  total: 0,
+  lastMonthTotal: 0,
+  buildings: [],
+  platforms: { airbnb: 0, booking: 0 },
+  platformRevenue: { airbnb: 0, booking: 0, direct: 0 }
+};
+const EMPTY_OCCUPANCY_DATA = { currentRate: 0, lastMonthRate: 0, totalNights: 0, totalSlots: 0 };
+const EMPTY_TODAY_ACTIVITY = { checkins: 0, checkouts: 0, newBookings: 0 };
+const EMPTY_AVG_STAY_DATA = { avgNights: 0, totalBookings: 0, lastMonthAvg: 0 };
 
 // 예약된 날짜들을 Set으로 계산 (겹침 제거) - OccupancyRateDashboard와 동일
 // ★ 베드24 기준: arrival ~ departure 전날까지 점유됨
@@ -94,383 +107,188 @@ const TodaySummaryDashboard = () => {
   const { companyId } = useUser();
   const [loading, setLoading] = useState(true);
   const [lastUpdate, setLastUpdate] = useState(null);
-  
-  // ===== 매출 데이터 (Revenue Dashboard Monthly 모드와 동일) =====
-  const [revenueData, setRevenueData] = useState({
-    currentMonth: 0,      // 이번 달 매출
-    lastMonth: 0          // 지난 달 매출
-  });
-
-  // ===== 예약 접수 데이터 (Performance Dashboard와 동일) =====
-  const [performanceData, setPerformanceData] = useState({
-    total: 0,             // 이번 달 예약 접수 건수
-    lastMonthTotal: 0,    // 지난 달 예약 접수 건수
-    buildings: [],        // 건물별 예약 수
-    platforms: { airbnb: 0, booking: 0 },
-    platformRevenue: { airbnb: 0, booking: 0, direct: 0 }
-  });
-
-  // ===== 숙박 현황 데이터 (Occupancy Dashboard와 동일) =====
-  const [occupancyData, setOccupancyData] = useState({
-    currentRate: 0,       // 이번 달 가동률 (사노시 제외)
-    lastMonthRate: 0,     // 지난 달 가동률 (사노시 제외)
-    totalNights: 0,       // 이번 달 총 숙박 일수
-    totalSlots: 0         // 이번 달 총 객실×일수
-  });
-
-  // ===== 오늘 활동 =====
-  const [todayActivity, setTodayActivity] = useState({
-    checkins: 0,
-    checkouts: 0,
-    newBookings: 0
-  });
-
-  // ===== 평균 숙박 일수 (이번 달 체크인 확정, 사노시 제외) =====
-  const [avgStayData, setAvgStayData] = useState({
-    avgNights: 0,
-    totalBookings: 0,
-    lastMonthAvg: 0
-  });
-
-  // ===== Quick Calendar (다이쿄초·사노시 제외) =====
-  const calendarBuildingList = useMemo(
-    () => Object.keys(BUILDING_ROOMS).filter(b => b !== "사노시" && b !== EXCLUDED_BUILDING_UI),
-    []
-  );
-  const [selectedCalendarBuilding, setSelectedCalendarBuilding] = useState("아라키초A");
+  const [revenueData, setRevenueData] = useState(EMPTY_REVENUE_DATA);
+  const [performanceData, setPerformanceData] = useState(EMPTY_PERFORMANCE_DATA);
+  const [occupancyData, setOccupancyData] = useState(EMPTY_OCCUPANCY_DATA);
+  const [todayActivity, setTodayActivity] = useState(EMPTY_TODAY_ACTIVITY);
+  const [avgStayData, setAvgStayData] = useState(EMPTY_AVG_STAY_DATA);
   const [calendarReservations, setCalendarReservations] = useState([]);
+  const [summaryRevision, setSummaryRevision] = useState(0);
+  const summaryRefreshRequestedRef = useRef(false);
+
+  const calendarBuildingList = useMemo(() => {
+    const summaryBuildings = (performanceData.buildings || [])
+      .map((item) => item?.name)
+      .filter((name) => Boolean(name) && name !== EXCLUDED_BUILDING_UI);
+
+    if (summaryBuildings.length > 0) {
+      return summaryBuildings;
+    }
+
+    return Object.keys(BUILDING_ROOMS).filter((buildingName) => buildingName !== EXCLUDED_BUILDING_UI);
+  }, [performanceData.buildings]);
+
+  const [selectedCalendarBuilding, setSelectedCalendarBuilding] = useState(
+    () => Object.keys(BUILDING_ROOMS).find((buildingName) => buildingName !== EXCLUDED_BUILDING_UI) || Object.keys(BUILDING_ROOMS)[0] || ''
+  );
 
   useEffect(() => {
-    if (selectedCalendarBuilding === EXCLUDED_BUILDING_UI || !calendarBuildingList.includes(selectedCalendarBuilding)) {
-      setSelectedCalendarBuilding(calendarBuildingList[0] || "아라키초A");
+    if (!selectedCalendarBuilding || !calendarBuildingList.includes(selectedCalendarBuilding)) {
+      setSelectedCalendarBuilding(calendarBuildingList[0] || '');
     }
   }, [selectedCalendarBuilding, calendarBuildingList]);
 
   useEffect(() => {
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = now.getMonth();
-    
-    // 현재 월 범위
-    const currentMonthStr = `${year}-${String(month + 1).padStart(2, '0')}`;
-    const currentMonthStart = `${year}-${String(month + 1).padStart(2, '0')}-01`;
-    const currentMonthEnd = `${year}-${String(month + 1).padStart(2, '0')}-${new Date(year, month + 1, 0).getDate()}`;
-    
-    // 지난 월 범위
-    const lastMonthYear = month === 0 ? year - 1 : year;
-    const lastMonthNum = month === 0 ? 12 : month;
-    const lastMonthStr = `${lastMonthYear}-${String(lastMonthNum).padStart(2, '0')}`;
-    const lastMonthStart = `${lastMonthYear}-${String(lastMonthNum).padStart(2, '0')}-01`;
-    const lastMonthEnd = `${lastMonthYear}-${String(lastMonthNum).padStart(2, '0')}-${new Date(lastMonthYear, lastMonthNum, 0).getDate()}`;
-    
-    // 오늘 날짜
-    const today = `${year}-${String(month + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-    
-    // 총 객실 수
-    const daysInCurrentMonth = new Date(year, month + 1, 0).getDate();
-    const daysInLastMonth = new Date(lastMonthYear, lastMonthNum, 0).getDate();
+    summaryRefreshRequestedRef.current = false;
 
-    // ============================================================
-    // 🔴 실시간 리스너: confirmed 예약 전체
-    // ============================================================
     if (!companyId) {
-      console.warn('⚠️ No companyId for TodaySummaryDashboard');
       setLoading(false);
-      return;
+      return undefined;
     }
 
-    const mainQuery = query(
-      collection(db, "reservations"),
-      where("companyId", "==", companyId),
-      where("status", "==", "confirmed")
-    );
+    setLoading(true);
 
-    const unsubscribeMain = onSnapshot(mainQuery, (snapshot) => {
-      const allReservations = snapshot.docs.map(d => d.data());
-      console.log(`📊 Dashboard: ${allReservations.length}건 confirmed 예약 로드됨`);
+    const summaryRef = doc(db, 'dashboard_home_summaries', companyId);
+    const unsubscribe = onSnapshot(
+      summaryRef,
+      async (snapshot) => {
+        if (!snapshot.exists()) {
+          if (!summaryRefreshRequestedRef.current) {
+            summaryRefreshRequestedRef.current = true;
+            try {
+              const response = await fetch(`${API_BASE_URL}/refreshHomeDashboardSummary`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  companyId,
+                  reason: 'dashboard_bootstrap',
+                  source: 'TodaySummaryDashboard'
+                })
+              });
 
-      // ========================================
-      // 1️⃣ 매출 계산 (Revenue Dashboard Monthly 로직) + 플랫폼별 동시 집계
-      // ========================================
-      let currentMonthRevenue = 0;
-      let lastMonthRevenue = 0;
-      const platformRevenue = {
-        airbnb: 0,
-        booking: 0,
-        direct: 0
-      };
-
-      const currentStart = parseLocalDate(currentMonthStart);
-      const currentEnd = parseLocalDate(currentMonthEnd);
-      const lastStart = parseLocalDate(lastMonthStart);
-      const lastEnd = parseLocalDate(lastMonthEnd);
-
-      allReservations.forEach(doc => {
-        if (!doc.arrival || !doc.departure) return;
-        if ((doc.building || "") === EXCLUDED_BUILDING_UI) return;
-
-        const totalPrice = Number(doc.totalPrice || doc.price) || 0;
-        const arrivalDate = parseLocalDate(doc.arrival);
-        const departureDate = parseLocalDate(doc.departure);
-        
-        if (!arrivalDate || !departureDate) return;
-        
-        const totalNights = Math.floor((departureDate - arrivalDate) / (1000 * 60 * 60 * 24));
-        if (totalNights <= 0) return;
-
-        const pricePerNight = totalPrice / totalNights;
-        const platformRevenueKey = getPlatformRevenueKey(doc);
-
-        // 현재 월 overlap 매출 계산
-        if (departureDate > currentStart && arrivalDate <= currentEnd) {
-          const overlapStart = new Date(Math.max(arrivalDate, currentStart));
-          const overlapEndDate = new Date(departureDate);
-          overlapEndDate.setDate(overlapEndDate.getDate() - 1);
-          const overlapEnd = new Date(Math.min(overlapEndDate, currentEnd));
-          
-          if (overlapStart <= overlapEnd) {
-            const overlapNights = Math.floor((overlapEnd - overlapStart) / (1000 * 60 * 60 * 24)) + 1;
-            const monthlyRevenue = pricePerNight * overlapNights;
-            currentMonthRevenue += monthlyRevenue;
-            
-            // ★ 플랫폼별 매출 동시 집계
-            if (platformRevenueKey === PLATFORM_REVENUE_KEYS.airbnb) {
-              platformRevenue.airbnb += monthlyRevenue;
-            } else if (platformRevenueKey === PLATFORM_REVENUE_KEYS.booking) {
-              platformRevenue.booking += monthlyRevenue;
-            } else if (platformRevenueKey === PLATFORM_REVENUE_KEYS.direct) {
-              platformRevenue.direct += monthlyRevenue;
+              if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+              }
+            } catch (error) {
+              console.warn('[TodaySummaryDashboard] bootstrap summary refresh failed:', error.message);
+              setLoading(false);
             }
           }
+          return;
         }
 
-        // 지난 월 overlap 매출 계산
-        if (departureDate > lastStart && arrivalDate <= lastEnd) {
-          const overlapStart = new Date(Math.max(arrivalDate, lastStart));
-          const overlapEndDate = new Date(departureDate);
-          overlapEndDate.setDate(overlapEndDate.getDate() - 1);
-          const overlapEnd = new Date(Math.min(overlapEndDate, lastEnd));
-          
-          if (overlapStart <= overlapEnd) {
-            const overlapNights = Math.floor((overlapEnd - overlapStart) / (1000 * 60 * 60 * 24)) + 1;
-            lastMonthRevenue += pricePerNight * overlapNights;
-          }
-        }
-      });
+        summaryRefreshRequestedRef.current = false;
+        const data = snapshot.data() || {};
+        const rawPerformanceData = data.performanceData || {};
+        const rawOccupancyData = data.occupancyData || {};
+        const rawTodayActivity = data.todayActivity || {};
+        const rawAvgStayData = data.avgStayData || {};
+        const computedAtMs = Number(data.computedAtMs || data.updatedAt?.toMillis?.() || Date.now());
 
-      // ★ 플랫폼별 매출 반올림 (Monthly Revenue와 합계 일치하도록)
-      const roundedTotal = Math.round(currentMonthRevenue);
-      const roundedAirbnb = Math.round(platformRevenue.airbnb);
-      const roundedBooking = Math.round(platformRevenue.booking);
-      const roundedDirect = Math.round(platformRevenue.direct);
+        setRevenueData({
+          currentMonth: Number(data.revenueData?.currentMonth || 0),
+          lastMonth: Number(data.revenueData?.lastMonth || 0)
+        });
 
-      setRevenueData({
-        currentMonth: roundedTotal,
-        lastMonth: Math.round(lastMonthRevenue)
-      });
-
-      // performanceData에 platformRevenue 저장 (나중에 사용)
-      const calculatedPlatformRevenue = { 
-        airbnb: roundedAirbnb, 
-        booking: roundedBooking,
-        direct: roundedDirect
-      };
-
-      // ========================================
-      // 2️⃣ 예약 접수 실적 (Performance Dashboard 로직)
-      // bookDate 기준, 중복 제거
-      // ========================================
-      const currentMonthBookings = allReservations.filter(r => {
-        if ((r.building || "") === EXCLUDED_BUILDING_UI) return false;
-        const bookTime = r.bookDate || r.firstNight || '';
-        return bookTime && typeof bookTime === 'string' && bookTime.startsWith(currentMonthStr);
-      });
-
-      const lastMonthBookings = allReservations.filter(r => {
-        if ((r.building || "") === EXCLUDED_BUILDING_UI) return false;
-        const bookTime = r.bookDate || r.firstNight || '';
-        return bookTime && typeof bookTime === 'string' && bookTime.startsWith(lastMonthStr);
-      });
-
-      // 중복 제거 (Performance Dashboard와 동일)
-      const deduplicateBookings = (bookings) => {
-        const uniqueMap = new Map();
-        bookings.forEach(r => {
-          const key = r.bookId || r.refNum || `${r.guestName}_${r.firstNight}`;
-          if (!uniqueMap.has(key)) {
-            uniqueMap.set(key, r);
+        setPerformanceData({
+          total: Number(rawPerformanceData.total || 0),
+          lastMonthTotal: Number(rawPerformanceData.lastMonthTotal || 0),
+          buildings: Array.isArray(rawPerformanceData.buildings) ? rawPerformanceData.buildings : [],
+          platforms: {
+            airbnb: Number(rawPerformanceData.platforms?.airbnb || 0),
+            booking: Number(rawPerformanceData.platforms?.booking || 0)
+          },
+          platformRevenue: {
+            airbnb: Number(rawPerformanceData.platformRevenue?.airbnb || 0),
+            booking: Number(rawPerformanceData.platformRevenue?.booking || 0),
+            direct: Number(rawPerformanceData.platformRevenue?.direct || 0)
           }
         });
-        return Array.from(uniqueMap.values());
-      };
 
-      const uniqueCurrentBookings = deduplicateBookings(currentMonthBookings);
-      const uniqueLastBookings = deduplicateBookings(lastMonthBookings);
-
-      // 건물별 통계 (예약 접수 기준)
-      const buildingCount = {};
-      const platformCount = { airbnb: 0, booking: 0 };
-
-      uniqueCurrentBookings.forEach(r => {
-        const building = r.building || "Unknown";
-        buildingCount[building] = (buildingCount[building] || 0) + 1;
-
-        const platformName = (r.platform || '').toLowerCase();
-        
-        if (platformName.includes('booking')) {
-          platformCount.booking++;
-        } else {
-          platformCount.airbnb++;
-        }
-      });
-
-      // ★ 플랫폼별 매출은 위 1️⃣에서 이미 계산됨 (calculatedPlatformRevenue)
-
-      // 표시용 건물 목록 (다이쿄초·사노시 제외). 예약 0건인 건물도 막대에 표시
-      const displayBuildingList = Object.keys(BUILDING_ROOMS).filter(
-        b => b !== "사노시" && b !== EXCLUDED_BUILDING_UI
-      );
-      const buildingStats = displayBuildingList
-        .map(name => ({ name, count: buildingCount[name] || 0 }))
-        .sort((a, b) => b.count - a.count);
-
-      setPerformanceData({
-        total: uniqueCurrentBookings.length,
-        lastMonthTotal: uniqueLastBookings.length,
-        buildings: buildingStats,
-        platforms: platformCount,
-        platformRevenue: calculatedPlatformRevenue
-      });
-
-      // ========================================
-      // 3️⃣ 가동률 계산 (OccupancyRateDashboard와 100% 동일한 로직)
-      // ★ 사노시 제외, 실제 점유 날짜 Set 계산
-      // ========================================
-      let currentOccupiedDays = 0;
-      let currentAvailableDays = 0;
-      let lastOccupiedDays = 0;
-      let lastAvailableDays = 0;
-
-      Object.keys(BUILDING_ROOMS).forEach(building => {
-        // ★ 사노시·다이쿄초: 가동률 계산에서 제외
-        if (building === "사노시" || building === EXCLUDED_BUILDING_UI) return;
-
-        const rooms = BUILDING_ROOMS[building];
-        rooms.forEach(room => {
-          // 현재 월 가동률 계산
-          // ★ 다이쿄초: bookDate가 1/26 이후인 예약만 제외 (1/25 이전 예약은 모두 포함)
-          const currentRoomReservations = allReservations.filter(r => {
-            return r.building === building &&
-              r.room === room &&
-              r.arrival <= currentMonthEnd &&
-              r.departure >= currentMonthStart &&
-              building !== EXCLUDED_BUILDING_UI;
-          });
-          currentOccupiedDays += getOccupiedDaysSet(currentRoomReservations, currentMonthStart, currentMonthEnd);
-          currentAvailableDays += daysInCurrentMonth;
-
-          // 지난 월 가동률 계산
-          // ★ 다이쿄초: bookDate가 1/26 이후인 예약만 제외 (1/25 이전 예약은 모두 포함)
-          const lastRoomReservations = allReservations.filter(r => {
-            return r.building === building &&
-              r.room === room &&
-              r.arrival <= lastMonthEnd &&
-              r.departure >= lastMonthStart &&
-              building !== EXCLUDED_BUILDING_UI;
-          });
-          lastOccupiedDays += getOccupiedDaysSet(lastRoomReservations, lastMonthStart, lastMonthEnd);
-          lastAvailableDays += daysInLastMonth;
+        setOccupancyData({
+          currentRate: Number(rawOccupancyData.currentRate || 0),
+          lastMonthRate: Number(rawOccupancyData.lastMonthRate || 0),
+          totalNights: Number(rawOccupancyData.totalNights || 0),
+          totalSlots: Number(rawOccupancyData.totalSlots || 0)
         });
-      });
 
-      const currentOccupancy = currentAvailableDays > 0 ? (currentOccupiedDays / currentAvailableDays * 100) : 0;
-      const lastOccupancy = lastAvailableDays > 0 ? (lastOccupiedDays / lastAvailableDays * 100) : 0;
+        setTodayActivity({
+          checkins: Number(rawTodayActivity.checkins || 0),
+          checkouts: Number(rawTodayActivity.checkouts || 0),
+          newBookings: Number(rawTodayActivity.newBookings || 0)
+        });
 
-      setOccupancyData({
-        currentRate: parseFloat(currentOccupancy.toFixed(1)),
-        lastMonthRate: parseFloat(lastOccupancy.toFixed(1)),
-        totalNights: currentOccupiedDays,
-        totalSlots: currentAvailableDays
-      });
+        setAvgStayData({
+          avgNights: Number(rawAvgStayData.avgNights || 0),
+          totalBookings: Number(rawAvgStayData.totalBookings || 0),
+          lastMonthAvg: Number(rawAvgStayData.lastMonthAvg || 0)
+        });
 
-      // ========================================
-      // 4️⃣ 오늘 활동
-      // ========================================
-      const todayCheckins = allReservations.filter(r => r.arrival === today).length;
-      const todayCheckouts = allReservations.filter(r => r.departure === today).length;
-      const todayNewBookings = allReservations.filter(r => r.bookDate === today).length;
-
-      setTodayActivity({
-        checkins: todayCheckins,
-        checkouts: todayCheckouts,
-        newBookings: todayNewBookings
-      });
-
-      // ========================================
-      // 5️⃣ 평균 숙박 일수 (이번 달 체크인 확정, 사노시 제외, 0엔 제외)
-      // ========================================
-      // 이번 달 체크인 + 사노시 제외 + 다이쿄초 bookDate 1/26 이후 제외 + 0엔 수기예약 제외
-      const thisMonthCheckins = allReservations.filter(r => {
-        return r.arrival &&
-          r.arrival.startsWith(currentMonthStr) &&
-          r.building !== "사노시" &&
-          r.building !== EXCLUDED_BUILDING_UI &&
-          Number(r.totalPrice || r.price || 0) > 0;
-      });
-
-      // 지난 달 체크인 + 사노시 제외 + 다이쿄초 bookDate 1/26 이후 제외 + 0엔 수기예약 제외
-      const lastMonthCheckins = allReservations.filter(r => {
-        return r.arrival &&
-          r.arrival.startsWith(lastMonthStr) &&
-          r.building !== "사노시" &&
-          r.building !== EXCLUDED_BUILDING_UI &&
-          Number(r.totalPrice || r.price || 0) > 0;
-      });
-
-      // 이번 달 평균 숙박 일수
-      const thisMonthNightsSum = thisMonthCheckins.reduce((sum, r) => 
-        sum + Number(r.nights || 0), 0
-      );
-      const thisMonthAvgNights = thisMonthCheckins.length > 0 
-        ? thisMonthNightsSum / thisMonthCheckins.length 
-        : 0;
-
-      // 지난 달 평균 숙박 일수
-      const lastMonthNightsSum = lastMonthCheckins.reduce((sum, r) => 
-        sum + Number(r.nights || 0), 0
-      );
-      const lastMonthAvgNights = lastMonthCheckins.length > 0 
-        ? lastMonthNightsSum / lastMonthCheckins.length 
-        : 0;
-
-      setAvgStayData({
-        avgNights: parseFloat(thisMonthAvgNights.toFixed(1)),
-        totalBookings: thisMonthCheckins.length,
-        lastMonthAvg: parseFloat(lastMonthAvgNights.toFixed(1))
-      });
-
-      // ========================================
-      // 6️⃣ Quick Calendar 데이터 (이번 달 예약)
-      // ========================================
-      const calendarData = allReservations.filter(r => 
-        r.arrival && r.departure &&
-        r.arrival <= currentMonthEnd &&
-        r.departure >= currentMonthStart
-      );
-      setCalendarReservations(calendarData);
-
-      setLastUpdate(new Date());
-      setLoading(false);
-    });
+        setSummaryRevision(computedAtMs);
+        setLastUpdate(new Date(computedAtMs));
+        setLoading(false);
+      },
+      (error) => {
+        console.warn('[TodaySummaryDashboard] summary subscription failed:', error.message);
+        setLoading(false);
+      }
+    );
 
     return () => {
-      unsubscribeMain();
+      unsubscribe();
     };
   }, [companyId]);
 
-  // ========================================
-  // 유틸리티 함수
-  // ========================================
+  useEffect(() => {
+    if (!companyId || !selectedCalendarBuilding) {
+      setCalendarReservations([]);
+      return undefined;
+    }
+
+    let isMounted = true;
+
+    const loadCalendarReservations = async () => {
+      try {
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = now.getMonth();
+        const currentMonthStart = `${year}-${String(month + 1).padStart(2, '0')}-01`;
+        const currentMonthEnd = `${year}-${String(month + 1).padStart(2, '0')}-${String(new Date(year, month + 1, 0).getDate()).padStart(2, '0')}`;
+
+        const reservationsQuery = query(
+          collection(db, 'reservations'),
+          where('companyId', '==', companyId),
+          where('status', '==', 'confirmed'),
+          where('building', '==', selectedCalendarBuilding)
+        );
+
+        const snapshot = await getDocs(reservationsQuery);
+        const filteredReservations = snapshot.docs
+          .map((reservationDoc) => reservationDoc.data())
+          .filter((reservation) => (
+            reservation.arrival &&
+            reservation.departure &&
+            reservation.arrival <= currentMonthEnd &&
+            reservation.departure >= currentMonthStart
+          ));
+
+        if (isMounted) {
+          setCalendarReservations(filteredReservations);
+        }
+      } catch (error) {
+        console.warn('[TodaySummaryDashboard] quick calendar load failed:', error.message);
+        if (isMounted) {
+          setCalendarReservations([]);
+        }
+      }
+    };
+
+    loadCalendarReservations();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [companyId, selectedCalendarBuilding, summaryRevision]);
   const formatPrice = (price) => `¥${Math.round(price).toLocaleString()}`;
   
   const getChangePercent = (current, previous) => {
