@@ -477,16 +477,8 @@ function PriceChangeHistory() {
         return { total, beds24, admin, converted };
     }, [filteredLogs, attributedConversions]);
 
-    // ─── 보기 모드 ───────────────────────────────────────────────────────────
-    // 롤백 방법: 아래 useState 기본값을 'comfortable'로 변경하면 Compact UI 비활성화
-    // Compact 분기를 완전 제거하려면 viewMode 관련 코드(toggle 버튼 + isCompact 분기)를 삭제
-    const [viewMode, setViewMode] = useState('comfortable');
-    const isCompact = viewMode === 'compact';
-
-    // Comfortable 모드 그리드 컬럼
-    const COL = '72px 54px minmax(110px,140px) minmax(80px,110px) 126px 118px 1fr';
-    // Compact 모드 그리드 컬럼: Time | OK | Building | Room | Period | Type | Before | After | Δ%
-    const COL_COMPACT = '58px 28px minmax(90px,1fr) minmax(70px,90px) 96px 74px 72px 72px 52px';
+    // 그리드 컬럼: Time | OK | Building | Room | Period | Type | Before | After | Δ%
+    const COL = '58px 28px minmax(90px,1fr) minmax(70px,90px) 96px 74px 72px 72px 52px';
 
     const colHeaderStyle = {
         fontSize: '11px', fontWeight: '600', color: '#8E8E93',
@@ -549,39 +541,7 @@ function PriceChangeHistory() {
         </div>
     );
 
-    // ─── Comfortable 모드 Expanded Snapshot (카드 그리드) ────────────────────
-    const renderSnapshotComfortable = (log, uniquePriceSnapshot, isBeds24) => (
-        <div style={{ padding: '16px 20px 20px', background: '#F5F5F7', borderTop: '1px solid #E5E5EA' }}>
-            <div style={{ fontSize: '11px', fontWeight: '600', color: '#8E8E93', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                {isBeds24 ? 'Detected Changes' : 'Price Snapshot by Date'}
-                {log.adjustMode === 'percent' && log.percentValue && (
-                    <span style={{ background: Number(log.percentValue) > 0 ? '#FFF2F0' : '#F0FFF4', color: Number(log.percentValue) > 0 ? '#FF3B30' : '#34C759', padding: '2px 8px', borderRadius: '4px', fontSize: '11px', fontWeight: '600' }}>
-                        {Number(log.percentValue) > 0 ? '+' : ''}{log.percentValue}%
-                    </span>
-                )}
-                <span style={{ marginLeft: 'auto', fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
-                    by {getWorkerDisplay(log)}{log.workerEmail ? ` · ${log.workerEmail}` : ''}
-                </span>
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(148px, 1fr))', gap: '8px' }}>
-                {uniquePriceSnapshot.map((snap, sidx) => (
-                    <div key={sidx} style={{ background: '#FFFFFF', borderRadius: '10px', padding: '10px 12px', border: '1px solid #E5E5EA' }}>
-                        <div style={{ fontSize: '11px', fontWeight: '600', color: '#0071E3', marginBottom: '5px', display: 'flex', justifyContent: 'space-between' }}>
-                            <span>{snap.date ? snap.date.slice(5).replace('-', '/') : '-'}</span>
-                            {snap.room && <span style={{ color: '#AEAEB2', fontWeight: '400' }}>{getRoomName(snap.room)}</span>}
-                        </div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                            <span style={{ fontSize: '12px', color: '#AEAEB2', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums' }}>{formatPrice(snap.oldPrice)}</span>
-                            <span style={{ color: '#D1D1D6', fontSize: '10px' }}>→</span>
-                            <span style={{ fontSize: '13px', fontWeight: '700', fontVariantNumeric: 'tabular-nums', color: snap.newPrice > snap.oldPrice ? '#FF3B30' : snap.newPrice < snap.oldPrice ? '#34C759' : '#1D1D1F' }}>{formatPrice(snap.newPrice)}</span>
-                        </div>
-                    </div>
-                ))}
-            </div>
-        </div>
-    );
-
-    // ─── 행 렌더러 (Comfortable / Compact 분기) ──────────────────────────────
+    // ─── 행 렌더러 (단일 Compact 스타일) ────────────────────────────────────
     const renderRows = (rows) => rows.map((log, idx) => {
         const period = extractPeriodFromDates(log);
         const isExpanded = expandedId === log.id;
@@ -592,208 +552,102 @@ function PriceChangeHistory() {
         const errorMsg = log.errorMessage || log.error;
         const priceDelta = log.oldPrice > 0 && log.newPrice != null
             ? Math.round((log.newPrice - log.oldPrice) / log.oldPrice * 100) : null;
+        const zebraBase = idx % 2 === 0 ? '#FFFFFF' : '#FAFAFA';
 
-        // ── Compact 행 ────────────────────────────────────────────────────────
-        if (isCompact) {
-            const zebraBase = idx % 2 === 0 ? '#FFFFFF' : '#FAFAFA';
-            return (
-                <React.Fragment key={log.id}>
-                    <div
-                        onClick={() => hasSnapshot && setExpandedId(isExpanded ? null : log.id)}
-                        onMouseEnter={e => { e.currentTarget.style.background = '#EFF6FF'; }}
-                        onMouseLeave={e => { e.currentTarget.style.background = isExpanded ? '#EFF6FF' : zebraBase; }}
-                        style={{
-                            display: 'grid', gridTemplateColumns: COL_COMPACT, alignItems: 'center',
-                            padding: '0 12px', gap: '0 6px', height: '30px',
-                            borderTop: '1px solid #F2F2F7',
-                            borderLeft: `2px solid ${isBeds24 ? '#FF9F0A' : 'transparent'}`,
-                            cursor: hasSnapshot ? 'pointer' : 'default',
-                            background: isExpanded ? '#EFF6FF' : zebraBase,
-                            transition: 'background 0.1s'
-                        }}
-                    >
-                        {/* Time */}
-                        <span style={{ fontSize: '11px', color: '#8E8E93', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
-                            {formatTimestamp(log.timestamp)}
-                        </span>
-                        {/* Status */}
-                        <span style={{ fontSize: '10px', fontWeight: '700', color: log.success !== false ? '#34C759' : '#FF3B30', textAlign: 'center' }}>
-                            {log.success !== false ? '✓' : '✗'}
-                        </span>
-                        {/* Building */}
-                        <span style={{ fontSize: '12px', fontWeight: '500', color: '#1D1D1F', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {getBuildingName(log.building)}
-                        </span>
-                        {/* Room */}
-                        <span style={{ fontSize: '11px', color: '#3C3C43', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {getRoomTitle(log)}
-                        </span>
-                        {/* Period */}
-                        <span style={{ fontSize: '11px', color: '#0071E3', fontVariantNumeric: 'tabular-nums', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {formatDateRange(period.dateFrom, period.dateTo)}
-                            {period.totalDays > 0 && <span style={{ color: '#AEAEB2', marginLeft: '2px' }}>{period.totalDays}d</span>}
-                        </span>
-                        {/* Type */}
-                        <span style={{ fontSize: '10px', fontWeight: '600', color: ct.color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {ct.label}
-                        </span>
-                        {/* Before */}
-                        <span style={{ fontSize: '11px', color: '#AEAEB2', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap' }}>
-                            {log.oldPrice != null ? formatPrice(log.oldPrice) : '—'}
-                        </span>
-                        {/* After */}
-                        <span style={{ fontSize: '12px', fontWeight: '700', fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap', color: log.newPrice > log.oldPrice ? '#FF3B30' : log.newPrice < log.oldPrice ? '#34C759' : '#1D1D1F' }}>
-                            {log.newPrice != null ? formatPrice(log.newPrice) : '—'}
-                        </span>
-                        {/* Delta % */}
-                        <span style={{ fontSize: '11px', fontWeight: '600', textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap',
-                            color: priceDelta == null ? '#C7C7CC' : priceDelta > 0 ? '#FF3B30' : priceDelta < 0 ? '#34C759' : '#8E8E93' }}>
-                            {priceDelta == null ? '—' : `${priceDelta > 0 ? '+' : ''}${priceDelta}%`}
-                            {hasSnapshot && <span style={{ color: '#C7C7CC', marginLeft: '3px', display: 'inline-block', transition: 'transform 0.15s', transform: isExpanded ? 'rotate(90deg)' : 'none' }}>›</span>}
-                        </span>
-                    </div>
-                    {log.success === false && errorMsg && (
-                        <div style={{ padding: '3px 12px 4px', fontSize: '11px', color: '#FF3B30', background: '#FFF2F0', borderTop: '1px solid #FFE5E5' }}>
-                            {errorMsg}
-                        </div>
-                    )}
-                    {isExpanded && hasSnapshot && renderSnapshotCompact(log, uniquePriceSnapshot, isBeds24)}
-                </React.Fragment>
-            );
-        }
-
-        // ── Comfortable 행 (기존 코드 그대로) ─────────────────────────────────
         return (
             <React.Fragment key={log.id}>
                 <div
                     onClick={() => hasSnapshot && setExpandedId(isExpanded ? null : log.id)}
-                    onMouseEnter={e => { if (!isExpanded) e.currentTarget.style.background = '#F9F9F9'; }}
-                    onMouseLeave={e => { if (!isExpanded) e.currentTarget.style.background = 'transparent'; }}
+                    onMouseEnter={e => { e.currentTarget.style.background = '#EFF6FF'; }}
+                    onMouseLeave={e => { e.currentTarget.style.background = isExpanded ? '#EFF6FF' : zebraBase; }}
                     style={{
                         display: 'grid', gridTemplateColumns: COL, alignItems: 'center',
-                        padding: '10px 20px', gap: '0 8px',
-                        borderTop: idx > 0 ? '1px solid #F2F2F7' : 'none',
-                        borderLeft: `3px solid ${isBeds24 ? '#FF9F0A' : 'transparent'}`,
+                        padding: '0 12px', gap: '0 6px', height: '30px',
+                        borderTop: '1px solid #F2F2F7',
+                        borderLeft: `2px solid ${isBeds24 ? '#FF9F0A' : 'transparent'}`,
                         cursor: hasSnapshot ? 'pointer' : 'default',
-                        background: isExpanded ? '#F5F5F7' : 'transparent',
-                        transition: 'background 0.12s'
+                        background: isExpanded ? '#EFF6FF' : zebraBase,
+                        transition: 'background 0.1s'
                     }}
                 >
-                    <span style={{ fontSize: '12px', color: '#8E8E93', fontVariantNumeric: 'tabular-nums' }}>
+                    <span style={{ fontSize: '11px', color: '#8E8E93', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
                         {formatTimestamp(log.timestamp)}
                     </span>
-                    <span>
-                        {log.success !== false
-                            ? <span style={{ fontSize: '10px', fontWeight: '700', color: '#34C759', background: '#F0FFF4', padding: '2px 7px', borderRadius: '20px' }}>OK</span>
-                            : <span style={{ fontSize: '10px', fontWeight: '700', color: '#FF3B30', background: '#FFF2F0', padding: '2px 7px', borderRadius: '20px' }} title={errorMsg}>FAIL</span>
-                        }
+                    <span style={{ fontSize: '10px', fontWeight: '700', color: log.success !== false ? '#34C759' : '#FF3B30', textAlign: 'center' }}>
+                        {log.success !== false ? '✓' : '✗'}
                     </span>
-                    <span style={{ fontSize: '13px', fontWeight: '500', color: '#1D1D1F', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    <span style={{ fontSize: '12px', fontWeight: '500', color: '#1D1D1F', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {getBuildingName(log.building)}
                     </span>
-                    <span style={{ fontSize: '12px', color: '#3C3C43', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    <span style={{ fontSize: '11px', color: '#3C3C43', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {getRoomTitle(log)}
                     </span>
-                    <div style={{ fontSize: '12px', color: '#0071E3', fontWeight: '500', fontVariantNumeric: 'tabular-nums' }}>
+                    <span style={{ fontSize: '11px', color: '#0071E3', fontVariantNumeric: 'tabular-nums', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {formatDateRange(period.dateFrom, period.dateTo)}
-                        {period.totalDays > 0 && <span style={{ color: '#AEAEB2', fontWeight: '400', marginLeft: '3px' }}>{period.totalDays}d</span>}
-                    </div>
-                    <span style={{ fontSize: '11px', fontWeight: '500', color: ct.color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {period.totalDays > 0 && <span style={{ color: '#AEAEB2', marginLeft: '2px' }}>{period.totalDays}d</span>}
+                    </span>
+                    <span style={{ fontSize: '10px', fontWeight: '600', color: ct.color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {ct.label}
                     </span>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '7px' }}>
-                        {log.oldPrice != null && log.newPrice != null ? (
-                            <>
-                                <span style={{ fontSize: '12px', color: '#AEAEB2', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums' }}>
-                                    {formatPrice(log.oldPrice)}
-                                </span>
-                                <span style={{ color: '#D1D1D6', fontSize: '11px' }}>→</span>
-                                <span style={{
-                                    fontSize: '14px', fontWeight: '700', fontVariantNumeric: 'tabular-nums',
-                                    color: log.newPrice > log.oldPrice ? '#FF3B30' : log.newPrice < log.oldPrice ? '#34C759' : '#1D1D1F'
-                                }}>
-                                    {formatPrice(log.newPrice)}
-                                </span>
-                                {priceDelta !== null && priceDelta !== 0 && (
-                                    <span style={{
-                                        fontSize: '11px', fontWeight: '600',
-                                        color: priceDelta > 0 ? '#FF3B30' : '#34C759',
-                                        background: priceDelta > 0 ? '#FFF2F0' : '#F0FFF4',
-                                        padding: '2px 6px', borderRadius: '20px'
-                                    }}>
-                                        {priceDelta > 0 ? '▲' : '▼'}{Math.abs(priceDelta)}%
-                                    </span>
-                                )}
-                                {hasSnapshot && (
-                                    <span style={{
-                                        color: '#C7C7CC', fontSize: '14px', marginLeft: '2px',
-                                        display: 'inline-block', transition: 'transform 0.18s',
-                                        transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)'
-                                    }}>›</span>
-                                )}
-                            </>
-                        ) : (
-                            <span style={{ fontSize: '13px', color: '#D1D1D6' }}>—</span>
-                        )}
-                    </div>
+                    <span style={{ fontSize: '11px', color: '#AEAEB2', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                        {log.oldPrice != null ? formatPrice(log.oldPrice) : '—'}
+                    </span>
+                    <span style={{ fontSize: '12px', fontWeight: '700', fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap', color: log.newPrice > log.oldPrice ? '#FF3B30' : log.newPrice < log.oldPrice ? '#34C759' : '#1D1D1F' }}>
+                        {log.newPrice != null ? formatPrice(log.newPrice) : '—'}
+                    </span>
+                    <span style={{ fontSize: '11px', fontWeight: '600', textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap',
+                        color: priceDelta == null ? '#C7C7CC' : priceDelta > 0 ? '#FF3B30' : priceDelta < 0 ? '#34C759' : '#8E8E93' }}>
+                        {priceDelta == null ? '—' : `${priceDelta > 0 ? '+' : ''}${priceDelta}%`}
+                        {hasSnapshot && <span style={{ color: '#C7C7CC', marginLeft: '3px', display: 'inline-block', transition: 'transform 0.15s', transform: isExpanded ? 'rotate(90deg)' : 'none' }}>›</span>}
+                    </span>
                 </div>
                 {log.success === false && errorMsg && (
-                    <div style={{ padding: '6px 20px 8px', fontSize: '12px', color: '#FF3B30', background: '#FFF2F0', borderTop: '1px solid #FFE5E5' }}>
+                    <div style={{ padding: '3px 12px 4px', fontSize: '11px', color: '#FF3B30', background: '#FFF2F0', borderTop: '1px solid #FFE5E5' }}>
                         {errorMsg}
                     </div>
                 )}
-                {isExpanded && hasSnapshot && renderSnapshotComfortable(log, uniquePriceSnapshot, isBeds24)}
+                {isExpanded && hasSnapshot && renderSnapshotCompact(log, uniquePriceSnapshot, isBeds24)}
             </React.Fragment>
         );
     });
 
-    const groupHeaderStyle = (sub = false) => (
-        isCompact
-            ? {
-                padding: sub ? '2px 12px' : '3px 12px',
-                background: sub ? '#F5F5F7' : '#EBEBEB',
-                borderTop: '1px solid #E0E0E0',
-                borderBottom: '1px solid #E0E0E0',
-                display: 'flex', alignItems: 'center', gap: '6px', height: '22px'
-            }
-            : {
-                padding: sub ? '6px 20px' : '8px 20px',
-                background: sub ? '#F9F9F9' : '#F2F2F7',
-                borderTop: '1px solid #E5E5EA',
-                borderBottom: '1px solid #E5E5EA',
-                display: 'flex', alignItems: 'center', gap: '8px'
-            }
-    );
+    const groupHeaderStyle = (sub = false) => ({
+        padding: sub ? '2px 12px' : '3px 12px',
+        background: sub ? '#F5F5F7' : '#EBEBEB',
+        borderTop: '1px solid #E0E0E0',
+        borderBottom: '1px solid #E0E0E0',
+        display: 'flex', alignItems: 'center', gap: '6px', height: '22px'
+    });
 
     return (
         <div style={{
-            padding: '28px 32px',
+            padding: '14px 20px',
             background: '#F5F5F7',
             minHeight: '100vh',
             fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif'
         }}>
             {/* Header */}
-            <div style={{ marginBottom: '24px' }}>
-                <h1 style={{ fontSize: '26px', fontWeight: '700', color: '#1D1D1F', margin: '0 0 4px', letterSpacing: '-0.5px' }}>
+            <div style={{ marginBottom: '10px', display: 'flex', alignItems: 'baseline', gap: '12px' }}>
+                <h1 style={{ fontSize: '20px', fontWeight: '700', color: '#1D1D1F', margin: 0, letterSpacing: '-0.3px' }}>
                     Price History
                 </h1>
-                <p style={{ fontSize: '13px', color: '#8E8E93', margin: 0, fontWeight: '400' }}>
-                    {stats.total} records&nbsp;&nbsp;·&nbsp;&nbsp;{stats.admin} admin&nbsp;&nbsp;·&nbsp;&nbsp;{stats.beds24} Beds24&nbsp;&nbsp;·&nbsp;&nbsp;{stats.converted} converted
+                <p style={{ fontSize: '12px', color: '#8E8E93', margin: 0, fontWeight: '400' }}>
+                    {stats.total} records · {stats.admin} admin · {stats.beds24} Beds24 · {stats.converted} converted
                 </p>
             </div>
 
             {/* Controls */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px', flexWrap: 'wrap' }}>
                 <select
                     value={buildingFilter}
                     onChange={e => setBuildingFilter(e.target.value)}
                     style={{
-                        padding: '7px 12px', borderRadius: '9px',
-                        border: '1px solid #D1D1D6', fontSize: '13px',
+                        padding: '4px 24px 4px 8px', borderRadius: '7px',
+                        border: '1px solid #D1D1D6', fontSize: '12px',
                         color: '#1D1D1F', background: '#FFFFFF', cursor: 'pointer', outline: 'none',
-                        WebkitAppearance: 'none', appearance: 'none', paddingRight: '28px',
+                        WebkitAppearance: 'none', appearance: 'none',
                         backgroundImage: 'url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'10\' height=\'6\'%3E%3Cpath d=\'M0 0l5 6 5-6z\' fill=\'%238E8E93\'/%3E%3C/svg%3E")',
-                        backgroundRepeat: 'no-repeat', backgroundPosition: 'right 10px center'
+                        backgroundRepeat: 'no-repeat', backgroundPosition: 'right 8px center'
                     }}
                 >
                     <option value="all">All Properties</option>
@@ -806,12 +660,12 @@ function PriceChangeHistory() {
                     value={originFilter}
                     onChange={e => setOriginFilter(e.target.value)}
                     style={{
-                        padding: '7px 12px', borderRadius: '9px',
-                        border: '1px solid #D1D1D6', fontSize: '13px',
+                        padding: '4px 24px 4px 8px', borderRadius: '7px',
+                        border: '1px solid #D1D1D6', fontSize: '12px',
                         color: '#1D1D1F', background: '#FFFFFF', cursor: 'pointer', outline: 'none',
-                        WebkitAppearance: 'none', appearance: 'none', paddingRight: '28px',
+                        WebkitAppearance: 'none', appearance: 'none',
                         backgroundImage: 'url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'10\' height=\'6\'%3E%3Cpath d=\'M0 0l5 6 5-6z\' fill=\'%238E8E93\'/%3E%3C/svg%3E")',
-                        backgroundRepeat: 'no-repeat', backgroundPosition: 'right 10px center'
+                        backgroundRepeat: 'no-repeat', backgroundPosition: 'right 8px center'
                     }}
                 >
                     <option value="all">All Sources</option>
@@ -820,16 +674,7 @@ function PriceChangeHistory() {
                     <option value="conversion">Price Conversions</option>
                 </select>
 
-                <div style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '8px',
-                    padding: '6px 10px',
-                    borderRadius: '10px',
-                    background: '#FFFFFF',
-                    border: '1px solid #E5E5EA',
-                    flexWrap: 'wrap'
-                }}>
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
                     <input
                         type="text"
                         inputMode="numeric"
@@ -838,18 +683,13 @@ function PriceChangeHistory() {
                         onChange={e => setDateFromFilter(normalizeDateInput(e.target.value))}
                         placeholder="From YYYY-MM-DD"
                         style={{
-                            width: '132px',
-                            padding: '7px 10px',
-                            borderRadius: '8px',
-                            border: '1px solid #D1D1D6',
-                            fontSize: '12px',
-                            color: '#1D1D1F',
-                            background: '#FFFFFF',
-                            outline: 'none',
+                            width: '120px', padding: '4px 7px', borderRadius: '7px',
+                            border: '1px solid #D1D1D6', fontSize: '12px',
+                            color: '#1D1D1F', background: '#FFFFFF', outline: 'none',
                             fontVariantNumeric: 'tabular-nums'
                         }}
                     />
-                    <span style={{ fontSize: '12px', color: '#AEAEB2' }}>~</span>
+                    <span style={{ fontSize: '11px', color: '#AEAEB2' }}>~</span>
                     <input
                         type="text"
                         inputMode="numeric"
@@ -858,78 +698,25 @@ function PriceChangeHistory() {
                         onChange={e => setDateToFilter(normalizeDateInput(e.target.value))}
                         placeholder="To YYYY-MM-DD"
                         style={{
-                            width: '124px',
-                            padding: '7px 10px',
-                            borderRadius: '8px',
-                            border: '1px solid #D1D1D6',
-                            fontSize: '12px',
-                            color: '#1D1D1F',
-                            background: '#FFFFFF',
-                            outline: 'none',
+                            width: '112px', padding: '4px 7px', borderRadius: '7px',
+                            border: '1px solid #D1D1D6', fontSize: '12px',
+                            color: '#1D1D1F', background: '#FFFFFF', outline: 'none',
                             fontVariantNumeric: 'tabular-nums'
                         }}
                     />
                     <button
-                        onClick={() => {
-                            const todayKey = getTokyoTodayKey();
-                            setDateFromFilter(todayKey);
-                            setDateToFilter(todayKey);
-                        }}
-                        style={{
-                            padding: '6px 10px',
-                            borderRadius: '8px',
-                            border: '1px solid #D1D1D6',
-                            background: '#F8FAFC',
-                            color: '#334155',
-                            fontSize: '12px',
-                            fontWeight: '600',
-                            cursor: 'pointer'
-                        }}
-                    >
-                        Today
-                    </button>
+                        onClick={() => { const t = getTokyoTodayKey(); setDateFromFilter(t); setDateToFilter(t); }}
+                        style={{ padding: '4px 8px', borderRadius: '7px', border: '1px solid #D1D1D6', background: '#F8FAFC', color: '#334155', fontSize: '11px', fontWeight: '600', cursor: 'pointer' }}
+                    >Today</button>
                     <button
-                        onClick={() => {
-                            setDateFromFilter("");
-                            setDateToFilter("");
-                        }}
-                        style={{
-                            padding: '6px 10px',
-                            borderRadius: '8px',
-                            border: '1px solid #D1D1D6',
-                            background: '#FFFFFF',
-                            color: '#6B7280',
-                            fontSize: '12px',
-                            fontWeight: '600',
-                            cursor: 'pointer'
-                        }}
-                    >
-                        Clear
-                    </button>
+                        onClick={() => { setDateFromFilter(""); setDateToFilter(""); }}
+                        style={{ padding: '4px 8px', borderRadius: '7px', border: '1px solid #D1D1D6', background: '#FFFFFF', color: '#6B7280', fontSize: '11px', fontWeight: '600', cursor: 'pointer' }}
+                    >Clear</button>
                 </div>
 
                 <span style={{ fontSize: '12px', color: '#AEAEB2' }}>
                     {filteredLogs.length} of {logs.length}
                 </span>
-
-                {/* View Mode toggle */}
-                <div style={{
-                    display: 'inline-flex', alignItems: 'center',
-                    background: '#E5E5EA', borderRadius: '10px', padding: '3px', gap: '2px'
-                }}>
-                    {['comfortable', 'compact'].map(mode => (
-                        <button key={mode} onClick={() => setViewMode(mode)} style={{
-                            padding: '5px 11px', borderRadius: '8px', border: 'none', cursor: 'pointer',
-                            background: viewMode === mode ? '#FFFFFF' : 'transparent',
-                            color: viewMode === mode ? '#1D1D1F' : '#6E6E73',
-                            fontSize: '12px', fontWeight: viewMode === mode ? '600' : '400',
-                            boxShadow: viewMode === mode ? '0 1px 4px rgba(0,0,0,0.14)' : 'none',
-                            transition: 'all 0.15s', whiteSpace: 'nowrap'
-                        }}>
-                            {mode === 'comfortable' ? 'Comfortable' : 'Compact'}
-                        </button>
-                    ))}
-                </div>
 
                 {/* Group By segment control — pushed right */}
                 <div style={{
@@ -1045,53 +832,31 @@ function PriceChangeHistory() {
                     boxShadow: '0 1px 4px rgba(0,0,0,0.06), 0 0 0 0.5px rgba(0,0,0,0.06)',
                     overflow: 'hidden'
                 }}>
-                    {/* Column headers — Compact */}
-                    {isCompact && (
-                        <div style={{
-                            display: 'grid', gridTemplateColumns: COL_COMPACT,
-                            padding: '0 12px', gap: '0 6px', height: '26px', alignItems: 'center',
-                            borderBottom: '1px solid #E5E5EA', background: '#F5F5F7',
-                            position: 'sticky', top: 0, zIndex: 1
-                        }}>
-                            <span style={colHeaderStyle}>Time</span>
-                            <span style={colHeaderStyle}>OK</span>
-                            <span style={colHeaderStyle}>Building</span>
-                            <span style={colHeaderStyle}>Room</span>
-                            <span style={colHeaderStyle}>Period</span>
-                            <span style={colHeaderStyle}>Type</span>
-                            <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Before</span>
-                            <span style={{ ...colHeaderStyle, textAlign: 'right' }}>After</span>
-                            <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Δ%</span>
-                        </div>
-                    )}
-                    {/* Column headers — Comfortable */}
-                    {!isCompact && (
-                        <div style={{
-                            display: 'grid', gridTemplateColumns: COL,
-                            padding: '9px 20px', gap: '0 8px',
-                            borderBottom: '1px solid #E5E5EA',
-                            background: '#FAFAFA'
-                        }}>
-                            <span style={colHeaderStyle}>Time</span>
-                            <span style={colHeaderStyle}>Status</span>
-                            <span style={colHeaderStyle}>Building</span>
-                            <span style={colHeaderStyle}>Room</span>
-                            <span style={colHeaderStyle}>Period</span>
-                            <span style={colHeaderStyle}>Type</span>
-                            <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Price Change</span>
-                        </div>
-                    )}
+                    {/* Column headers */}
+                    <div style={{
+                        display: 'grid', gridTemplateColumns: COL,
+                        padding: '0 12px', gap: '0 6px', height: '26px', alignItems: 'center',
+                        borderBottom: '1px solid #E5E5EA', background: '#F5F5F7',
+                        position: 'sticky', top: 0, zIndex: 1
+                    }}>
+                        <span style={colHeaderStyle}>Time</span>
+                        <span style={colHeaderStyle}>OK</span>
+                        <span style={colHeaderStyle}>Building</span>
+                        <span style={colHeaderStyle}>Room</span>
+                        <span style={colHeaderStyle}>Period</span>
+                        <span style={colHeaderStyle}>Type</span>
+                        <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Before</span>
+                        <span style={{ ...colHeaderStyle, textAlign: 'right' }}>After</span>
+                        <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Δ%</span>
+                    </div>
 
                     {/* Rows — By Date */}
                     {groupBy === 'date' && groupedLogs.map(([dateKey, dateLogs]) => (
                         <React.Fragment key={dateKey}>
                             <div style={groupHeaderStyle()}>
-                                <span style={{ fontSize: isCompact ? '11px' : '12px', fontWeight: '600', color: '#3C3C43' }}>
-                                    {isCompact ? `${dateKey} · ${dateLogs.length} change${dateLogs.length !== 1 ? 's' : ''}` : formatDateFull(dateKey)}
+                                <span style={{ fontSize: '11px', fontWeight: '600', color: '#3C3C43' }}>
+                                    {`${dateKey} · ${dateLogs.length} change${dateLogs.length !== 1 ? 's' : ''}`}
                                 </span>
-                                {!isCompact && <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
-                                    {dateLogs.length} change{dateLogs.length !== 1 ? 's' : ''}
-                                </span>}
                             </div>
                             {renderRows(dateLogs)}
                         </React.Fragment>
@@ -1101,12 +866,9 @@ function PriceChangeHistory() {
                     {groupBy === 'building' && groupedByBuilding.map(([building, buildingLogs]) => (
                         <React.Fragment key={building}>
                             <div style={groupHeaderStyle()}>
-                                <span style={{ fontSize: isCompact ? '11px' : '12px', fontWeight: '600', color: '#3C3C43' }}>
-                                    {isCompact ? `${getBuildingName(building)} · ${buildingLogs.length} record${buildingLogs.length !== 1 ? 's' : ''}` : getBuildingName(building)}
+                                <span style={{ fontSize: '11px', fontWeight: '600', color: '#3C3C43' }}>
+                                    {`${getBuildingName(building)} · ${buildingLogs.length} record${buildingLogs.length !== 1 ? 's' : ''}`}
                                 </span>
-                                {!isCompact && <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
-                                    {buildingLogs.length} record{buildingLogs.length !== 1 ? 's' : ''}
-                                </span>}
                             </div>
                             {renderRows(buildingLogs)}
                         </React.Fragment>
@@ -1116,24 +878,16 @@ function PriceChangeHistory() {
                     {groupBy === 'building+date' && groupedByBuildingDate.map(([building, dateGroups]) => (
                         <React.Fragment key={building}>
                             <div style={groupHeaderStyle()}>
-                                <span style={{ fontSize: isCompact ? '11px' : '12px', fontWeight: '700', color: '#1D1D1F' }}>
-                                    {isCompact
-                                        ? `${getBuildingName(building)} · ${dateGroups.reduce((s, [, rows]) => s + rows.length, 0)} records`
-                                        : getBuildingName(building)}
+                                <span style={{ fontSize: '11px', fontWeight: '700', color: '#1D1D1F' }}>
+                                    {`${getBuildingName(building)} · ${dateGroups.reduce((s, [, rows]) => s + rows.length, 0)} records`}
                                 </span>
-                                {!isCompact && <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
-                                    {dateGroups.reduce((s, [, rows]) => s + rows.length, 0)} records
-                                </span>}
                             </div>
                             {dateGroups.map(([dateKey, dateLogs]) => (
                                 <React.Fragment key={dateKey}>
                                     <div style={groupHeaderStyle(true)}>
                                         <span style={{ fontSize: '11px', fontWeight: '500', color: '#6E6E73' }}>
-                                            {isCompact ? `${dateKey} · ${dateLogs.length}` : formatDateFull(dateKey)}
+                                            {`${dateKey} · ${dateLogs.length}`}
                                         </span>
-                                        {!isCompact && <span style={{ fontSize: '11px', color: '#AEAEB2', fontWeight: '400' }}>
-                                            {dateLogs.length} change{dateLogs.length !== 1 ? 's' : ''}
-                                        </span>}
                                     </div>
                                     {renderRows(dateLogs)}
                                 </React.Fragment>
