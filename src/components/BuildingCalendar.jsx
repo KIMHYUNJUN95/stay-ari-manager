@@ -2742,12 +2742,19 @@ function BuildingCalendar() {
     e.preventDefault();
     const x = e.clientX;
     const walk = (startX - x) * 1.5; // 스크롤 속도감을 위한 가속도
-    calendarRef.current.scrollLeft = scrollLeft + walk;
+    const nextScrollLeft = scrollLeft + walk;
+    calendarRef.current.scrollLeft = nextScrollLeft;
+    syncCalendarHeaderScroll(nextScrollLeft);
   };
 
   const handleCalendarMouseUp = () => {
     setIsDraggingCalendar(false);
   };
+
+  const syncCalendarHeaderScroll = useCallback((nextScrollLeft) => {
+    if (!calendarHeaderRowRef.current || isCalendarFullscreen) return;
+    calendarHeaderRowRef.current.scrollLeft = nextScrollLeft;
+  }, [isCalendarFullscreen]);
 
   const restoreCalendarViewport = useCallback((viewport) => {
     if (!viewport) return;
@@ -2757,9 +2764,10 @@ function BuildingCalendar() {
         if (!calendarRef.current) return;
         calendarRef.current.scrollLeft = viewport.left;
         calendarRef.current.scrollTop = viewport.top;
+        syncCalendarHeaderScroll(viewport.left);
       });
     });
-  }, []);
+  }, [syncCalendarHeaderScroll]);
 
   // 가격 설정 관련 state
   const [priceMode, setPriceMode] = useState(false);
@@ -3251,16 +3259,16 @@ function BuildingCalendar() {
   // 롤링 뷰용 (다른 곳에서 사용)
   const rollingDays = viewMode === "rolling" ? displayDays : [];
 
-  const renderCalendarDateHeader = (headerRef = null) => (
+  const renderCalendarDateHeader = () => (
     <div
-      ref={headerRef}
       style={{
         display: "flex",
         borderBottom: "1px solid #E5E7EB",
         background: "#F9FAFB",
         position: "relative",
         minHeight: "48px",
-        flexShrink: 0
+        flexShrink: 0,
+        minWidth: "max-content"
       }}
     >
       <div style={{
@@ -8137,160 +8145,53 @@ function BuildingCalendar() {
               </div>
             </div>
           ) : (
-            <div style={{
-              overflowX: "auto",
-              overflowY: isCalendarFullscreen ? "auto" : "visible",
-              flex: isCalendarFullscreen ? 1 : undefined,
-              minHeight: isCalendarFullscreen ? 0 : undefined,
-              cursor: isDraggingCalendar ? 'grabbing' : 'grab',
-              userSelect: 'none'
-            }}
-              onMouseDown={handleCalendarMouseDown}
-              onMouseMove={handleCalendarMouseMove}
-              onMouseUp={handleCalendarMouseUp}
-              onMouseLeave={handleCalendarMouseUp}
-              ref={calendarRef}
-            >
-              <div style={{ minWidth: "max-content" }}>
-                {/* 날짜 헤더 */}
+            <>
+              {!isCalendarFullscreen && (
                 <div style={{
-                  display: "flex",
-                  borderBottom: "1px solid #E5E7EB",
+                  position: "sticky",
+                  top: 74,
+                  zIndex: 120,
+                  overflow: "hidden",
                   background: "#F9FAFB",
-                  position: 'sticky',
-                  top: 0,
-                  zIndex: isCalendarFullscreen ? 100 : 120,
-                  boxShadow: "0 1px 0 rgba(226, 232, 240, 0.9)",
-                  minHeight: "48px",
-                  flexShrink: 0
+                  boxShadow: "0 1px 0 rgba(226, 232, 240, 0.9)"
                 }}>
-                  <div style={{
-                    width: showBeds24DetailView ? `${BEDS24_DETAIL_STICKY_WIDTH}px` : "120px",
-                    minWidth: showBeds24DetailView ? `${BEDS24_DETAIL_STICKY_WIDTH}px` : "120px",
-                    padding: "16px 12px",
-                    fontWeight: "700",
-                    fontSize: "12px",
-                    color: "#4B5563",
-                    textTransform: "uppercase",
-                    letterSpacing: "0.5px",
-                    borderRight: "1px solid #E5E7EB",
-                    background: "#F9FAFB",
-                    position: 'sticky',
-                    left: 0,
-                    zIndex: isCalendarFullscreen ? 110 : 121
-                  }}>
-                    Room
+                  <div
+                    ref={calendarHeaderRowRef}
+                    style={{
+                      overflowX: "hidden",
+                      overflowY: "visible"
+                    }}
+                  >
+                    {renderCalendarDateHeader()}
                   </div>
-                  {viewMode === "monthly" ? (
-                    // 월별 뷰 헤더 (1일부터)
-                    Array.from({ length: daysInMonth }, (_, i) => {
-                      const day = i + 1;
-                      const date = new Date(year, month, day);
-                      const dayOfWeek = date.getDay();
-                      const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
-                      const isToday = new Date().toDateString() === date.toDateString();
-                      const isHeaderSelected = selectedDateSet.has(dayjs(date).format("YYYY-MM-DD"));
-                      const isPastHeaderDate = date < new Date(new Date().setHours(0, 0, 0, 0));
-
-                      return (
-                        <div
-                          key={day}
-                          style={{
-                            flex: "1 1 0",
-                            minWidth: "32px",
-                            padding: "10px 2px",
-                            minHeight: "48px",
-                            boxSizing: "border-box",
-                            textAlign: "center",
-                            fontSize: "12px",
-                            fontWeight: isToday ? "800" : "600",
-                            color: isPastHeaderDate
-                              ? "#94A3B8"
-                              : isToday
-                                ? "#3B82F6"
-                                : isWeekend
-                                  ? "#E98B8B"
-                                  : "#4B5563",
-                            background: isHeaderSelected
-                              ? "linear-gradient(180deg, rgba(245,158,11,0.18) 0%, rgba(251,191,36,0.08) 100%)"
-                              : isToday
-                                ? "#EFF6FF"
-                                : isPastHeaderDate
-                                  ? "rgba(248,250,252,0.96)"
-                                  : "#F9FAFB",
-                            borderRight: "1px solid #F3F4F6",
-                            boxShadow: isHeaderSelected ? "inset 0 -3px 0 #F59E0B" : "none",
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '2px',
-                            opacity: isPastHeaderDate ? 0.72 : 1
-                          }}
-                        >
-                          <div style={{ fontSize: '13px' }}>{day}</div>
-                          <div style={{ fontSize: "9px", opacity: 0.7 }}>
-                            {["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"][dayOfWeek]}
-                          </div>
-                        </div>
-                      );
-                    })
-                  ) : (
-                    // 30일 롤링 뷰 헤더
-                    rollingDays.map((d, i) => {
-                      const dayOfWeek = d.date.getDay();
-                      const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
-                      const isToday = new Date().toDateString() === d.date.toDateString();
-                      const isNewMonth = i === 0 || d.day === 1;
-                      const isHeaderSelected = selectedDateSet.has(d.dateStr);
-                      const isPastHeaderDate = d.date < new Date(new Date().setHours(0, 0, 0, 0));
-
-                      return (
-                        <div
-                          key={d.dateStr}
-                          style={{
-                            flex: "1 1 0",
-                            minWidth: "32px",
-                            padding: "10px 2px",
-                            minHeight: "48px",
-                            boxSizing: "border-box",
-                            textAlign: "center",
-                            fontSize: "12px",
-                            fontWeight: isToday ? "800" : "600",
-                            color: isPastHeaderDate
-                              ? "#94A3B8"
-                              : isToday
-                                ? "#3B82F6"
-                                : isWeekend
-                                  ? "#EF4444"
-                                  : "#4B5563",
-                            background: isHeaderSelected
-                              ? "linear-gradient(180deg, rgba(245,158,11,0.18) 0%, rgba(251,191,36,0.08) 100%)"
-                              : isToday
-                                ? "#EFF6FF"
-                                : isPastHeaderDate
-                                  ? "rgba(248,250,252,0.96)"
-                                : isNewMonth
-                                  ? "#FFFBEB"
-                                  : "#F9FAFB",
-                            borderRight: "1px solid #F3F4F6",
-                            borderLeft: isNewMonth && i > 0 ? "2px solid #F59E0B" : "none",
-                            boxShadow: isHeaderSelected ? "inset 0 -3px 0 #F59E0B" : "none",
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '2px',
-                            opacity: isPastHeaderDate ? 0.72 : 1
-                          }}
-                        >
-                          <div style={{ fontSize: isNewMonth ? "10px" : "13px", color: isNewMonth ? "#D97706" : "inherit" }}>
-                            {isNewMonth ? `${d.month + 1}/${d.day}` : d.day}
-                          </div>
-                          <div style={{ fontSize: "9px", opacity: 0.7 }}>
-                            {["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"][dayOfWeek]}
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
                 </div>
+              )}
+              <div style={{
+                overflowX: "auto",
+                overflowY: isCalendarFullscreen ? "auto" : "visible",
+                flex: isCalendarFullscreen ? 1 : undefined,
+                minHeight: isCalendarFullscreen ? 0 : undefined,
+                cursor: isDraggingCalendar ? 'grabbing' : 'grab',
+                userSelect: 'none'
+              }}
+                onMouseDown={handleCalendarMouseDown}
+                onMouseMove={handleCalendarMouseMove}
+                onMouseUp={handleCalendarMouseUp}
+                onMouseLeave={handleCalendarMouseUp}
+                onScroll={(e) => syncCalendarHeaderScroll(e.currentTarget.scrollLeft)}
+                ref={calendarRef}
+              >
+              <div style={{ minWidth: "max-content" }}>
+                {isCalendarFullscreen && (
+                  <div style={{
+                    position: "sticky",
+                    top: 0,
+                    zIndex: 100,
+                    boxShadow: "0 1px 0 rgba(226, 232, 240, 0.9)"
+                  }}>
+                    {renderCalendarDateHeader()}
+                  </div>
+                )}
 
                 {/* 객실 행 */}
                 {visibleRooms.length > 0 ? visibleRooms.map((room, roomIndex) => (
@@ -8997,7 +8898,8 @@ function BuildingCalendar() {
                   </div>
                 )}
               </div>
-            </div>
+              </div>
+            </>
           )}
         </div>
         </div>
