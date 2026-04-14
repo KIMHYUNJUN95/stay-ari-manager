@@ -1012,6 +1012,53 @@ const BEDS24_DETAIL_STICKY_WIDTH = 164;
 const BEDS24_DETAIL_ROOM_NAME_WIDTH = 86;
 
 // 예약 상세 모달 내부 컴포넌트 (재사용을 위해 함수 바깥에서 정의)
+// 예약 생성 시각 파서 — Firestore Timestamp / Date / string 모두 처리, JST 포맷 반환
+function parseBookedAt(reservation) {
+  const raw =
+    reservation.bookingTime ??
+    reservation.bookTime ??
+    reservation.entryTime ??
+    reservation.sourceEventTime ??
+    reservation.bookDate ??
+    null;
+
+  if (raw === null || raw === undefined || raw === "") return "No info";
+
+  try {
+    let ms;
+
+    // Firestore Timestamp ({ seconds, nanoseconds } or .toDate())
+    if (raw && typeof raw === "object" && typeof raw.toDate === "function") {
+      ms = raw.toDate().getTime();
+    } else if (raw && typeof raw === "object" && typeof raw.seconds === "number") {
+      ms = raw.seconds * 1000;
+    } else {
+      ms = new Date(raw).getTime();
+    }
+
+    if (isNaN(ms)) return "No info";
+
+    const d = new Date(ms);
+    const jst = new Intl.DateTimeFormat("sv-SE", {
+      timeZone: "Asia/Tokyo",
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit",
+    }).format(d).replace("T", " ");
+
+    // 시분이 00:00이고 원본이 date-only 문자열이면 날짜만 표시
+    const isDateOnly =
+      typeof raw === "string" &&
+      /^\d{4}-\d{2}-\d{2}$/.test(raw.trim());
+
+    if (isDateOnly) {
+      return `${jst.slice(0, 10)} (JST)`;
+    }
+    return `${jst} (JST)`;
+  } catch (_) {
+    return "No info";
+  }
+}
+
 const InfoRow = ({ label, value, icon, field, isEditing, editData, setEditData }) => (
   <div style={{
     display: "flex",
@@ -1110,6 +1157,7 @@ function ReservationDetailModal({ reservation, onClose, onRefresh, isMobile, com
 
       <div style={{ height: "12px" }} />
 
+      <InfoRow icon={"🕐"} label="Booked At" value={parseBookedAt(reservation)} isEditing={isEditing} editData={editData} setEditData={setEditData} />
       <InfoRow icon={"📅"} label="Check-in" value={isEditing ? editData.arrival : reservation.arrival} field="arrival" isEditing={isEditing} editData={editData} setEditData={setEditData} />
       <InfoRow icon={"📅"} label="Check-out" value={isEditing ? editData.departure : reservation.departure} field="departure" isEditing={isEditing} editData={editData} setEditData={setEditData} />
       <InfoRow icon={"🌙"} label="Nights" value={reservation.nights ? `${reservation.nights} nights` : ""} isEditing={isEditing} editData={editData} setEditData={setEditData} />
