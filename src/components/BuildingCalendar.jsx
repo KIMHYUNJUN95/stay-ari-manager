@@ -2712,6 +2712,9 @@ function BuildingCalendar() {
   const [currentDate, setCurrentDate] = useState(new Date());
   const [portfolioDateFrom, setPortfolioDateFrom] = useState("");
   const [portfolioDateTo, setPortfolioDateTo] = useState("");
+  // 타이핑 버퍼와 분리된 확정 날짜 상태 (실제 조회에만 사용)
+  const [committedDateFrom, setCommittedDateFrom] = useState("");
+  const [committedDateTo, setCommittedDateTo] = useState("");
   const [reservations, setReservations] = useState([]);
   const [loading, setLoading] = useState(false);
   const [selectedReservation, setSelectedReservation] = useState(null);
@@ -3169,8 +3172,8 @@ function BuildingCalendar() {
   const portfolioAnalysisRange = useMemo(() => {
     const monthStart = dayjs(new Date(year, month, 1)).format("YYYY-MM-DD");
     const monthEnd = dayjs(new Date(year, month, daysInMonth)).format("YYYY-MM-DD");
-    const validFrom = getResolvedDateInput(portfolioDateFrom);
-    const validTo = getResolvedDateInput(portfolioDateTo);
+    const validFrom = getResolvedDateInput(committedDateFrom);
+    const validTo = getResolvedDateInput(committedDateTo);
 
     if (validFrom || validTo) {
       const first = validFrom || validTo;
@@ -3191,7 +3194,7 @@ function BuildingCalendar() {
       isCustom: false,
       label: `${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][month]} ${year}`
     };
-  }, [year, month, daysInMonth, portfolioDateFrom, portfolioDateTo]);
+  }, [year, month, daysInMonth, committedDateFrom, committedDateTo]);
   const rooms = useMemo(() => BUILDING_DATA[calendarBuilding] || [], [calendarBuilding]);
   const roomCatalogByName = useMemo(() => {
     const map = {};
@@ -3509,11 +3512,10 @@ function BuildingCalendar() {
     if (allInfos.length === 0) return false;
 
     const activeInfos = getActiveUnitInfosForDate(roomName, dateStr);
-    if (allInfos.length > 1 && activeInfos.length === 0) {
-      return false;
-    }
+    // 활성 unit이 있으면 그것만, 없으면 전체 infos로 fallback (전 unit 비활성 날짜도 blackout 체크)
+    const infosToCheck = activeInfos.length > 0 ? activeInfos : allInfos;
 
-    return activeInfos.some((info) => {
+    return infosToCheck.some((info) => {
       const priceInfo = roomPrices?.[String(info.roomId)]?.dates?.[dateKey];
       return String(priceInfo?.ov || "").toLowerCase() === "blackout";
     });
@@ -3612,7 +3614,11 @@ function BuildingCalendar() {
       : null;
     const nextPriceMode = !priceMode;
     setPriceMode(nextPriceMode);
-    if (nextPriceMode) setGapEditMode(false);
+    if (nextPriceMode) {
+      setGapEditMode(false);
+      // 가격 모드 진입 시 열려 있는 예약 상세 모달 닫기 (UI 겹침 방지)
+      setSelectedReservation(null);
+    }
     setSelectedRoom(null);
     setSelectedCells([]); // 초기화
     setSelectionStart(null); // 드래그 선택 중이었다면 초기화
@@ -3638,7 +3644,11 @@ function BuildingCalendar() {
   const toggleMinStayEditMode = () => {
     const nextGapMode = !gapEditMode;
     setGapEditMode(nextGapMode);
-    if (nextGapMode) setPriceMode(false);
+    if (nextGapMode) {
+      setPriceMode(false);
+      // gap edit 모드 진입 시 예약 상세 모달 닫기
+      setSelectedReservation(null);
+    }
     setSelectedCells([]);
     setSelectedRoom(null);
     setSelectionStart(null);
@@ -3932,6 +3942,8 @@ function BuildingCalendar() {
       });
 
       const data = await response.json();
+      // stale 응답 가드: 응답이 도착했을 때 이미 더 새 요청이 있으면 무시
+      if (requestId !== priceFetchRequestIdRef.current) return;
       if (data.success && data.priceData) {
         // 프론트 캐시에 저장
         setPriceCache(prev => ({ ...prev, [fetchBuilding]: data.priceData }));
@@ -3949,10 +3961,14 @@ function BuildingCalendar() {
       }
     } catch (err) {
       if (err.name === "AbortError") {
+        // 의도적 취소 — 어떤 상태도 변경하지 않음 (finally는 여전히 실행됨)
         return;
       }
       console.error("Price fetch error:", err);
-      setPricesError(true);
+      // stale 요청의 에러가 현재 UI 상태를 덮지 않도록 requestId 확인
+      if (requestId === priceFetchRequestIdRef.current) {
+        setPricesError(true);
+      }
     } finally {
       if (requestId === priceFetchRequestIdRef.current) {
         pricesLoadingRef.current = false;
@@ -3969,6 +3985,14 @@ function BuildingCalendar() {
   useEffect(() => {
     fetchPricesRef.current = fetchPrices;
   }, [fetchPrices]);
+
+  // unmount 시 진행 중인 가격 요청 abort (stale 응답이 상태를 건드리지 않도록)
+  useEffect(() => {
+    return () => {
+      priceFetchControllerRef.current?.abort();
+      priceFetchControllerRef.current = null;
+    };
+  }, []);
 
   // 일반 모드/가격 모드 모두 날짜별 활성 roomId 결정을 위해 캐시 로드
   useEffect(() => {
@@ -4916,12 +4940,20 @@ function BuildingCalendar() {
       const arrival = dayjs(reservation.arrival).startOf('day');
       const departure = dayjs(reservation.departure).startOf('day');
 
+      // 범위 완전 밖 조기 탈출 (월별 뷰 guard와 동일 패턴):
+      // departure <= rangeStart → 예약이 창 이전에 이미 끝남 (exclusive 규칙)
+      // arrival >= rangeEnd → 예약이 창 이후에 시작
+      if (!departure.isAfter(rangeStart) || !arrival.isBefore(rangeEnd)) {
+        return null;
+      }
+
       // 시작/종료를 현재 rolling 범위에 맞춰 잘라낸다.
       const effectiveStart = arrival.isBefore(rangeStart) ? rangeStart : arrival;
       const effectiveEnd = departure.isAfter(rangeEnd) ? rangeEnd : departure;
 
       startDay = effectiveStart.diff(rangeStart, 'day');
-      endDay = effectiveEnd.diff(rangeStart, 'day');
+      // endDay는 totalDays(30)를 초과하지 않도록 clamp (overflow 방지)
+      endDay = Math.min(effectiveEnd.diff(rangeStart, 'day'), 30);
       totalDays = 30;
     } else {
       // 월별 뷰: dayjs 사용 (시각화 문제 해결)
@@ -4943,20 +4975,21 @@ function BuildingCalendar() {
       totalDays = daysInMonth;
     }
 
-    // ✅ 위치와 너비 계산 (픽셀기반 - percentage 기준)
-    const leftPercent = (startDay / totalDays) * 100;
-    const widthPercent = ((endDay - startDay) / totalDays) * 100;
-
     // ✅ 렌더링 전략: 비활성화된 데이터 또는 범위 밖 예약 처리
-    // 1. 활성화된 시작: 검사 이전보다 이전 또는 같은 경우
+    // 1. 잘못된 예약 데이터 (arrival >= departure)
     if (arrivalDate >= departureDate) {
       console.warn(`[INVALID DATA] ${reservation.guestName} (arrival: ${reservation.arrival} >= departure: ${reservation.departure}) - bookId: ${reservation.bookId}`);
       return null;
     }
-    // 2. 범위 밖: 현재 보기에서 표시할 날짜가 없음 (정상 케이스, 에러 아님)
-    if (widthPercent <= 0) {
+    // 2. 범위 완전 밖: rolling/월 경계를 벗어난 예약 (endDay<=0 이거나 startDay>=totalDays)
+    if (startDay >= totalDays || endDay <= 0) {
       return null;
     }
+
+    // ✅ 위치와 너비 계산 — 1박 예약은 최소 1셀 보장 (경계 클리핑 후에도 0이 되지 않음)
+    const nights = Math.max(1, endDay - startDay);
+    const leftPercent = (startDay / totalDays) * 100;
+    const widthPercent = (nights / totalDays) * 100;
 
     const isCancelled = reservation.status === "cancelled";
     const isBlackout = reservation.status === "blackout";
@@ -5007,6 +5040,7 @@ function BuildingCalendar() {
 
     const isManualCheckoutTargetActive = !!selectionStart && !priceMode && !gapEditMode && selectionStart.room === reservation.room;
     const allowPriceEditThroughBlock = !!priceMode && (isBlackout || isInventoryLikeBlock);
+    const isEditMode = priceMode || gapEditMode; // 가격/gap 편집 모드 — 예약 상세 모달 차단
     const isPastReservation = dayjs(reservation.departure).startOf('day').valueOf() <= dayjs().startOf('day').valueOf();
     const reservationIdentityKey = getReservationIdentityKey(reservation);
     const attributedConversion = priceAttributionByReservationKey[reservationIdentityKey] || null;
@@ -5017,6 +5051,8 @@ function BuildingCalendar() {
         key={reservation.bookId || `${reservation.arrival}-${reservation.room}-${reservation.status}`}
         data-no-drag="true"
         onClick={() => {
+          // 편집 모드(가격/gap)에서는 어떤 예약 바 클릭도 상세 모달을 열지 않음
+          if (isEditMode) return;
           if (!isInventoryLikeBlock && !allowPriceEditThroughBlock) setSelectedReservation(reservation);
         }}
         style={{
@@ -5039,7 +5075,7 @@ function BuildingCalendar() {
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
-          cursor: (isManualCheckoutTargetActive || isInventoryLikeBlock || allowPriceEditThroughBlock) ? "default" : "pointer",
+          cursor: (isEditMode || isManualCheckoutTargetActive || isInventoryLikeBlock || allowPriceEditThroughBlock) ? "default" : "pointer",
           boxShadow: isCancelled
             ? "none"
             : (isPriceDrivenSuccess
@@ -5060,7 +5096,7 @@ function BuildingCalendar() {
           pointerEvents: (isManualCheckoutTargetActive || allowPriceEditThroughBlock) ? "none" : "auto"
         }}
         onMouseEnter={(e) => {
-          if (isManualCheckoutTargetActive || isInventoryLikeBlock || allowPriceEditThroughBlock) return;
+          if (isEditMode || isManualCheckoutTargetActive || isInventoryLikeBlock || allowPriceEditThroughBlock) return;
           const hoverTransform = showBeds24DetailView
             ? "translateY(-1px) scale(1.01)"
             : totalCount > 1
@@ -5073,7 +5109,7 @@ function BuildingCalendar() {
           e.currentTarget.style.zIndex = 25;
         }}
         onMouseLeave={(e) => {
-          if (isManualCheckoutTargetActive || isInventoryLikeBlock || allowPriceEditThroughBlock) return;
+          if (isEditMode || isManualCheckoutTargetActive || isInventoryLikeBlock || allowPriceEditThroughBlock) return;
           e.currentTarget.style.transform = barTransform;
           e.currentTarget.style.boxShadow = isCancelled
             ? "none"
@@ -6527,6 +6563,18 @@ function BuildingCalendar() {
                   maxLength={10}
                   value={portfolioDateFrom}
                   onChange={e => setPortfolioDateFrom(normalizeDateInput(e.target.value))}
+                  onBlur={() => {
+                    const resolved = getResolvedDateInput(portfolioDateFrom);
+                    if (resolved) setCommittedDateFrom(resolved);
+                    else if (!portfolioDateFrom) setCommittedDateFrom("");
+                  }}
+                  onKeyDown={e => {
+                    if (e.key === "Enter") {
+                      const resolved = getResolvedDateInput(portfolioDateFrom);
+                      if (resolved) setCommittedDateFrom(resolved);
+                      e.target.blur();
+                    }
+                  }}
                   placeholder="From YYYY-MM-DD"
                   style={{
                     width: "132px",
@@ -6547,6 +6595,18 @@ function BuildingCalendar() {
                   maxLength={10}
                   value={portfolioDateTo}
                   onChange={e => setPortfolioDateTo(normalizeDateInput(e.target.value))}
+                  onBlur={() => {
+                    const resolved = getResolvedDateInput(portfolioDateTo);
+                    if (resolved) setCommittedDateTo(resolved);
+                    else if (!portfolioDateTo) setCommittedDateTo("");
+                  }}
+                  onKeyDown={e => {
+                    if (e.key === "Enter") {
+                      const resolved = getResolvedDateInput(portfolioDateTo);
+                      if (resolved) setCommittedDateTo(resolved);
+                      e.target.blur();
+                    }
+                  }}
                   placeholder="To YYYY-MM-DD"
                   style={{
                     width: "124px",
@@ -6565,6 +6625,8 @@ function BuildingCalendar() {
                     const todayKey = dayjs().format("YYYY-MM-DD");
                     setPortfolioDateFrom(todayKey);
                     setPortfolioDateTo(todayKey);
+                    setCommittedDateFrom(todayKey);
+                    setCommittedDateTo(todayKey);
                   }}
                   style={{
                     padding: "6px 10px",
@@ -6583,6 +6645,8 @@ function BuildingCalendar() {
                   onClick={() => {
                     setPortfolioDateFrom("");
                     setPortfolioDateTo("");
+                    setCommittedDateFrom("");
+                    setCommittedDateTo("");
                   }}
                   style={{
                     padding: "6px 10px",
