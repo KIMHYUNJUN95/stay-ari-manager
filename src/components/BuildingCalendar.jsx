@@ -2859,6 +2859,14 @@ function BuildingCalendar() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
+  // Today 표시 stale 방지: 자정에 todayKey 갱신
+  const [todayKey, setTodayKey] = useState(() => dayjs().format("YYYY-MM-DD"));
+  useEffect(() => {
+    const msUntilMidnight = dayjs().endOf('day').valueOf() - dayjs().valueOf() + 1;
+    const timer = setTimeout(() => setTodayKey(dayjs().format("YYYY-MM-DD")), msUntilMidnight);
+    return () => clearTimeout(timer);
+  }, [todayKey]);
+
   useEffect(() => {
     priceModeRef.current = priceMode;
   }, [priceMode]);
@@ -3325,7 +3333,7 @@ function BuildingCalendar() {
           const date = new Date(year, month, day);
           const dayOfWeek = date.getDay();
           const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
-          const isToday = new Date().toDateString() === date.toDateString();
+          const isToday = dayjs(date).format("YYYY-MM-DD") === todayKey;
           const isHeaderSelected = selectedDateSet.has(dayjs(date).format("YYYY-MM-DD"));
           const isPastHeaderDate = date < new Date(new Date().setHours(0, 0, 0, 0));
 
@@ -3374,7 +3382,7 @@ function BuildingCalendar() {
         rollingDays.map((d, i) => {
           const dayOfWeek = d.date.getDay();
           const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
-          const isToday = new Date().toDateString() === d.date.toDateString();
+          const isToday = d.dateStr === todayKey;
           const isNewMonth = i === 0 || d.day === 1;
           const isHeaderSelected = selectedDateSet.has(d.dateStr);
           const isPastHeaderDate = d.date < new Date(new Date().setHours(0, 0, 0, 0));
@@ -3427,7 +3435,7 @@ function BuildingCalendar() {
         })
       )}
     </div>
-  ), [showBeds24DetailView, viewMode, daysInMonth, year, month, rollingDays, selectedDateSet]);
+  ), [showBeds24DetailView, viewMode, daysInMonth, year, month, rollingDays, selectedDateSet, todayKey]);
 
   const gapCoverageDays = useMemo(() => {
     if (stableDisplayDays.length === 0) return [];
