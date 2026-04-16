@@ -541,7 +541,7 @@ function enrichReservationDocument(data, {
     }
 
     if (!enriched.guestComments && enriched.comments) {
-        enriched.guestComments = enriched.comments;
+        enriched.guestComments = extractHumanNotes(enriched);
     }
 
     enriched.outputImpact = buildReservationOutputImpact(enriched);
@@ -1086,6 +1086,56 @@ function resolveBookingCreatedAt(b) {
 // ==========================================
 // 3) NORMALIZE & FETCH (Normal Sync)
 // ==========================================
+
+// OTA/Beds24 시스템 정책 문구 판별 — 사람이 쓴 메모는 제거하지 않도록 보수적으로 작성
+function isSystemPolicyLine(line) {
+    if (!line || !line.trim()) return true; // 빈 줄 제거
+    const t = line.trim();
+    const patterns = [
+        /THIS RESERVATION HAS BEEN PRE-PAID/i,
+        /cancellation grace period/i,
+        /do not charge if cancelled/i,
+        /non-refundable/i,
+        /booked rate:/i,
+        /rate plan:/i,
+        /payment policy/i,
+        /cancellation policy/i,
+        /\bpre-paid\b/i,
+        /booking\.com policy/i,
+        /^this booking is guaranteed/i,
+        /^payment received/i,
+        /^virtual credit card/i,
+        /\bVCC\b/,
+    ];
+    return patterns.some((re) => re.test(t));
+}
+
+// 예약 raw 데이터에서 사람이 쓴 메모만 추출
+function extractHumanNotes(b) {
+    // 후보 필드 순서대로 수집 (중복 제거)
+    const seen = new Set();
+    const candidates = [];
+    for (const val of [b.comments, b.guestComments, b.notes]) {
+        const s = String(val || "").trim();
+        if (s && !seen.has(s)) { seen.add(s); candidates.push(s); }
+    }
+    if (candidates.length === 0) return "";
+
+    // 줄 단위 분리 후 시스템 문구 제거
+    const lines = [];
+    const seenLines = new Set();
+    for (const block of candidates) {
+        for (const rawLine of block.split(/\r?\n/)) {
+            const line = rawLine.trim();
+            if (!line || seenLines.has(line)) continue;
+            if (isSystemPolicyLine(line)) continue;
+            seenLines.add(line);
+            lines.push(line);
+        }
+    }
+    return lines.join("\n");
+}
+
 function normalize(b, propKey, building, companyId) {
     const status = determineStatus(b);
     const bookDateStr = determineDate(b);
@@ -1161,7 +1211,7 @@ function normalize(b, propKey, building, companyId) {
         guestAddress: b.address || b.guestAddress || "",
         guestCity: b.city || b.guestCity || "",
         guestPostcode: b.postcode || b.guestPostcode || "",
-        guestComments: b.comments || b.guestComments || b.notes || "",
+        guestComments: extractHumanNotes(b),
         guestTitle: b.title || b.guestTitle || "",
         arrivalTime: b.arrivalTime || b.guestArrivalTime || "",
         lang: b.lang || "",

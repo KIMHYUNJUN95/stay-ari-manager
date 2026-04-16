@@ -1186,7 +1186,7 @@ function ReservationDetailModal({ reservation, onClose, onRefresh, isMobile, com
             }}
           />
         ) : (
-          reservation.guestComments && (
+          reservation.guestComments ? (
             <div style={{
               background: "#F9FAFB",
               padding: "14px",
@@ -1197,6 +1197,10 @@ function ReservationDetailModal({ reservation, onClose, onRefresh, isMobile, com
               border: "1px solid #E5E7EB"
             }}>
               {reservation.guestComments}
+            </div>
+          ) : (
+            <div style={{ fontSize: "13px", color: "#9CA3AF", fontStyle: "italic" }}>
+              No guest/staff note
             </div>
           )
         )}
