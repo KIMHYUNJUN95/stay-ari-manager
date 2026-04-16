@@ -79,6 +79,7 @@ const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || "https://us-central1-
 
 // 비활성 계정 minStay 기준값 (50 이상 = 비활성 판단)
 const INACTIVE_MINSTAY_THRESHOLD = 50;
+const PRICE_INTERVENTION_LIMIT = 400;
 const CALENDAR_NUMERIC_FONT_FAMILY = '"Bahnschrift", "DIN Alternate", "Inter", "Aptos", "Segoe UI", sans-serif';
 
 // 가격 설정 모달 (고급 버전)
@@ -2797,6 +2798,22 @@ function BuildingCalendar() {
   const [priceCache, setPriceCache] = useState({}); // 건물별 가격 캐시: { "아라키초A": {...} }
   const [priceInterventionLogs, setPriceInterventionLogs] = useState([]);
   const priceCacheRef = useRef({});
+  // priceCache는 반드시 updatePriceCache로만 갱신 (state/ref 동기화 보장)
+  const updatePriceCache = useCallback((updater) => {
+    setPriceCache((prev) => {
+      const next = updater(prev);
+      if (next === prev) return prev;
+      if (next === null || typeof next !== "object" || Array.isArray(next)) {
+        console.warn("[BuildingCalendar] priceCache updater must return a plain object; kept previous cache.");
+        if (process.env.NODE_ENV === "development") {
+          console.warn("[BuildingCalendar] Do not call setPriceCache directly — use updatePriceCache.");
+        }
+        return prev;
+      }
+      priceCacheRef.current = next;
+      return next;
+    });
+  }, []);
   const priceFetchControllerRef = useRef(null);
   const priceFetchRequestIdRef = useRef(0);
   const fetchPricesRef = useRef(null);
@@ -2809,7 +2826,10 @@ function BuildingCalendar() {
   // ✅ 가격 설정 job 상태 추적 관련
   const [pendingPriceJobs, setPendingPriceJobs] = useState({}); // { [jobId]: { jobId, building, roomCount, status, pendingCells, usePollingFallback } }
   const pendingPriceJobsRef = useRef({});
+  const prevPendingJobIdsRef = useRef(new Set());
   const priceJobListenersRef = useRef({});
+  const lastInterventionFetchKeyRef = useRef(null);
+  const lastInterventionFetchAtRef = useRef(0);
   const [priceJobToast, setPriceJobToast] = useState(null);     // { status: 'success'|'error'|'partial'|'queued', message }
   const [priceCellTooltip, setPriceCellTooltip] = useState(null); // { text, x, y }
   const priceCellTooltipRef = useRef(null);
@@ -2844,8 +2864,17 @@ function BuildingCalendar() {
   }, [calendarBuilding]);
 
   useEffect(() => {
-    if (!companyId) {
-      setPriceInterventionLogs([]);
+    if (!companyId || !showBeds24DetailView) {
+      if (!companyId) setPriceInterventionLogs([]);
+      return;
+    }
+
+    const now = Date.now();
+    const fetchKey = companyId;
+    if (
+      lastInterventionFetchKeyRef.current === fetchKey &&
+      now - lastInterventionFetchAtRef.current < 60_000
+    ) {
       return;
     }
 
@@ -2856,10 +2885,12 @@ function BuildingCalendar() {
           collection(db, "price_change_logs"),
           where("companyId", "==", companyId),
           orderBy("timestamp", "desc"),
-          limit(800)
+          limit(PRICE_INTERVENTION_LIMIT)
         );
         const snapshot = await getDocs(q);
         if (cancelled) return;
+        lastInterventionFetchKeyRef.current = fetchKey;
+        lastInterventionFetchAtRef.current = Date.now();
         setPriceInterventionLogs(snapshot.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })));
       } catch (error) {
         console.error("[BuildingCalendar] Failed to fetch price interventions:", error);
@@ -2870,7 +2901,7 @@ function BuildingCalendar() {
     return () => {
       cancelled = true;
     };
-  }, [companyId]);
+  }, [companyId, showBeds24DetailView]);
 
   useEffect(() => () => {
     if (priceCellTooltipFrameRef.current) {
@@ -2901,10 +2932,6 @@ function BuildingCalendar() {
       window.removeEventListener('keydown', handleKeyDown);
     };
   }, [isCalendarFullscreen]);
-
-  useEffect(() => {
-    priceCacheRef.current = priceCache;
-  }, [priceCache]);
 
   useEffect(() => {
     pendingPriceJobsRef.current = pendingPriceJobs;
@@ -3017,18 +3044,24 @@ function BuildingCalendar() {
   }, []);
 
   useEffect(() => {
-    const activeJobIds = new Set(Object.keys(pendingPriceJobs));
+    const currentIds = new Set(Object.keys(pendingPriceJobs));
+    const prevIds = prevPendingJobIdsRef.current;
 
-    Object.entries(priceJobListenersRef.current).forEach(([jobId, unsubscribe]) => {
-      if (activeJobIds.has(jobId)) return;
-      try {
-        unsubscribe();
-      } catch (_) {}
-      delete priceJobListenersRef.current[jobId];
+    // removed: jobId가 사라진 경우만 unsubscribe
+    prevIds.forEach((jobId) => {
+      if (currentIds.has(jobId)) return;
+      const unsub = priceJobListenersRef.current[jobId];
+      if (unsub) {
+        try { unsub(); } catch (_) {}
+        delete priceJobListenersRef.current[jobId];
+      }
     });
 
-    Object.entries(pendingPriceJobs).forEach(([jobId, job]) => {
-      if (priceJobListenersRef.current[jobId] || job.usePollingFallback) return;
+    // added: 신규 jobId에만 listener 등록
+    currentIds.forEach((jobId) => {
+      if (prevIds.has(jobId)) return; // 기존 job — 재등록 안 함
+      const job = pendingPriceJobs[jobId];
+      if (!job || priceJobListenersRef.current[jobId] || job.usePollingFallback) return;
       priceJobListenersRef.current[jobId] = onSnapshot(
         doc(db, "beds24_price_jobs", jobId),
         (snapshot) => {
@@ -3046,21 +3079,19 @@ function BuildingCalendar() {
                 }
               })
             : prev);
-          const unsubscribe = priceJobListenersRef.current[jobId];
-          if (unsubscribe) {
-            try {
-              unsubscribe();
-            } catch (_) {}
+          const unsub2 = priceJobListenersRef.current[jobId];
+          if (unsub2) {
+            try { unsub2(); } catch (_) {}
             delete priceJobListenersRef.current[jobId];
           }
         }
       );
     });
+
+    prevPendingJobIdsRef.current = currentIds;
   }, [handlePendingPriceJobUpdate, pendingPriceJobs]);
 
   useEffect(() => {
-    if (pendingPriceJobList.length === 0) return;
-
     const id = setInterval(() => {
       const now = Date.now();
       Object.values(pendingPriceJobsRef.current).forEach((job) => {
@@ -3085,22 +3116,25 @@ function BuildingCalendar() {
     }, 4000);
 
     return () => clearInterval(id);
-  }, [pendingPriceJobList.length, triggerPriceJobNow]);
+  }, [triggerPriceJobNow]);
 
   useEffect(() => {
-    const pollingJobIds = Object.entries(pendingPriceJobs)
-      .filter(([, job]) => job.usePollingFallback)
-      .map(([jobId]) => jobId);
-
-    if (pollingJobIds.length === 0) return;
-
-    let cancelled = false;
-    let attempts = 0;
     const MAX_ATTEMPTS = 120; // 최대 8분 (Beds24 cooldown + next worker tick 여유)
+    const attemptsRef = { current: 0 };
+    let cancelled = false;
 
     const poll = async () => {
-      attempts++;
-      if (attempts > MAX_ATTEMPTS) {
+      const pollingJobIds = Object.entries(pendingPriceJobsRef.current)
+        .filter(([, job]) => job.usePollingFallback)
+        .map(([jobId]) => jobId);
+
+      if (pollingJobIds.length === 0) {
+        attemptsRef.current = 0;
+        return;
+      }
+
+      attemptsRef.current++;
+      if (attemptsRef.current > MAX_ATTEMPTS) {
         pollingJobIds.forEach((jobId) => clearPendingPriceJob(jobId));
         setPriceJobToast({ status: "error", message: "Processing is taking longer than expected. Please refresh prices in a moment." });
         return;
@@ -3129,7 +3163,7 @@ function BuildingCalendar() {
       cancelled = true;
       clearInterval(id);
     };
-  }, [clearPendingPriceJob, companyId, handlePendingPriceJobUpdate, pendingPriceJobs]);
+  }, [clearPendingPriceJob, companyId, handlePendingPriceJobUpdate]);
 
   // priceJobToast 자동 닫기 (6초)
   useEffect(() => {
@@ -3652,7 +3686,7 @@ function BuildingCalendar() {
     gapCellSet.forEach(key => {
       const [room, date] = key.split('__');
       if (date < todayStr) return;
-      const gapInfo = getCheckInGapInfo(room, date);
+      const gapInfo = gapInfoByCellKey[`${room}__${date}`] || { resolvedRoomId: null };
       gapCells.push({ room, date, roomId: gapInfo.resolvedRoomId || "" });
     });
     if (gapCells.length === 0) {
@@ -3936,7 +3970,7 @@ function BuildingCalendar() {
       if (requestId !== priceFetchRequestIdRef.current) return;
       if (data.success && data.priceData) {
         // 프론트 캐시에 저장
-        setPriceCache(prev => ({ ...prev, [fetchBuilding]: data.priceData }));
+        updatePriceCache(prev => ({ ...prev, [fetchBuilding]: data.priceData }));
         // 현재 가격 데이터에 업데이트
         setRoomPrices(prev => ({ ...prev, ...data.priceData }));
         // 마지막 동기화 시각 저장
@@ -3975,7 +4009,7 @@ function BuildingCalendar() {
 
       // pending 작업이 있으면 즉시 실행
     }
-  }, [companyId, gapCoverageDays, hasVisiblePriceCoverage]);
+  }, [companyId, gapCoverageDays, hasVisiblePriceCoverage, updatePriceCache]);
 
   useEffect(() => {
     fetchPricesRef.current = fetchPrices;
@@ -4224,6 +4258,35 @@ function BuildingCalendar() {
   const externalInventoryBlocks = useMemo(() => {
     if (!calendarBuilding || calendarBuilding === '전체' || stableDisplayDays.length === 0 || rooms.length === 0) return [];
 
+    const visibleDateSet = new Set(stableDisplayDays.map((d) => d.dateStr));
+    let visMinStr = stableDisplayDays[0].dateStr;
+    let visMaxStr = stableDisplayDays[0].dateStr;
+    stableDisplayDays.forEach((d) => {
+      if (d.dateStr < visMinStr) visMinStr = d.dateStr;
+      if (d.dateStr > visMaxStr) visMaxStr = d.dateStr;
+    });
+
+    const occupiedByRoomDate = new Set();
+    reservations.forEach((r) => {
+      if (r.isInventoryOverrideBlock || r.status === 'cancelled' || !r.arrival || !r.departure) return;
+
+      let cur = dayjs(r.arrival);
+      const visMinD = dayjs(visMinStr);
+      if (cur.isBefore(visMinD, 'day')) cur = visMinD;
+
+      const depExclusive = dayjs(r.departure);
+      const visEndExclusive = dayjs(visMaxStr).add(1, 'day');
+      const endExclusive = depExclusive.isBefore(visEndExclusive, 'day') ? depExclusive : visEndExclusive;
+
+      while (cur.isBefore(endExclusive, 'day')) {
+        const dStr = cur.format('YYYY-MM-DD');
+        if (visibleDateSet.has(dStr)) {
+          occupiedByRoomDate.add(`${r.room}__${dStr}`);
+        }
+        cur = cur.add(1, 'day');
+      }
+    });
+
     const blocks = [];
 
     rooms.forEach((room) => {
@@ -4232,15 +4295,7 @@ function BuildingCalendar() {
 
       stableDisplayDays.forEach((dayInfo, index) => {
         const dateStr = dayInfo.dateStr;
-        const hasExistingReservation = reservations.some((r) =>
-          r.room === room &&
-          !r.isInventoryOverrideBlock &&
-          r.status !== 'cancelled' &&
-          r.arrival &&
-          r.departure &&
-          dateStr >= r.arrival &&
-          dateStr < r.departure
-        );
+        const hasExistingReservation = occupiedByRoomDate.has(`${room}__${dateStr}`);
 
         const isInventoryBlocked = !hasExistingReservation && isBeds24InventoryBlackoutForDate(room, dateStr);
         const isLastDay = index === stableDisplayDays.length - 1;
@@ -4658,6 +4713,17 @@ function BuildingCalendar() {
     };
   }, [calendarBuilding, roomAllReservationsByUnitMap, roomAllReservationsMap, roomReservationsMap, getCellMinStayForDate, getPriceInfoForRoomIdDate]);
 
+  // 화면 범위 기준 gap info 사전계산 맵 (O(1) 조회용)
+  const gapInfoByCellKey = useMemo(() => {
+    const map = {};
+    rooms.forEach(room => {
+      stableDisplayDays.forEach(dayInfo => {
+        map[`${room}__${dayInfo.dateStr}`] = getCheckInGapInfo(room, dayInfo.dateStr);
+      });
+    });
+    return map;
+  }, [rooms, stableDisplayDays, getCheckInGapInfo]);
+
   // Gap cell set: only cells where check-in → 1 sellable night AND displayed minStay === 2.
   // Uses getCheckInGapInfo (row-level vacancy + dual-roomId safe).
   // Past dates included; Select Red Gaps button filters past dates on its own.
@@ -4667,14 +4733,14 @@ function BuildingCalendar() {
       const allRes = roomAllReservationsMap[room] || [];
       if (allRes.length === 0) return;
       stableDisplayDays.forEach(dayInfo => {
-        const { isOneNightMinStayGap } = getCheckInGapInfo(room, dayInfo.dateStr);
-        if (isOneNightMinStayGap) {
+        const gi = gapInfoByCellKey[`${room}__${dayInfo.dateStr}`];
+        if (gi?.isOneNightMinStayGap) {
           set.add(`${room}__${dayInfo.dateStr}`);
         }
       });
     });
     return set;
-  }, [rooms, roomAllReservationsMap, stableDisplayDays, getCheckInGapInfo, selectedBuilding]);
+  }, [rooms, roomAllReservationsMap, stableDisplayDays, gapInfoByCellKey, selectedBuilding]);
 
   // [Single View] 건물 통계 데이터 계산
   const analysis = useMemo(() => {
@@ -5620,7 +5686,7 @@ function BuildingCalendar() {
             onSave={() => {
               setSelectedCells([]);
               setSelectedRoom(null);
-              setPriceCache(prev => {
+              updatePriceCache(prev => {
                 const newCache = { ...prev };
                 delete newCache[calendarBuilding];
                 return newCache;
@@ -5874,7 +5940,7 @@ function BuildingCalendar() {
                     setIsGapApplying(true);
                     const startTime = Date.now();
                     const cellTargets = selectedCells.map((cell) => {
-                      const resolvedRoomId = cell.roomId || getCheckInGapInfo(cell.room, cell.date).resolvedRoomId || "";
+                      const resolvedRoomId = cell.roomId || (gapInfoByCellKey[`${cell.room}__${cell.date}`]?.resolvedRoomId) || "";
                       return {
                         roomName: cell.room,
                         date: cell.date,
@@ -5927,7 +5993,7 @@ function BuildingCalendar() {
                         return updated;
                       });
 
-                      setPriceCache(prev => {
+                      updatePriceCache(prev => {
                         if (!prev[calendarBuilding]) return prev;
                         const updatedBuilding = { ...prev[calendarBuilding] };
 
@@ -6035,7 +6101,7 @@ function BuildingCalendar() {
                       console.error("[Gap Apply] Fatal error:", error);
                       // 전체 롤백
                       setRoomPrices(backupRoomPrices);
-                      setPriceCache(backupPriceCache);
+                      updatePriceCache(() => backupPriceCache);
                       alert(`Failed to update.\n\nError: ${error.message}\n\nAll changes have been rolled back.`);
                     } finally {
                       setIsGapApplying(false);
@@ -7112,7 +7178,7 @@ function BuildingCalendar() {
                           gapCellSet.forEach(key => {
                             const [room, date] = key.split('__');
                             if (date < todayStr) return;
-                            const gapInfo = getCheckInGapInfo(room, date);
+                            const gapInfo = gapInfoByCellKey[`${room}__${date}`] || { resolvedRoomId: null };
                             gapCells.push({ room, date, roomId: gapInfo.resolvedRoomId || "" });
                           });
                           if (gapCells.length === 0) {
@@ -8852,7 +8918,7 @@ function BuildingCalendar() {
                                 }}
                                 title={minStay > 0
                                   ? (() => {
-                                      const _gi = (!isFullyOccupied && minStay >= 2) ? getCheckInGapInfo(room, dateStr) : null;
+                                      const _gi = (!isFullyOccupied && minStay >= 2) ? (gapInfoByCellKey[`${room}__${dateStr}`] || null) : null;
                                       return _gi
                                         ? `nights:${_gi.availableNightsFromDate} gap:${_gi.isOneNightMinStayGap} roomId:${_gi.resolvedRoomId} curr:${_gi.currentDateStatus}/${_gi.currentDateReason} prev:${_gi.previousDateStr} ${_gi.previousDateStatus}/${_gi.previousDateReason} next:${_gi.nextDateStr} ${_gi.nextDateStatus}/${_gi.nextDateReason}`
                                         : `minStay:${minStay}`;
@@ -8982,7 +9048,7 @@ function BuildingCalendar() {
                                 )}
                                 {/* Min Stay Badge (read-only 가격설정 및 확인 액션바에서) */}
                                 {minStay > 0 && (() => {
-                                  const _gi = (!isFullyOccupied && minStay >= 2) ? getCheckInGapInfo(room, dateStr) : null;
+                                  const _gi = (!isFullyOccupied && minStay >= 2) ? (gapInfoByCellKey[`${room}__${dateStr}`] || null) : null;
                                   return (
                                   <div
                                     title={_gi
