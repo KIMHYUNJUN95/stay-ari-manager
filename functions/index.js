@@ -1054,11 +1054,42 @@ const determineDate = (b) => {
 };
 
 // ==========================================
+// 2-B) HELPER: BOOKING CREATED-AT (exact ms + source)
+// ==========================================
+function resolveBookingCreatedAt(b) {
+    // exact datetime: require time component (length > 10)
+    const toExactMs = (str) => {
+        if (!str || str.length <= 10) return null;
+        try {
+            const ms = dayjs(str).valueOf();
+            return (Number.isFinite(ms) && ms > 0) ? ms : null;
+        } catch { return null; }
+    };
+    // date-only fallback: end-of-day JST
+    const toDateEndMs = (dateKey) => {
+        if (!dateKey || dateKey.length < 10) return null;
+        try {
+            const ms = new Date(`${String(dateKey).slice(0, 10)}T23:59:59+09:00`).getTime();
+            return Number.isFinite(ms) ? ms : null;
+        } catch { return null; }
+    };
+
+    for (const [field, src] of [['bookingTime', 'bookingTime'], ['bookTime', 'bookTime'], ['entryTime', 'entryTime']]) {
+        const ms = toExactMs(b[field]);
+        if (ms) return { ms, source: src };
+    }
+    const bookDateMs = toDateEndMs(b.bookDate);
+    if (bookDateMs) return { ms: bookDateMs, source: 'bookDate_fallback' };
+    return { ms: null, source: 'unknown' };
+}
+
+// ==========================================
 // 3) NORMALIZE & FETCH (Normal Sync)
 // ==========================================
 function normalize(b, propKey, building, companyId) {
     const status = determineStatus(b);
     const bookDateStr = determineDate(b);
+    const bookingCreatedAt = resolveBookingCreatedAt(b);
 
     // V1 vs V2 Mapping
     // firstNight -> arrival
@@ -1153,6 +1184,12 @@ function normalize(b, propKey, building, companyId) {
         // ★ 취소된 예약인데 cancelTime이 없으면 modifiedTime을 cancelTime으로 사용
         cancelTime: b.cancelTime || (status === "cancelled" ? (b.modifiedTime || b.modified || "") : ""),
         modified: b.modifiedTime || b.modified || "",
+        // ★ 예약 생성 정밀 시각 (attribution용)
+        bookingCreatedAtMs: bookingCreatedAt.ms,
+        bookingCreatedAtSource: bookingCreatedAt.source,
+        ...(b.bookingTime ? { bookingTimeRaw: b.bookingTime } : {}),
+        ...(b.bookTime ? { bookTimeRaw: b.bookTime } : {}),
+        ...(b.entryTime ? { entryTimeRaw: b.entryTime } : {}),
         // ★ 플래그/표시
         flagColor: b.flagColor || "",
         flagText: b.flagText || "",

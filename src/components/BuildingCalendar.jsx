@@ -5,7 +5,7 @@ import { db, auth } from '../firebase';
 import { useUser } from '../contexts/UserContext';
 import dayjs from 'dayjs';
 import axios from 'axios';
-import { buildPriceAttributionResult, getReservationIdentityKey } from '../utils/priceAttribution';
+import { buildPriceAttributionResult, getReservationIdentityKey, parseReservationCreatedAtMs } from '../utils/priceAttribution';
 
 import { BUILDING_NAMES_EN as _BUILDING_NAMES_EN, EXCLUDED_BUILDING_UI, ACTIVE_BUILDING_ORDER } from '../constants/buildingData';
 
@@ -1014,49 +1014,27 @@ const BEDS24_DETAIL_ROOM_NAME_WIDTH = 86;
 // 예약 상세 모달 내부 컴포넌트 (재사용을 위해 함수 바깥에서 정의)
 // 예약 생성 시각 파서 — Firestore Timestamp / Date / string 모두 처리, JST 포맷 반환
 function parseBookedAt(reservation) {
-  const raw =
-    reservation.bookingTime ??
-    reservation.bookTime ??
-    reservation.entryTime ??
-    reservation.sourceEventTime ??
-    reservation.bookDate ??
-    null;
+  const { ms, source } = parseReservationCreatedAtMs(reservation);
 
-  if (raw === null || raw === undefined || raw === "") return "No info";
-
-  try {
-    let ms;
-
-    // Firestore Timestamp ({ seconds, nanoseconds } or .toDate())
-    if (raw && typeof raw === "object" && typeof raw.toDate === "function") {
-      ms = raw.toDate().getTime();
-    } else if (raw && typeof raw === "object" && typeof raw.seconds === "number") {
-      ms = raw.seconds * 1000;
-    } else {
-      ms = new Date(raw).getTime();
-    }
-
-    if (isNaN(ms)) return "No info";
-
-    const d = new Date(ms);
-    const jst = new Intl.DateTimeFormat("sv-SE", {
+  if (source === 'exact' && Number.isFinite(ms)) {
+    const formatted = new Date(ms).toLocaleString("en-US", {
       timeZone: "Asia/Tokyo",
       year: "numeric", month: "2-digit", day: "2-digit",
       hour: "2-digit", minute: "2-digit",
-    }).format(d).replace("T", " ");
-
-    // 시분이 00:00이고 원본이 date-only 문자열이면 날짜만 표시
-    const isDateOnly =
-      typeof raw === "string" &&
-      /^\d{4}-\d{2}-\d{2}$/.test(raw.trim());
-
-    if (isDateOnly) {
-      return `${jst.slice(0, 10)} (JST)`;
-    }
-    return `${jst} (JST)`;
-  } catch (_) {
-    return "No info";
+      hour12: false
+    });
+    return `${formatted} (JST)`;
   }
+
+  if (source === 'date_only_fallback' && Number.isFinite(ms)) {
+    const jst = new Date(new Date(ms).toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+    const y = jst.getFullYear();
+    const mo = String(jst.getMonth() + 1).padStart(2, "0");
+    const d = String(jst.getDate()).padStart(2, "0");
+    return `${y}-${mo}-${d} (date only)`;
+  }
+
+  return "No info";
 }
 
 const InfoRow = ({ label, value, icon, field, isEditing, editData, setEditData }) => (
@@ -2794,6 +2772,7 @@ function BuildingCalendar() {
   const [gapEditMode, setGapEditMode] = useState(false); // Gap 설정 모드
   const [showGapEditModal, setShowGapEditModal] = useState(false); // Gap 설정 모달
   const [gapEditMinStay, setGapEditMinStay] = useState(1); // 1박 또는 2박
+  const [customMinStay, setCustomMinStay] = useState(""); // custom 3+ 입력값
   const [isGapApplying, setIsGapApplying] = useState(false); // Gap 적용 중 상태
   const [showCancelled, setShowCancelled] = useState(false); // 취소된 예약 보기 여부
 
@@ -7199,6 +7178,65 @@ function BuildingCalendar() {
                         {isGapApplying ? "Applying..." : "Set 2 Nights"}
                       </button>
 
+                      {/* Custom 3+ min stay */}
+                      <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                        <input
+                          type="number"
+                          min={3}
+                          max={30}
+                          placeholder="3+"
+                          value={customMinStay}
+                          onChange={(e) => setCustomMinStay(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              const v = parseInt(customMinStay, 10);
+                              if (v >= 3 && v <= 30 && selectedCells.length > 0 && !isGapApplying) {
+                                setGapEditMinStay(v);
+                                setShowGapEditModal(true);
+                              }
+                            }
+                          }}
+                          style={{
+                            width: "52px", padding: "7px 8px", borderRadius: "8px",
+                            border: "1.5px solid #C4B5FD", background: "white",
+                            fontSize: "13px", fontWeight: "600", color: "#1E293B",
+                            textAlign: "center", outline: "none",
+                            boxShadow: "0 1px 3px rgba(79,70,229,0.08)",
+                            MozAppearance: "textfield"
+                          }}
+                        />
+                        <button
+                          disabled={
+                            selectedCells.length === 0 || isGapApplying ||
+                            !(parseInt(customMinStay, 10) >= 3 && parseInt(customMinStay, 10) <= 30)
+                          }
+                          onClick={() => {
+                            const v = parseInt(customMinStay, 10);
+                            if (v >= 3 && v <= 30) { setGapEditMinStay(v); setShowGapEditModal(true); }
+                          }}
+                          style={{
+                            padding: "8px 14px", borderRadius: "8px", border: "none",
+                            background: (selectedCells.length === 0 || isGapApplying ||
+                              !(parseInt(customMinStay, 10) >= 3 && parseInt(customMinStay, 10) <= 30))
+                              ? "#E5E7EB"
+                              : "linear-gradient(135deg, #6366F1 0%, #4F46E5 100%)",
+                            color: (selectedCells.length === 0 || isGapApplying ||
+                              !(parseInt(customMinStay, 10) >= 3 && parseInt(customMinStay, 10) <= 30))
+                              ? "#9CA3AF" : "white",
+                            fontSize: "13px", fontWeight: "700",
+                            cursor: (selectedCells.length === 0 || isGapApplying ||
+                              !(parseInt(customMinStay, 10) >= 3 && parseInt(customMinStay, 10) <= 30))
+                              ? "not-allowed" : "pointer",
+                            boxShadow: (selectedCells.length > 0 && !isGapApplying &&
+                              parseInt(customMinStay, 10) >= 3 && parseInt(customMinStay, 10) <= 30)
+                              ? "0 2px 8px rgba(79,70,229,0.3)" : "none",
+                            transition: "all 0.15s"
+                          }}
+                        >
+                          Apply
+                        </button>
+                      </div>
+
                       <div style={{ width: "1px", height: "28px", background: "#DDD6FE" }} />
 
                       {/* Clear Selection */}
@@ -7880,6 +7918,62 @@ function BuildingCalendar() {
                   }}
                 >
                   Set 2N
+                </button>
+                {/* Custom 3+ (mobile) */}
+                <input
+                  type="number"
+                  min={3}
+                  max={30}
+                  placeholder="3+"
+                  value={customMinStay}
+                  onChange={(e) => setCustomMinStay(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      const v = parseInt(customMinStay, 10);
+                      if (v >= 3 && v <= 30 && selectedCells.length > 0 && !isGapApplying) {
+                        setGapEditMinStay(v);
+                        setShowGapEditModal(true);
+                      }
+                    }
+                  }}
+                  style={{
+                    width: "46px", padding: "6px 6px", borderRadius: "8px",
+                    border: "1.5px solid #C4B5FD", background: "white",
+                    fontSize: "12px", fontWeight: "600", color: "#1E293B",
+                    textAlign: "center", outline: "none",
+                    MozAppearance: "textfield"
+                  }}
+                />
+                <button
+                  disabled={
+                    selectedCells.length === 0 || isGapApplying ||
+                    !(parseInt(customMinStay, 10) >= 3 && parseInt(customMinStay, 10) <= 30)
+                  }
+                  onClick={() => {
+                    const v = parseInt(customMinStay, 10);
+                    if (v >= 3 && v <= 30) { setGapEditMinStay(v); setShowGapEditModal(true); }
+                  }}
+                  style={{
+                    padding: "7px 10px", borderRadius: "8px", border: "none",
+                    background: (selectedCells.length === 0 || isGapApplying ||
+                      !(parseInt(customMinStay, 10) >= 3 && parseInt(customMinStay, 10) <= 30))
+                      ? "#E5E7EB"
+                      : "linear-gradient(135deg, #6366F1 0%, #4F46E5 100%)",
+                    color: (selectedCells.length === 0 || isGapApplying ||
+                      !(parseInt(customMinStay, 10) >= 3 && parseInt(customMinStay, 10) <= 30))
+                      ? "#9CA3AF" : "white",
+                    cursor: (selectedCells.length === 0 || isGapApplying ||
+                      !(parseInt(customMinStay, 10) >= 3 && parseInt(customMinStay, 10) <= 30))
+                      ? "not-allowed" : "pointer",
+                    fontWeight: "700", fontSize: "12px",
+                    display: "flex", alignItems: "center", gap: "4px",
+                    boxShadow: (selectedCells.length > 0 && !isGapApplying &&
+                      parseInt(customMinStay, 10) >= 3 && parseInt(customMinStay, 10) <= 30)
+                      ? "0 3px 8px rgba(79,70,229,0.24)" : "none",
+                    transition: "all 0.2s"
+                  }}
+                >
+                  Apply
                 </button>
                 <button
                   disabled={selectedCells.length === 0}
@@ -8750,10 +8844,11 @@ function BuildingCalendar() {
                                     ? "#DC6A6A"
                                     : minStay === 1
                                       ? "#2F8F73"
-                                      : "#94A3B8",
+                                      : "#64748B",
                                   fontSize: "8.5px",
                                   fontWeight: "700",
-                                  letterSpacing: "0.02em"
+                                  letterSpacing: "0.02em",
+                                  textShadow: "0 1px 0 rgba(255,255,255,0.6)"
                                 }}
                                 title={minStay > 0
                                   ? (() => {
@@ -8906,12 +9001,14 @@ function BuildingCalendar() {
                                         ? "#DC2626"
                                         : minStay === 1
                                           ? "#059669"
-                                          : "#6B7280",
+                                          : "#64748B",
                                       borderRadius: "4px",
                                       fontSize: "11px",
                                       fontWeight: "800",
                                       textAlign: "center",
                                       lineHeight: "16px",
+                                      letterSpacing: "0.01em",
+                                      textShadow: "0 1px 0 rgba(255,255,255,0.6)",
                                       boxShadow: "0 1px 2px rgba(0,0,0,0.1)"
                                     }}
                                   >

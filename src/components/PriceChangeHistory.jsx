@@ -252,6 +252,20 @@ function PriceChangeHistory() {
         return result;
     }, [logs, buildingFilter, originFilter, deferredDateFromFilter, deferredDateToFilter]);
 
+    // conversion attribution 전용: building/origin은 적용하되 날짜는 자르지 않음
+    const conversionInterventions = useMemo(() => {
+        let result = logs;
+        if (buildingFilter !== "all") {
+            result = result.filter(log => log.building === buildingFilter);
+        }
+        if (originFilter === "beds24") {
+            result = result.filter(log => log.origin?.includes("Beds24") || log.origin?.includes("외부"));
+        } else if (originFilter === "admin") {
+            result = result.filter(log => log.origin === "관리자 대시보드" || log.origin === "queue_worker");
+        }
+        return result;
+    }, [logs, buildingFilter, originFilter]);
+
     // Group logs by date (YYYY-MM-DD)
     const groupedLogs = useMemo(() => {
         const groups = {};
@@ -427,14 +441,14 @@ function PriceChangeHistory() {
 
     const attributedConversions = useMemo(() => {
         const { conversionList } = buildPriceAttributionResult({
-            interventions: filteredLogs,
+            interventions: conversionInterventions,
             reservations,
             defaultWindowHours: 48,
             minInterventionDate: "2026-04-11",
             minBookingDate: "2026-04-11"
         });
         return conversionList;
-    }, [filteredLogs, reservations]);
+    }, [conversionInterventions, reservations]);
 
     const conversionRows = useMemo(() => (
         attributedConversions.map((item) => {
@@ -443,6 +457,7 @@ function PriceChangeHistory() {
             return {
                 key: `${item.reservationKey}:${item.appliedAtMs}`,
                 bookingAtMs: item.bookingCreatedAtMs,
+                bookingAtSource: item.bookingCreatedAtSource || 'unknown',
                 interventionAtMs: item.appliedAtMs,
                 building: reservation.building || intervention.building || "Unknown",
                 room: reservation.room || "-",
@@ -456,6 +471,20 @@ function PriceChangeHistory() {
         })
     ), [attributedConversions]);
 
+    const filteredConversionRows = useMemo(() => {
+        const validDateFrom = getValidatedDateFilter(deferredDateFromFilter);
+        const validDateTo = getValidatedDateFilter(deferredDateToFilter);
+        if (!validDateFrom && !validDateTo) return conversionRows;
+        return conversionRows.filter((row) => {
+            if (!Number.isFinite(row.bookingAtMs)) return false;
+            const dateKey = getTokyoDateKey(row.bookingAtMs);
+            if (!dateKey || dateKey === "Unknown") return false;
+            if (validDateFrom && dateKey < validDateFrom) return false;
+            if (validDateTo && dateKey > validDateTo) return false;
+            return true;
+        });
+    }, [conversionRows, deferredDateFromFilter, deferredDateToFilter, getValidatedDateFilter, getTokyoDateKey]);
+
     const formatDateTime = (ms) => {
         if (!Number.isFinite(ms)) return "-";
         return new Date(ms).toLocaleString("en-US", {
@@ -467,6 +496,15 @@ function PriceChangeHistory() {
             minute: "2-digit",
             hour12: false
         });
+    };
+
+    const formatDateOnly = (ms) => {
+        if (!Number.isFinite(ms)) return "-";
+        const jst = new Date(new Date(ms).toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+        const y = jst.getFullYear();
+        const mo = String(jst.getMonth() + 1).padStart(2, "0");
+        const d = String(jst.getDate()).padStart(2, "0");
+        return `${y}-${mo}-${d}`;
     };
 
     const stats = useMemo(() => {
@@ -496,58 +534,100 @@ function PriceChangeHistory() {
         }}>{label}</button>
     );
 
-    // ─── Expanded Snapshot: 오른쪽 정렬 표 대신 아래쪽 세로 카드 리스트 ─────────────
-    const renderSnapshotCompact = (log, uniquePriceSnapshot, isBeds24) => (
-        <div style={{ padding: '8px 10px 10px', background: '#FAFAFA', borderTop: '1px solid #EBEBEB' }}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                {uniquePriceSnapshot.map((snap, sidx) => {
-                    const d = snap.newPrice - snap.oldPrice;
-                    const pct = snap.oldPrice > 0 ? Math.round(d / snap.oldPrice * 100) : null;
+    // ─── Expanded Snapshot: 룸별 섹션 + 날짜순 타일 그리드 ──────────────────────
+    const renderSnapshotCompact = (log, uniquePriceSnapshot, isBeds24) => {
+        // 룸별 groupBy
+        const roomMap = {};
+        uniquePriceSnapshot.forEach((snap) => {
+            const roomKey = snap.room || 'Unknown Room';
+            if (!roomMap[roomKey]) roomMap[roomKey] = [];
+            roomMap[roomKey].push(snap);
+        });
+        // 룸 키 자연 정렬 (숫자 포함)
+        const sortedRooms = Object.keys(roomMap).sort((a, b) =>
+            a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+        );
+        // 각 룸 내부 날짜 오름차순 정렬
+        sortedRooms.forEach((roomKey) => {
+            roomMap[roomKey].sort((a, b) => (a.date || '') < (b.date || '') ? -1 : (a.date || '') > (b.date || '') ? 1 : 0);
+        });
+
+        return (
+            <div style={{ padding: '10px 10px 12px', background: '#F8FAFC', borderTop: '1px solid #E5E7EB' }}>
+                {sortedRooms.map((roomKey) => {
+                    const snaps = roomMap[roomKey];
+                    const roomLabel = snaps[0]?.room ? getRoomName(snaps[0].room) : roomKey;
                     return (
-                        <div
-                            key={sidx}
-                            style={{
-                                background: '#FFFFFF',
-                                border: `1px solid ${isBeds24 ? '#FFE7BF' : '#E5E7EB'}`,
-                                borderRadius: '8px',
-                                padding: '7px 9px'
-                            }}
-                        >
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', flexWrap: 'wrap' }}>
-                                <span style={{ fontSize: '12px', fontWeight: '700', color: '#334155', fontVariantNumeric: 'tabular-nums' }}>
-                                    {snap.date ? snap.date.slice(5).replace('-', '/') : '-'}
-                                </span>
-                                <span style={{ fontSize: '12px', color: '#475569' }}>
-                                    {snap.room ? getRoomName(snap.room) : '-'}
-                                </span>
+                        <div key={roomKey} style={{ marginBottom: '10px' }}>
+                            {/* 섹션 헤더 */}
+                            <div style={{
+                                display: 'inline-flex', alignItems: 'center', gap: '6px',
+                                padding: '4px 10px', marginBottom: '7px',
+                                borderRadius: '8px', border: '1px solid #E5E7EB',
+                                background: '#F1F5F9'
+                            }}>
+                                <span style={{ fontSize: '12px', fontWeight: '600', color: '#334155' }}>{roomLabel}</span>
+                                <span style={{ fontSize: '11px', color: '#94A3B8' }}>{snaps.length} changes</span>
                             </div>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                                <span style={{ fontSize: '12px', color: '#94A3B8', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums' }}>
-                                    {formatPrice(snap.oldPrice)}
-                                </span>
-                                <span style={{ fontSize: '12px', color: '#94A3B8' }}>→</span>
-                                <span style={{ fontSize: '13px', fontWeight: '700', color: d > 0 ? '#16A34A' : d < 0 ? '#DC2626' : '#1D1D1F', fontVariantNumeric: 'tabular-nums' }}>
-                                    {formatPrice(snap.newPrice)}
-                                </span>
-                                <span
-                                    style={{
-                                        fontSize: '11px',
-                                        fontWeight: '700',
-                                        padding: '1px 7px',
-                                        borderRadius: '999px',
-                                        color: pct == null ? '#64748B' : pct > 0 ? '#166534' : pct < 0 ? '#B91C1C' : '#64748B',
-                                        background: pct == null ? '#E2E8F0' : pct > 0 ? '#DCFCE7' : pct < 0 ? '#FEE2E2' : '#E2E8F0'
-                                    }}
-                                >
-                                    {pct == null ? '-' : `${pct > 0 ? '+' : ''}${pct}%`}
-                                </span>
+                            {/* 카드 그리드 */}
+                            <div style={{
+                                display: 'grid',
+                                gridTemplateColumns: 'repeat(auto-fill, minmax(176px, 1fr))',
+                                gap: '7px'
+                            }}>
+                                {snaps.map((snap, sidx) => {
+                                    const d = snap.newPrice - snap.oldPrice;
+                                    const pct = snap.oldPrice > 0 ? Math.round(d / snap.oldPrice * 100) : null;
+                                    const cardKey = snap.date ? `${roomKey}__${snap.date}__${sidx}` : `${roomKey}__${sidx}`;
+                                    return (
+                                        <div key={cardKey} style={{
+                                            background: '#FFFFFF',
+                                            border: `1px solid ${isBeds24 ? '#FFE7BF' : '#E5E7EB'}`,
+                                            borderRadius: '10px',
+                                            padding: '8px 10px',
+                                            minHeight: '64px',
+                                            display: 'flex',
+                                            flexDirection: 'column',
+                                            justifyContent: 'space-between',
+                                            gap: '5px'
+                                        }}>
+                                            {/* 1행: 날짜 */}
+                                            <div>
+                                                <span style={{ fontSize: '12px', fontWeight: '700', color: '#334155', fontVariantNumeric: 'tabular-nums' }}>
+                                                    {snap.date ? snap.date.slice(5).replace('-', '/') : '-'}
+                                                </span>
+                                            </div>
+                                            {/* 2행: oldPrice → newPrice */}
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: '5px', flexWrap: 'wrap' }}>
+                                                <span style={{ fontSize: '11px', color: '#94A3B8', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums' }}>
+                                                    {formatPrice(snap.oldPrice)}
+                                                </span>
+                                                <span style={{ fontSize: '11px', color: '#CBD5E1' }}>→</span>
+                                                <span style={{ fontSize: '12px', fontWeight: '700', color: d > 0 ? '#16A34A' : d < 0 ? '#DC2626' : '#1D1D1F', fontVariantNumeric: 'tabular-nums' }}>
+                                                    {formatPrice(snap.newPrice)}
+                                                </span>
+                                            </div>
+                                            {/* 3행: % badge */}
+                                            <div>
+                                                <span style={{
+                                                    fontSize: '11px', fontWeight: '700',
+                                                    padding: '1px 7px', borderRadius: '999px',
+                                                    color: pct == null ? '#64748B' : pct > 0 ? '#166534' : pct < 0 ? '#B91C1C' : '#64748B',
+                                                    background: pct == null ? '#E2E8F0' : pct > 0 ? '#DCFCE7' : pct < 0 ? '#FEE2E2' : '#E2E8F0'
+                                                }}>
+                                                    {pct == null ? '-' : `${pct > 0 ? '+' : ''}${pct}%`}
+                                                </span>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
                             </div>
                         </div>
                     );
                 })}
             </div>
-        </div>
-    );
+        );
+    };
 
     // ─── 행 렌더러 (단일 Compact 스타일) ────────────────────────────────────
     const renderRows = (rows) => rows.map((log, idx) => {
@@ -769,14 +849,14 @@ function PriceChangeHistory() {
                         Price-Driven Booking Conversions
                     </div>
                     <div style={{ fontSize: '12px', color: '#64748B' }}>
-                        {reservationsLoading ? 'Loading reservations...' : `${conversionRows.length} matched bookings`}
+                        {reservationsLoading ? 'Loading reservations...' : `${filteredConversionRows.length} matched bookings`}
                     </div>
                 </div>
                 {reservationsLoading ? (
                     <div style={{ padding: '18px 16px', fontSize: '13px', color: '#94A3B8' }}>
                         Calculating attribution...
                     </div>
-                ) : conversionRows.length === 0 ? (
+                ) : filteredConversionRows.length === 0 ? (
                     <div style={{ padding: '18px 16px', fontSize: '13px', color: '#94A3B8' }}>
                         No matched booking found for current filters (rule: same room/date overlap and booking within 48h after price change).
                     </div>
@@ -796,9 +876,16 @@ function PriceChangeHistory() {
                                 </tr>
                             </thead>
                             <tbody>
-                                {conversionRows.map((row) => (
+                                {filteredConversionRows.map((row) => (
                                     <tr key={row.key} style={{ borderBottom: '1px solid #F1F5F9' }}>
-                                        <td style={{ padding: '8px 10px', color: '#0F172A', fontVariantNumeric: 'tabular-nums' }}>{formatDateTime(row.bookingAtMs)}</td>
+                                        <td style={{ padding: '8px 10px', color: '#0F172A', fontVariantNumeric: 'tabular-nums' }}
+                                            title={row.bookingAtSource === 'date_only_fallback' ? 'Date-only booking — no exact booking time provided.' : undefined}>
+                                            {row.bookingAtSource === 'exact'
+                                                ? formatDateTime(row.bookingAtMs)
+                                                : row.bookingAtSource === 'date_only_fallback'
+                                                    ? <span>{formatDateOnly(row.bookingAtMs)}<span style={{ marginLeft: '4px', fontSize: '10px', color: '#94A3B8', fontWeight: '600' }}>(date only)</span></span>
+                                                    : '-'}
+                                        </td>
                                         <td style={{ padding: '8px 10px', color: '#0F172A' }}>
                                             <div style={{ fontWeight: '600' }}>{getBuildingName(row.building)}</div>
                                             <div style={{ fontSize: '11px', color: '#64748B' }}>{getRoomName(row.room)}</div>

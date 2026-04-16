@@ -147,6 +147,15 @@ function resolveWindowHours(log, defaultHours) {
 }
 
 export function parseReservationCreatedAtMs(reservation) {
+  // 0) Use pre-computed bookingCreatedAtMs persisted in Firestore (new documents)
+  if (Number.isFinite(reservation?.bookingCreatedAtMs)) {
+    const rawSrc = reservation?.bookingCreatedAtSource;
+    const source = rawSrc === 'bookDate_fallback' ? 'date_only_fallback'
+      : rawSrc === 'unknown' ? 'unknown'
+      : 'exact'; // 'bookingTime' | 'bookTime' | 'entryTime' → exact
+    return { ms: reservation.bookingCreatedAtMs, source };
+  }
+
   // 1) Prefer exact datetime fields from booking payloads.
   const datetimeCandidates = [
     reservation?.bookingTime,
@@ -156,7 +165,7 @@ export function parseReservationCreatedAtMs(reservation) {
 
   for (const candidate of datetimeCandidates) {
     const ms = toMillis(candidate);
-    if (Number.isFinite(ms)) return ms;
+    if (Number.isFinite(ms)) return { ms, source: 'exact' };
   }
 
   // 2) Fallback for date-only fields:
@@ -170,10 +179,10 @@ export function parseReservationCreatedAtMs(reservation) {
     const dayKey = toDateKey(candidate);
     if (!dayKey) continue;
     const ms = new Date(`${dayKey}T23:59:59+09:00`).getTime();
-    if (Number.isFinite(ms)) return ms;
+    if (Number.isFinite(ms)) return { ms, source: 'date_only_fallback' };
   }
 
-  return null;
+  return { ms: null, source: 'unknown' };
 }
 
 export function getReservationIdentityKey(reservation) {
@@ -201,14 +210,14 @@ export function buildPriceAttributionResult({
   const minBookingMs = minBookingDate ? toMillis(minBookingDate) : null;
   const occupancyEarliestCreatedAtByDate = {};
 
-  // --- DEBUG: �??�계�??�롭 ?�인 추적 ---
+  // --- DEBUG: �??�계�??�롭 ?�인 추적 ---
   const _dbgTotal = (interventions || []).length;
   const _dbgAfterSuccess = (interventions || []).filter((log) => log?.success !== false);
   const _dbgBeds24Count = _dbgAfterSuccess.filter((log) => String(log?.origin || "").toLowerCase().includes("beds24")).length;
   console.debug(`[Attribution] input=${_dbgTotal} | success_pass=${_dbgAfterSuccess.length} | beds24=${_dbgBeds24Count}`);
 
   const normalizedInterventions = _dbgAfterSuccess
-    // Beds24 직접 ?�정분도 ?�일 attribution 규칙 ?�용 (origin ?�한 ?�음)
+    // Beds24 직접 ?�정분도 ?�일 attribution 규칙 ?�용 (origin ?�한 ?�음)
     .map((log) => {
       const appliedAtMs = toMillis(log?.timestamp);
       const dateFrom = toDateKey(log?.dateFrom);
@@ -228,7 +237,7 @@ export function buildPriceAttributionResult({
         windowHours,
         windowMs: windowHours * 60 * 60 * 1000
       };
-      // Beds24 로그가 ?�드 부족으�??�롭?�는 경우 경고
+      // Beds24 로그가 ?�드 부족으�??�롭?�는 경우 경고
       const isBeds24 = String(log?.origin || "").toLowerCase().includes("beds24");
       if (isBeds24) {
         const dropReason = !Number.isFinite(appliedAtMs) ? "no_timestamp"
@@ -259,7 +268,7 @@ export function buildPriceAttributionResult({
     const reservationKey = getReservationIdentityKey(reservation);
     const building = String(reservation.building || "").trim();
     const room = String(reservation.room || "").trim();
-    const bookingCreatedAtMs = parseReservationCreatedAtMs(reservation);
+    const { ms: bookingCreatedAtMs, source: bookingCreatedAtSource } = parseReservationCreatedAtMs(reservation);
     const arrival = toDateKey(reservation.arrival);
     const departure = toDateKey(reservation.departure);
 
@@ -283,6 +292,7 @@ export function buildPriceAttributionResult({
       building,
       room,
       bookingCreatedAtMs,
+      bookingCreatedAtSource,
       arrival,
       departure
     };
@@ -299,7 +309,7 @@ export function buildPriceAttributionResult({
     });
   });
 
-  normalizedReservations.forEach(({ reservation, reservationKey, building, room, bookingCreatedAtMs, arrival, departure }) => {
+  normalizedReservations.forEach(({ reservation, reservationKey, building, room, bookingCreatedAtMs, bookingCreatedAtSource, arrival, departure }) => {
     if (!Number.isFinite(bookingCreatedAtMs)) return;
     if (Number.isFinite(minBookingMs) && bookingCreatedAtMs < minBookingMs) return;
 
@@ -342,6 +352,7 @@ export function buildPriceAttributionResult({
       reservation,
       intervention: best.log,
       bookingCreatedAtMs,
+      bookingCreatedAtSource,
       appliedAtMs: best.appliedAtMs,
       windowHours: best.windowHours,
       hoursToBooking
@@ -353,7 +364,7 @@ export function buildPriceAttributionResult({
 
   conversionList.sort((a, b) => b.bookingCreatedAtMs - a.bookingCreatedAtMs);
 
-  // --- DEBUG: 최종 conversion 결과 ?�약 ---
+  // --- DEBUG: 최종 conversion 결과 ?�약 ---
   const _dbgConvBeds24 = conversionList.filter((c) => String(c.intervention?.origin || "").toLowerCase().includes("beds24"));
   console.debug(`[Attribution] RESULT total_conversions=${conversionList.length} | beds24_conversions=${_dbgConvBeds24.length}`);
   if (_dbgConvBeds24.length > 0) {
