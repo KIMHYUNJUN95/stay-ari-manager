@@ -908,8 +908,8 @@ const getPlatformInitial = (platform) => {
 
 // 플랫폼별 색상
 const PLATFORM_COLORS = {
-  "Airbnb": "#FF1F5A",
-  "Booking": "#0054C8",
+  "Airbnb": "#F2A3A5",
+  "Booking": "#8FDCDD",
   "Expedia": "#FFC400",
   "Agoda": "#FF3B2E",
   "Direct": "#00C2F0",
@@ -1768,7 +1768,7 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
       return {
         date: dateStr,
         airbnb: pd ? (parseFloat(pd.p1) || 0) : null,
-        booking: pd ? (parseFloat(pd.p2) || 0) : null,
+        booking: pd ? Math.round(parseFloat(pd.p2) || 0) : null,
         unresolved
       };
     });
@@ -2821,6 +2821,7 @@ function BuildingCalendar() {
   const priceFetchControllerRef = useRef(null);
   const priceFetchRequestIdRef = useRef(0);
   const fetchPricesRef = useRef(null);
+  const isMountedRef = useRef(true); // unmount 후 상태 오염 방지
   const [lastPriceSyncByBuilding, setLastPriceSyncByBuilding] = useState({}); // 건물별 마지막 동기화 시각
   const selectedCellKeySetRef = useRef(new Set());
   const [viewMode, setViewMode] = useState("monthly"); // "monthly" | "rolling"
@@ -3259,8 +3260,18 @@ function BuildingCalendar() {
     }
   }, [viewMode, rollingStartDate, year, month, daysInMonth]);
 
-  // 롤링 뷰용 (다른 곳에서 사용)
-  const rollingDays = viewMode === "rolling" ? displayDays : [];
+  // 뷰 전환/로딩 구간 완충: displayDays가 비어있고 loading 중일 때만 이전 값 유지.
+  // loading이 끝난 뒤 빈 상태는 실제 빈 상태(잔상 없음)로 그대로 내려감.
+  const prevDisplayDaysRef = useRef([]);
+  if (displayDays.length > 0) {
+    prevDisplayDaysRef.current = displayDays;
+  }
+  const stableDisplayDays = displayDays.length > 0
+    ? displayDays
+    : (loading ? prevDisplayDaysRef.current : []);
+
+  // 롤링 뷰용 (다른 곳에서 사용) — stableDisplayDays 기반으로 헤더/본문 소스 일치
+  const rollingDays = viewMode === "rolling" ? stableDisplayDays : [];
 
   const renderCalendarDateHeader = () => (
     <div
@@ -3402,9 +3413,9 @@ function BuildingCalendar() {
   );
 
   const gapCoverageDays = useMemo(() => {
-    if (displayDays.length === 0) return [];
-    const firstDate = dayjs(displayDays[0].dateStr).subtract(1, 'day');
-    const lastDate = dayjs(displayDays[displayDays.length - 1].dateStr).add(1, 'day');
+    if (stableDisplayDays.length === 0) return [];
+    const firstDate = dayjs(stableDisplayDays[0].dateStr).subtract(1, 'day');
+    const lastDate = dayjs(stableDisplayDays[stableDisplayDays.length - 1].dateStr).add(1, 'day');
     const days = [];
     let cursor = firstDate;
     while (!cursor.isAfter(lastDate, 'day')) {
@@ -3415,7 +3426,7 @@ function BuildingCalendar() {
       cursor = cursor.add(1, 'day');
     }
     return days;
-  }, [displayDays]);
+  }, [stableDisplayDays]);
 
   const hasVisiblePriceCoverage = useCallback((buildingName, cacheData) => {
     if (!buildingName || buildingName === "전체" || !cacheData || Object.keys(cacheData).length === 0) {
@@ -3955,22 +3966,27 @@ function BuildingCalendar() {
           [fetchBuilding]: data.lastSync ? new Date(data.lastSync) : new Date()
         }));
       } else if (data.noCache) {
+        // noCache는 에러가 아님 — pricesError 올리지 않음
         console.warn("Price cache unavailable, waiting for sync...");
       } else {
+        // 논리 실패: stale 가드(line 위)를 통과한 최신 요청이므로 에러 반영
         console.error("Price fetch failed:", data.error || "Unknown error");
+        if (isMountedRef.current) {
+          setPricesError(true);
+        }
       }
     } catch (err) {
       if (err.name === "AbortError") {
-        // 의도적 취소 — 어떤 상태도 변경하지 않음 (finally는 여전히 실행됨)
+        // 의도적 취소 — pricesError를 건드리지 않음 (finally는 여전히 실행됨)
         return;
       }
       console.error("Price fetch error:", err);
-      // stale 요청의 에러가 현재 UI 상태를 덮지 않도록 requestId 확인
-      if (requestId === priceFetchRequestIdRef.current) {
+      // stale 요청 또는 unmount 후에는 상태 변경 금지
+      if (requestId === priceFetchRequestIdRef.current && isMountedRef.current) {
         setPricesError(true);
       }
     } finally {
-      if (requestId === priceFetchRequestIdRef.current) {
+      if (requestId === priceFetchRequestIdRef.current && isMountedRef.current) {
         pricesLoadingRef.current = false;
         setPricesLoading(false);
         if (priceFetchControllerRef.current === controller) {
@@ -3986,9 +4002,12 @@ function BuildingCalendar() {
     fetchPricesRef.current = fetchPrices;
   }, [fetchPrices]);
 
-  // unmount 시 진행 중인 가격 요청 abort (stale 응답이 상태를 건드리지 않도록)
+  // unmount 시 진행 중인 가격 요청 abort + isMounted 플래그 해제
+  // setup에서 true 복구 → StrictMode(dev) setup→cleanup→setup 재실행에서도 정상 동작
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
       priceFetchControllerRef.current?.abort();
       priceFetchControllerRef.current = null;
     };
@@ -4224,7 +4243,7 @@ function BuildingCalendar() {
   }, [fetchReservations]);
 
   const externalInventoryBlocks = useMemo(() => {
-    if (!calendarBuilding || calendarBuilding === '전체' || displayDays.length === 0 || rooms.length === 0) return [];
+    if (!calendarBuilding || calendarBuilding === '전체' || stableDisplayDays.length === 0 || rooms.length === 0) return [];
 
     const blocks = [];
 
@@ -4232,7 +4251,7 @@ function BuildingCalendar() {
       let blockStart = null;
       let lastBlockedDate = null;
 
-      displayDays.forEach((dayInfo, index) => {
+      stableDisplayDays.forEach((dayInfo, index) => {
         const dateStr = dayInfo.dateStr;
         const hasExistingReservation = reservations.some((r) =>
           r.room === room &&
@@ -4245,7 +4264,7 @@ function BuildingCalendar() {
         );
 
         const isInventoryBlocked = !hasExistingReservation && isBeds24InventoryBlackoutForDate(room, dateStr);
-        const isLastDay = index === displayDays.length - 1;
+        const isLastDay = index === stableDisplayDays.length - 1;
 
         if (isInventoryBlocked) {
           if (!blockStart) blockStart = dateStr;
@@ -4278,7 +4297,7 @@ function BuildingCalendar() {
     });
 
     return blocks;
-  }, [calendarBuilding, companyId, displayDays, isBeds24InventoryBlackoutForDate, reservations, rooms]);
+  }, [calendarBuilding, companyId, stableDisplayDays, isBeds24InventoryBlackoutForDate, reservations, rooms]);
 
   const isSameCalendarBlock = useCallback((left, right) => {
     if (!left || !right) return false;
@@ -4326,8 +4345,8 @@ function BuildingCalendar() {
     const byRoom = {};
     const byRoomUnit = {};
     const visibleByRoom = {};
-    const viewStart = displayDays[0]?.dateStr;
-    const viewEnd = displayDays[displayDays.length - 1]?.dateStr;
+    const viewStart = stableDisplayDays[0]?.dateStr;
+    const viewEnd = stableDisplayDays[stableDisplayDays.length - 1]?.dateStr;
     const viewEndExclusive = viewEnd ? dayjs(viewEnd).add(1, 'day').format('YYYY-MM-DD') : null;
 
     rooms.forEach((room) => {
@@ -4363,7 +4382,7 @@ function BuildingCalendar() {
     });
 
     return { byRoom, byRoomUnit, visibleByRoom };
-  }, [calendarBuilding, calendarReservations, displayDays, roomCatalogByName, rooms]);
+  }, [calendarBuilding, calendarReservations, stableDisplayDays, roomCatalogByName, rooms]);
 
   // 객실별 전체 예약 목록 (gap/인접 날짜 계산을 위해 더 넓은 범위 포함)
   const roomAllReservationsMap = useMemo(() => {
@@ -4668,7 +4687,7 @@ function BuildingCalendar() {
     rooms.forEach(room => {
       const allRes = roomAllReservationsMap[room] || [];
       if (allRes.length === 0) return;
-      displayDays.forEach(dayInfo => {
+      stableDisplayDays.forEach(dayInfo => {
         const { isOneNightMinStayGap } = getCheckInGapInfo(room, dayInfo.dateStr);
         if (isOneNightMinStayGap) {
           set.add(`${room}__${dayInfo.dateStr}`);
@@ -4676,7 +4695,7 @@ function BuildingCalendar() {
       });
     });
     return set;
-  }, [rooms, roomAllReservationsMap, displayDays, getCheckInGapInfo, selectedBuilding]);
+  }, [rooms, roomAllReservationsMap, stableDisplayDays, getCheckInGapInfo, selectedBuilding]);
 
   // [Single View] 건물 통계 데이터 계산
   const analysis = useMemo(() => {
@@ -4710,8 +4729,8 @@ function BuildingCalendar() {
     let minPrice = Infinity;
     let maxPrice = 0;
     if (calendarBuilding && calendarBuilding !== '전체') {
-      // displayDays 기준으로 현재 화면에 보이는 날짜만 추려냄
-      for (const { dateStr } of displayDays) {
+      // stableDisplayDays 기준으로 현재 화면에 보이는 날짜만 추려냄
+      for (const { dateStr } of stableDisplayDays) {
         const dateKey = dateStr.replace(/-/g, '');
 
         for (const roomName of rooms) {
@@ -4735,12 +4754,12 @@ function BuildingCalendar() {
       }
     }
     return { minPrice: minPrice === Infinity ? 0 : minPrice, maxPrice };
-  }, [calendarBuilding, roomReservationsMap, rooms, displayDays, roomPrices, getActiveUnitInfosForDate]);
+  }, [calendarBuilding, roomReservationsMap, rooms, stableDisplayDays, roomPrices, getActiveUnitInfosForDate]);
 
   // analysis 객실에 min/max 업데이트 (Single View 전용 편의)
   const singleAnalysis = { ...analysis, ...priceStats };
   const weekdayWeekendRateSummary = useMemo(() => {
-    if (!calendarBuilding || calendarBuilding === "전체" || displayDays.length === 0) {
+    if (!calendarBuilding || calendarBuilding === "전체" || stableDisplayDays.length === 0) {
       return {
         weekdayAvg: 0,
         weekendAvg: 0,
@@ -4754,7 +4773,7 @@ function BuildingCalendar() {
     let weekdayCells = 0;
     let weekendCells = 0;
 
-    displayDays.forEach(({ date, dateStr }) => {
+    stableDisplayDays.forEach(({ date, dateStr }) => {
       const dateKey = dateStr.replace(/-/g, "");
       const isWeekend = [0, 5, 6].includes(date.getDay()); // 금/토/일
 
@@ -4785,7 +4804,7 @@ function BuildingCalendar() {
       weekdayCells,
       weekendCells
     };
-  }, [calendarBuilding, displayDays, rooms, getActiveUnitInfosForDate, roomPrices]);
+  }, [calendarBuilding, stableDisplayDays, rooms, getActiveUnitInfosForDate, roomPrices]);
   const displayedAvgPrice = useMemo(() => {
     const totalCells = weekdayWeekendRateSummary.weekdayCells + weekdayWeekendRateSummary.weekendCells;
     if (totalCells <= 0) return 0;
@@ -4824,7 +4843,7 @@ function BuildingCalendar() {
       const metricsByType = { weekday: {}, weekend: {} };
       let sampleCells = 0;
 
-      displayDays.forEach(({ date, dateStr }) => {
+      stableDisplayDays.forEach(({ date, dateStr }) => {
         if (dateStr < todayStr) return;
         const dateKey = dateStr.replace(/-/g, "");
         const typeKey = [0, 5, 6].includes(date.getDay()) ? "weekend" : "weekday";
@@ -4879,22 +4898,22 @@ function BuildingCalendar() {
     });
 
     return { byBuilding };
-  }, [displayDays, reservations, roomPrices]);
+  }, [stableDisplayDays, reservations, roomPrices]);
   const commissionSummary = useMemo(() => {
     if (!calendarBuilding || calendarBuilding === "전체") return { airbnb: 0, booking: 0, total: 0 };
     const buildingReservations = calendarReservations.filter((reservation) => reservation.building === calendarBuilding);
-    return calculateCommissionSummary(buildingReservations, displayDays);
-  }, [calendarBuilding, calendarReservations, displayDays]);
+    return calculateCommissionSummary(buildingReservations, stableDisplayDays);
+  }, [calendarBuilding, calendarReservations, stableDisplayDays]);
   const arrivalCountSummary = useMemo(() => {
     if (!calendarBuilding || calendarBuilding === "전체") return { airbnb: 0, booking: 0, direct: 0, total: 0 };
     const buildingReservations = calendarReservations.filter((reservation) => reservation.building === calendarBuilding);
-    return calculateArrivalCountSummary(buildingReservations, displayDays);
-  }, [calendarBuilding, calendarReservations, displayDays]);
+    return calculateArrivalCountSummary(buildingReservations, stableDisplayDays);
+  }, [calendarBuilding, calendarReservations, stableDisplayDays]);
   const futureVacancySummary = useMemo(() => {
     if (!calendarBuilding || calendarBuilding === "전체") return { vacantRoomNights: 0, totalRoomNights: 0, days: 0, avgVacantRooms: 0 };
 
     const todayStr = dayjs().format("YYYY-MM-DD");
-    const futureDays = displayDays.filter((dayInfo) => dayInfo.dateStr >= todayStr);
+    const futureDays = stableDisplayDays.filter((dayInfo) => dayInfo.dateStr >= todayStr);
     let vacantRoomNights = 0;
 
     futureDays.forEach(({ dateStr }) => {
@@ -4920,7 +4939,7 @@ function BuildingCalendar() {
       days: futureDays.length,
       avgVacantRooms: futureDays.length > 0 ? vacantRoomNights / futureDays.length : 0
     };
-  }, [calendarBuilding, displayDays, roomReservationsMap, rooms]);
+  }, [calendarBuilding, stableDisplayDays, roomReservationsMap, rooms]);
 
 
 
@@ -5000,6 +5019,10 @@ function BuildingCalendar() {
     let platformColor = getPlatformColor(reservation.platform);
     if (isCancelled) platformColor = "#8E8E93";
     if (isBlackout) platformColor = "#1D1D1F"; // Blackout은 검정색
+    // pastel 배경에서 대비 확보: Airbnb/Booking은 진한 네이비-슬레이트 텍스트 사용
+    const barTextColor = platformColor === PLATFORM_COLORS.Airbnb ? "#5C2022"
+      : platformColor === PLATFORM_COLORS.Booking ? "#134648"
+      : "white";
     const guestName = reservation.guestName || "Reservation";
     let displayText = isInventoryLikeBlock
       ? "[Beds24 Block]"
@@ -5025,18 +5048,17 @@ function BuildingCalendar() {
       : 40;
     const barSlotHeight = reservationTrackHeight / Math.max(totalCount, 1);
     const barHeight = totalCount > 1
-      ? Math.max(9, Math.floor(barSlotHeight) - 2)
-      : reservationTrackHeight;
+      ? Math.max(7, Math.floor(barSlotHeight) - 4)
+      : Math.max(10, reservationTrackHeight - 6);
+    // 슬롯 중앙 정렬: beds24 detail은 픽셀 오프셋, 일반 뷰는 슬롯 중심 %
     const barTop = showBeds24DetailView
-      ? `${BEDS24_DETAIL_RESERVATION_TRACK_TOP + (barIndex * barSlotHeight)}px`
+      ? `${BEDS24_DETAIL_RESERVATION_TRACK_TOP + Math.floor((barSlotHeight - barHeight) / 2) + (barIndex * barSlotHeight)}px`
       : totalCount > 1
-        ? `${(barIndex / totalCount) * 100}%`
+        ? `${((barIndex + 0.5) / totalCount) * 100}%`
         : "50%";
     const barTransform = showBeds24DetailView
       ? "none"
-      : totalCount > 1
-        ? "none"
-        : "translateY(-50%)";
+      : "translateY(-50%)";
 
     const isManualCheckoutTargetActive = !!selectionStart && !priceMode && !gapEditMode && selectionStart.room === reservation.room;
     const allowPriceEditThroughBlock = !!priceMode && (isBlackout || isInventoryLikeBlock);
@@ -5065,13 +5087,13 @@ function BuildingCalendar() {
           backgroundColor: platformColor,
           border: isCancelled
             ? "1.5px dashed rgba(255,255,255,0.5)"
-            : (isPriceDrivenSuccess ? "2px solid #10B981" : "none"),
+            : (isPriceDrivenSuccess ? "2px solid #1E3A8A" : "none"),
           opacity: isCancelled ? 0.56 : (allowPriceEditThroughBlock ? 0.3 : (isPastReservation ? 0.44 : (showBeds24DetailView ? 0.94 : 1))),
-          borderRadius: showBeds24DetailView ? "5px" : "8px",
-          color: "white",
+          borderRadius: "999px",
+          color: barTextColor,
           fontSize: showBeds24DetailView ? "9px" : "11px",
           fontWeight: showBeds24DetailView ? "600" : "700",
-          padding: showBeds24DetailView ? "1px 6px" : "4px 10px",
+          padding: showBeds24DetailView ? "1px 8px" : "3px 12px",
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
@@ -5079,10 +5101,10 @@ function BuildingCalendar() {
           boxShadow: isCancelled
             ? "none"
             : (isPriceDrivenSuccess
-              ? "0 0 0 1px #10B981, 0 4px 12px rgba(16, 185, 129, 0.3)"
+              ? "0 0 0 1px #1E3A8A, 0 4px 12px rgba(30, 58, 138, 0.28)"
               : (showBeds24DetailView
                 ? "0 1px 4px rgba(15, 23, 42, 0.14)"
-                : "0 4px 8px rgba(0,0,0,0.15), inset 0 1px 1px rgba(255,255,255,0.2)")),
+                : "0 1px 3px rgba(15,23,42,0.10)")),
           transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
           zIndex: isCancelled ? 5 : (isBlackout ? 6 : 10),
           backgroundImage: isBlackout
@@ -5099,13 +5121,11 @@ function BuildingCalendar() {
           if (isEditMode || isManualCheckoutTargetActive || isInventoryLikeBlock || allowPriceEditThroughBlock) return;
           const hoverTransform = showBeds24DetailView
             ? "translateY(-1px) scale(1.01)"
-            : totalCount > 1
-              ? "scale(1.01)"
-              : "translateY(-50%) translateY(-1px) scale(1.01)";
+            : "translateY(-50%) scale(1.005)";
           e.currentTarget.style.transform = hoverTransform;
           e.currentTarget.style.boxShadow = showBeds24DetailView
             ? "0 2px 8px rgba(15, 23, 42, 0.18)"
-            : "0 6px 12px rgba(0,0,0,0.25), inset 0 1px 1px rgba(255,255,255,0.3)";
+            : "0 2px 6px rgba(15,23,42,0.14)";
           e.currentTarget.style.zIndex = 25;
         }}
         onMouseLeave={(e) => {
@@ -5114,10 +5134,10 @@ function BuildingCalendar() {
           e.currentTarget.style.boxShadow = isCancelled
             ? "none"
             : (isPriceDrivenSuccess
-              ? "0 0 0 1px #10B981, 0 4px 12px rgba(16, 185, 129, 0.3)"
+              ? "0 0 0 1px #1E3A8A, 0 4px 12px rgba(30, 58, 138, 0.28)"
               : (showBeds24DetailView
                 ? "0 1px 4px rgba(15, 23, 42, 0.14)"
-                : "0 4px 8px rgba(0,0,0,0.15), inset 0 1px 1px rgba(255,255,255,0.2)"));
+                : "0 1px 3px rgba(15,23,42,0.10)"));
           e.currentTarget.style.zIndex = isCancelled ? 5 : (isBlackout ? 6 : 10);
         }}
         title={`${isPriceDrivenSuccess ? `[PRICE SUCCESS] Booked ${attributedConversion?.hoursToBooking ?? "-"}h after a manual price update.\n` : ""}${
@@ -5371,8 +5391,8 @@ function BuildingCalendar() {
                   }}>›</button>
                 </div>
 
-                {/* ✅ 캘린더 슬라이드 */}
-                {loading ? (
+                {/* ✅ 캘린더 슬라이드 — 첫 로드(stableDisplayDays 없음)일 때만 스피너, 전환 시엔 기존 화면 유지 */}
+                {loading && stableDisplayDays.length === 0 ? (
                   <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '10px' }}>
                     <div style={{
                       width: '28px', height: '28px', borderRadius: '50%',
@@ -8161,7 +8181,7 @@ function BuildingCalendar() {
                   height: isCalendarFullscreen ? "12px" : "14px",
                   borderRadius: isCalendarFullscreen ? "3px" : "4px",
                   background: PLATFORM_COLORS.Airbnb,
-                  boxShadow: "0 2px 4px rgba(255, 56, 92, 0.3)"
+                  boxShadow: "0 2px 4px rgba(242, 163, 165, 0.5)"
                 }}></span>
                 <span style={{ fontWeight: "500" }}>Airbnb</span>
               </span>
@@ -8171,7 +8191,7 @@ function BuildingCalendar() {
                   height: isCalendarFullscreen ? "12px" : "14px",
                   borderRadius: isCalendarFullscreen ? "3px" : "4px",
                   background: PLATFORM_COLORS.Booking,
-                  boxShadow: "0 2px 4px rgba(0, 53, 128, 0.3)"
+                  boxShadow: "0 2px 4px rgba(143, 220, 221, 0.5)"
                 }}></span>
                 <span style={{ fontWeight: "500" }}>Booking</span>
               </span>
@@ -8193,7 +8213,7 @@ function BuildingCalendar() {
           minHeight: isCalendarFullscreen ? '0' : undefined,
           flex: isCalendarFullscreen ? 1 : undefined
         }}>
-          {loading ? (
+          {loading && stableDisplayDays.length === 0 ? (
             <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: "#86868B" }}>
               <div style={{ textAlign: 'center' }}>
                 <div style={{
@@ -8266,7 +8286,8 @@ function BuildingCalendar() {
                       borderBottom: "1px solid #F3F4F6",
                       minHeight: showBeds24DetailView ? `${BEDS24_DETAIL_ROW_HEIGHT}px` : priceMode ? "60px" : "52px",
                       position: "relative",
-                      transition: 'background 0.2s'
+                      transition: 'background 0.2s',
+                      marginBottom: roomIndex < visibleRooms.length - 1 ? (isMobile ? "2px" : "4px") : "0"
                     }}
                     onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#F9FAFB'}
                     onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
@@ -8425,7 +8446,7 @@ function BuildingCalendar() {
                       minWidth: 0
                     }}>
                       {/* 날짜 셀 배열 */}
-                      {displayDays.map((dayInfo, i) => {
+                      {stableDisplayDays.map((dayInfo, i) => {
                         const day = dayInfo.day;
                         const date = dayInfo.date;
                         const isToday = new Date().toDateString() === date.toDateString();
@@ -9240,11 +9261,11 @@ function BuildingCalendar() {
             <span style={{ fontWeight: "500" }}>Click on a reservation bar to view details</span>
             <div style={{ width: "1px", height: "20px", background: "#E5E7EB" }}></div>
             <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-              <span style={{ width: "16px", height: "16px", borderRadius: "5px", background: PLATFORM_COLORS.Airbnb, boxShadow: "0 2px 4px rgba(255, 56, 92, 0.3)" }}></span>
+              <span style={{ width: "16px", height: "16px", borderRadius: "5px", background: PLATFORM_COLORS.Airbnb, boxShadow: "0 2px 4px rgba(242, 163, 165, 0.5)" }}></span>
               <span style={{ fontWeight: "500" }}>Airbnb</span>
             </span>
             <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-              <span style={{ width: "16px", height: "16px", borderRadius: "5px", background: PLATFORM_COLORS.Booking, boxShadow: "0 2px 4px rgba(0, 53, 128, 0.3)" }}></span>
+              <span style={{ width: "16px", height: "16px", borderRadius: "5px", background: PLATFORM_COLORS.Booking, boxShadow: "0 2px 4px rgba(143, 220, 221, 0.5)" }}></span>
               <span style={{ fontWeight: "500" }}>Booking</span>
             </span>
             <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
