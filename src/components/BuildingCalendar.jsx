@@ -5212,6 +5212,27 @@ function BuildingCalendar() {
     );
   };
 
+  // 모바일 주간 점유율 — 렌더 외부 useMemo로 분리 (rooms × 7 × reservations 반복 계산 방지)
+  const { mobileWeekBookedCount, mobileWeekTotalCells, mobileWeekOccupancyPct } = useMemo(() => {
+    const rooms = selectedBuilding !== '전체' ? (BUILDING_DATA[selectedBuilding] || []) : [];
+    const days = Array.from({ length: 7 }, (_, i) => mobileWeekStart.add(i, 'day'));
+    const weekDateStrs = days.map(d => d.format('YYYY-MM-DD'));
+    const bookedCount = rooms.reduce((acc, rm) => {
+      return acc + weekDateStrs.filter(dStr =>
+        reservations.some(r =>
+          r.room === rm && r.status !== 'cancelled' &&
+          r.arrival <= dStr && r.departure > dStr
+        )
+      ).length;
+    }, 0);
+    const totalCells = rooms.length * 7;
+    return {
+      mobileWeekBookedCount: bookedCount,
+      mobileWeekTotalCells: totalCells,
+      mobileWeekOccupancyPct: totalCells > 0 ? Math.round(bookedCount / totalCells * 100) : 0
+    };
+  }, [selectedBuilding, mobileWeekStart, reservations]);
+
   return (
     <>
       <style>{`
@@ -5341,19 +5362,6 @@ function BuildingCalendar() {
             return priceData ? (parseFloat(priceData.p1) || 0) : 0;
           };
 
-          // 하루짜리 예약 처리 (아래 로직 배치)
-          const weekBookedCount = mobileRooms.reduce((acc, rm) => {
-            return acc + weekDays.filter(d => {
-              const dStr = d.format('YYYY-MM-DD');
-              return reservations.some(r =>
-                r.room === rm && r.status !== 'cancelled' &&
-                r.arrival <= dStr && r.departure > dStr
-              );
-            }).length;
-          }, 0);
-          const weekTotalCells = mobileRooms.length * 7;
-          const occupancyPct = weekTotalCells > 0 ? Math.round(weekBookedCount / weekTotalCells * 100) : 0;
-
           return (
             <div style={{
               display: 'flex', flexDirection: 'column', height: 'calc(100vh - 140px)',
@@ -5424,9 +5432,9 @@ function BuildingCalendar() {
                       {mobileRooms.length > 0 && (
                         <span style={{
                           fontSize: '10px', fontWeight: '600',
-                          background: occupancyPct >= 80 ? '#C07070' : occupancyPct >= 50 ? '#C09040' : '#6A9E78',
+                          background: mobileWeekOccupancyPct >= 80 ? '#C07070' : mobileWeekOccupancyPct >= 50 ? '#C09040' : '#6A9E78',
                           color: '#fff', borderRadius: '6px', padding: '1px 5px',
-                        }}>{occupancyPct}%</span>
+                        }}>{mobileWeekOccupancyPct}%</span>
                       )}
                     </div>
                   </div>
