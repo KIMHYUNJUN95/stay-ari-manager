@@ -1726,7 +1726,7 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
     if (stayDates.length === 0) return null;
     const rows = stayDates.map(dateStr => {
       const dateKey = dateStr.replace(/-/g, '');
-      let candidates = unitInfos;
+      let activeCandidates = unitInfos;
       let unresolved = false;
       if (unitInfos.length > 1) {
         const active = unitInfos.filter(info => {
@@ -1736,18 +1736,22 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
           return Number.isFinite(ms) && ms >= 1 && ms < INACTIVE_MINSTAY_THRESHOLD;
         });
         if (active.length > 0) {
-          candidates = active;
+          activeCandidates = active;
         } else {
           unresolved = true; // active room 없음 → stale fallback 방식
         }
       }
-      const pd = !unresolved && candidates[0]
-        ? modalPriceSource[String(candidates[0].roomId)]?.dates?.[dateKey]
-        : null;
+      const merged = getMergedRoomChannelPrices({
+        primaryUnitInfos: activeCandidates,
+        fallbackUnitInfos: unitInfos,
+        roomPrices: modalPriceSource,
+        dateKey,
+        preferAirbnbPrice3: false
+      });
       return {
         date: dateStr,
-        airbnb: pd ? (parseFloat(pd.p1) || 0) : null,
-        booking: pd ? Math.round(parseFloat(pd.p2) || 0) : null,
+        airbnb: merged.airbnbPrice > 0 ? Math.round(merged.airbnbPrice) : null,
+        booking: merged.bookingPrice > 0 ? Math.round(merged.bookingPrice) : null,
         unresolved
       };
     });
