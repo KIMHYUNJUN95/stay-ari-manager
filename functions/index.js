@@ -540,9 +540,9 @@ function enrichReservationDocument(data, {
         enriched.cancelTime = sourceLastModified;
     }
 
-    if (!enriched.guestComments && enriched.comments) {
-        enriched.guestComments = extractHumanNotes(enriched);
-    }
+    // sync 시마다 재정제: 기존 noisy guestComments도 점진 정리
+    // 후보 우선순위: guestComments(기존값) > comments > notes
+    enriched.guestComments = extractHumanNotes(enriched);
 
     enriched.outputImpact = buildReservationOutputImpact(enriched);
     enriched.integrity = buildReservationIntegrityInfo(enriched);
@@ -1111,29 +1111,41 @@ function isSystemPolicyLine(line) {
 }
 
 // 예약 raw 데이터에서 사람이 쓴 메모만 추출
+// 줄 단위 통삭제 대신 세그먼트 단위 필터 — 정책+요청 혼합 줄에서도 요청 보존
 function extractHumanNotes(b) {
-    // 후보 필드 순서대로 수집 (중복 제거)
+    // 후보 필드 순서대로 수집 (중복 제거): 수기 기입값(guestComments) 우선
     const seen = new Set();
     const candidates = [];
-    for (const val of [b.comments, b.guestComments, b.notes]) {
+    for (const val of [b.guestComments, b.comments, b.notes]) {
         const s = String(val || "").trim();
         if (s && !seen.has(s)) { seen.add(s); candidates.push(s); }
     }
     if (candidates.length === 0) return "";
 
-    // 줄 단위 분리 후 시스템 문구 제거
-    const lines = [];
-    const seenLines = new Set();
+    const resultLines = [];
+    const seenSegs = new Set();
+
     for (const block of candidates) {
         for (const rawLine of block.split(/\r?\n/)) {
             const line = rawLine.trim();
-            if (!line || seenLines.has(line)) continue;
-            if (isSystemPolicyLine(line)) continue;
-            seenLines.add(line);
-            lines.push(line);
+            if (!line) continue;
+
+            // 세그먼트 단위 분리: `. ` `;` `•` `|` 기준
+            // 소수점/약어 오탐 방지를 위해 `.` 뒤에 공백이 오는 경우만 분리
+            // 전체 줄 선필터 없이 세그먼트 레벨에서만 판별 — 혼합 줄 보존
+            const segments = line.split(/[•|;]|\.\s+/);
+            const kept = [];
+            for (const seg of segments) {
+                const s = seg.trim();
+                if (!s || seenSegs.has(s)) continue;
+                if (isSystemPolicyLine(s)) continue;
+                seenSegs.add(s);
+                kept.push(s);
+            }
+            if (kept.length > 0) resultLines.push(kept.join(" "));
         }
     }
-    return lines.join("\n");
+    return resultLines.join("\n");
 }
 
 function normalize(b, propKey, building, companyId) {
