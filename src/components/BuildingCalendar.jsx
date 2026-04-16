@@ -3290,7 +3290,7 @@ function BuildingCalendar() {
   // 롤링 뷰용 (다른 곳에서 사용) — stableDisplayDays 기반으로 헤더/본문 소스 일치
   const rollingDays = viewMode === "rolling" ? stableDisplayDays : [];
 
-  const renderCalendarDateHeader = () => (
+  const calendarDateHeader = useMemo(() => (
     <div
       style={{
         display: "flex",
@@ -3427,7 +3427,7 @@ function BuildingCalendar() {
         })
       )}
     </div>
-  );
+  ), [showBeds24DetailView, viewMode, daysInMonth, year, month, rollingDays, selectedDateSet]);
 
   const gapCoverageDays = useMemo(() => {
     if (stableDisplayDays.length === 0) return [];
@@ -8418,7 +8418,7 @@ function BuildingCalendar() {
                       overflowY: "visible"
                     }}
                   >
-                    {renderCalendarDateHeader()}
+                    {calendarDateHeader}
                   </div>
                 </div>
               )}
@@ -8445,7 +8445,7 @@ function BuildingCalendar() {
                     zIndex: 100,
                     boxShadow: "0 1px 0 rgba(226, 232, 240, 0.9)"
                   }}>
-                    {renderCalendarDateHeader()}
+                    {calendarDateHeader}
                   </div>
                 )}
 
