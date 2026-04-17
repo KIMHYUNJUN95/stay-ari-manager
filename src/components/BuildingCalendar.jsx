@@ -4395,6 +4395,7 @@ function BuildingCalendar() {
     const byRoom = {};
     const byRoomUnit = {};
     const visibleByRoom = {};
+    const visibleByRoomVisual = {};
     const viewStart = stableDisplayDays[0]?.dateStr;
     const viewEnd = stableDisplayDays[stableDisplayDays.length - 1]?.dateStr;
     const viewEndExclusive = viewEnd ? dayjs(viewEnd).add(1, 'day').format('YYYY-MM-DD') : null;
@@ -4402,6 +4403,7 @@ function BuildingCalendar() {
     rooms.forEach((room) => {
       byRoom[room] = [];
       visibleByRoom[room] = [];
+      visibleByRoomVisual[room] = [];
       (roomCatalogByName[room] || []).forEach((info) => {
         byRoomUnit[`${room}__${String(info.roomId)}`] = [];
       });
@@ -4409,30 +4411,47 @@ function BuildingCalendar() {
 
     calendarReservations.forEach((reservation) => {
       if (!reservation || reservation.building !== calendarBuilding) return;
-      if (reservation.status === 'cancelled') return;
       if (!reservation.arrival || !reservation.departure) return;
 
+      const isCancelled = reservation.status === 'cancelled';
       const roomName = reservation.room;
-      if (roomName && byRoom[roomName]) {
-        byRoom[roomName].push(reservation);
 
-        if (viewStart && viewEndExclusive) {
-          const start = reservation.arrival > viewStart ? reservation.arrival : viewStart;
-          const endExclusive = reservation.departure < viewEndExclusive ? reservation.departure : viewEndExclusive;
-          if (dayjs(start).isBefore(dayjs(endExclusive))) {
-            visibleByRoom[roomName].push(reservation);
+      // 계산용 맵: 항상 cancelled 제외
+      if (!isCancelled) {
+        if (roomName && byRoom[roomName]) {
+          byRoom[roomName].push(reservation);
+
+          if (viewStart && viewEndExclusive) {
+            const start = reservation.arrival > viewStart ? reservation.arrival : viewStart;
+            const endExclusive = reservation.departure < viewEndExclusive ? reservation.departure : viewEndExclusive;
+            if (dayjs(start).isBefore(dayjs(endExclusive))) {
+              visibleByRoom[roomName].push(reservation);
+            }
           }
+        }
+
+        const unitKey = `${roomName}__${String(reservation.roomId || "")}`;
+        if (byRoomUnit[unitKey]) {
+          byRoomUnit[unitKey].push(reservation);
         }
       }
 
-      const unitKey = `${roomName}__${String(reservation.roomId || "")}`;
-      if (byRoomUnit[unitKey]) {
-        byRoomUnit[unitKey].push(reservation);
+      // 렌더용 맵: OFF→일반만, ON(Cancelled Only)→캔슬만
+      if (isCancelled === showCancelled) {
+        if (roomName && visibleByRoomVisual[roomName] !== undefined) {
+          if (viewStart && viewEndExclusive) {
+            const start = reservation.arrival > viewStart ? reservation.arrival : viewStart;
+            const endExclusive = reservation.departure < viewEndExclusive ? reservation.departure : viewEndExclusive;
+            if (dayjs(start).isBefore(dayjs(endExclusive))) {
+              visibleByRoomVisual[roomName].push(reservation);
+            }
+          }
+        }
       }
     });
 
-    return { byRoom, byRoomUnit, visibleByRoom };
-  }, [calendarBuilding, calendarReservations, stableDisplayDays, roomCatalogByName, rooms]);
+    return { byRoom, byRoomUnit, visibleByRoom, visibleByRoomVisual };
+  }, [calendarBuilding, calendarReservations, stableDisplayDays, roomCatalogByName, rooms, showCancelled]);
 
   // 객실별 전체 예약 목록 (gap/인접 날짜 계산을 위해 더 넓은 범위 포함)
   const roomAllReservationsMap = useMemo(() => {
@@ -4444,9 +4463,14 @@ function BuildingCalendar() {
     return calendarReservationIndex.byRoomUnit;
   }, [calendarReservationIndex]);
 
-  // 객실별 예약 목록
+  // 객실별 예약 목록 (계산용 — cancelled 항상 제외)
   const roomReservationsMap = useMemo(() => {
     return calendarReservationIndex.visibleByRoom;
+  }, [calendarReservationIndex]);
+
+  // 객실별 예약 목록 (렌더용 — showCancelled=true면 cancelled 포함)
+  const roomReservationsMapVisual = useMemo(() => {
+    return calendarReservationIndex.visibleByRoomVisual;
   }, [calendarReservationIndex]);
 
   // 해당 room/date에 예약이 있는지 확인 — 대량 선택 필터용 (roomReservationsMap 이후 선언)
@@ -5004,6 +5028,30 @@ function BuildingCalendar() {
 
 
 
+  // Cancelled Only 모드: sweep line으로 각 바에 고정 lane 번호 사전 할당
+  const cancelledBarLaneMap = useMemo(() => {
+    if (!showCancelled) return { laneByKey: {}, maxByRoom: {} };
+    const laneByKey = {};
+    const maxByRoom = {};
+    Object.entries(roomReservationsMapVisual).forEach(([room, reservations]) => {
+      if (!reservations.length) { maxByRoom[room] = 1; return; }
+      const sorted = [...reservations].sort((a, b) =>
+        a.arrival < b.arrival ? -1 : a.arrival > b.arrival ? 1 :
+        a.departure < b.departure ? -1 : 1
+      );
+      const laneEnd = []; // laneEnd[i] = 해당 lane에 마지막으로 배정된 departure
+      sorted.forEach(r => {
+        const key = r.bookId || r.id || `${r.arrival}__${r.room}`;
+        let lane = laneEnd.findIndex(end => end <= r.arrival);
+        if (lane === -1) lane = laneEnd.length;
+        laneEnd[lane] = r.departure;
+        laneByKey[key] = lane;
+      });
+      maxByRoom[room] = Math.max(laneEnd.length, 1);
+    });
+    return { laneByKey, maxByRoom };
+  }, [showCancelled, roomReservationsMapVisual]);
+
   // 예약 바 렌더
   const renderReservationBar = (reservation) => {
 
@@ -5089,24 +5137,36 @@ function BuildingCalendar() {
       ? "[Beds24 Block]"
       : `${isCancelled ? "[Cancelled] " : ""}${isBlackout ? "[Block] " : ""}${guestName}`;
 
-    // ✅ 예약 감지: 같은 room에서 날짜가 겹치는 non-cancelled 예약 목록
-    const overlapGroup = (roomReservationsMap[reservation.room] || []).filter(r =>
-      r.status !== 'cancelled' &&
-      r.arrival < reservation.departure &&
-      r.departure > reservation.arrival
-    );
-    overlapGroup.sort((a, b) =>
-      a.arrival < b.arrival ? -1 : a.arrival > b.arrival ? 1 :
-      (a.bookId || a.id || '') < (b.bookId || b.id || '') ? -1 : 1
-    );
-    const totalCount = overlapGroup.length;
-    const overlapIndex = overlapGroup.findIndex(r =>
-      (r.bookId || r.id) === (reservation.bookId || reservation.id)
-    );
-    const barIndex = overlapIndex >= 0 ? overlapIndex : 0;
+    // ✅ 예약 감지: cancelled 바는 sweep lane 맵, 일반 바는 overlap group 방식
+    let totalCount, barIndex;
+    if (isCancelled && showCancelled) {
+      const laneKey = reservation.bookId || reservation.id || `${reservation.arrival}__${reservation.room}`;
+      barIndex = cancelledBarLaneMap.laneByKey[laneKey] ?? 0;
+      totalCount = cancelledBarLaneMap.maxByRoom[reservation.room] || 1;
+    } else {
+      const overlapGroup = (roomReservationsMap[reservation.room] || []).filter(r =>
+        r.status !== 'cancelled' &&
+        r.arrival < reservation.departure &&
+        r.departure > reservation.arrival
+      );
+      overlapGroup.sort((a, b) =>
+        a.arrival < b.arrival ? -1 : a.arrival > b.arrival ? 1 :
+        (a.bookId || a.id || '') < (b.bookId || b.id || '') ? -1 : 1
+      );
+      totalCount = overlapGroup.length;
+      const overlapIndex = overlapGroup.findIndex(r =>
+        (r.bookId || r.id) === (reservation.bookId || reservation.id)
+      );
+      barIndex = overlapIndex >= 0 ? overlapIndex : 0;
+    }
+    const cancelledRoomMax = isCancelled && showCancelled
+      ? (cancelledBarLaneMap.maxByRoom[reservation.room] || 1)
+      : 1;
     const reservationTrackHeight = showBeds24DetailView
       ? BEDS24_DETAIL_RESERVATION_TRACK_HEIGHT
-      : 40;
+      : isCancelled && showCancelled
+        ? Math.max(40, cancelledRoomMax * 22)
+        : 40;
     const barSlotHeight = reservationTrackHeight / Math.max(totalCount, 1);
     const barHeight = totalCount > 1
       ? Math.max(7, Math.floor(barSlotHeight) - 4)
@@ -6399,79 +6459,115 @@ function BuildingCalendar() {
           </div>
         )}
 
-        {/* 헤더 - Premium Design */}
+        {/* 카드 A: 타이틀 + 액션 버튼 */}
         <div style={{
+          background: "#FFFFFF",
+          border: "1px solid #E2E8F0",
+          borderRadius: "18px",
+          boxShadow: "0 6px 20px rgba(15, 23, 42, 0.06)",
+          padding: "20px 28px",
+          marginBottom: "12px",
           display: "flex",
           justifyContent: "space-between",
           alignItems: "center",
-          marginBottom: "24px",
-          paddingBottom: "20px",
-          borderBottom: "1px solid #E5E7EB"
+          gap: "16px",
+          flexWrap: "wrap"
         }}>
-          <div>
-            <h1 style={{
-              fontSize: "28px",
-              fontWeight: "700",
-              color: "#1E293B",
-              margin: 0,
-              marginBottom: "8px"
-            }}>
-              Room Calendar
-            </h1>
-            <p style={{
-              fontSize: "14px",
-              color: "#64748B",
-              margin: 0
-            }}>
-              Manage reservations and pricing for all properties
-            </p>
+          <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
+            {/* 인디고 포인트 바 */}
+            <div style={{
+              width: "4px",
+              height: "42px",
+              borderRadius: "4px",
+              background: "linear-gradient(180deg, #6366F1 0%, #4F46E5 100%)",
+              flexShrink: 0
+            }} />
+            <div>
+              <h1 style={{
+                fontSize: "30px",
+                fontWeight: "800",
+                color: "#0F172A",
+                margin: 0,
+                marginBottom: "4px",
+                letterSpacing: "-0.02em",
+                lineHeight: 1.15
+              }}>
+                Room Calendar
+              </h1>
+              <p style={{
+                fontSize: "15px",
+                color: "#64748B",
+                margin: 0,
+                fontWeight: "500"
+              }}>
+                Manage reservations and pricing for all properties
+              </p>
+            </div>
           </div>
-          <div style={{ display: "flex", gap: "12px" }}>
+          <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
         {!priceMode && (
               <>
-                <button
+                <div
+                  role="switch"
+                  aria-checked={showCancelled}
+                  tabIndex={0}
                   onClick={() => setShowCancelled(!showCancelled)}
+                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setShowCancelled(!showCancelled); } }}
                   style={{
-                    padding: "12px 20px",
-                    background: showCancelled
-                      ? "linear-gradient(135deg, #6B7280 0%, #4B5563 100%)"
-                      : "#F9FAFB",
-                    color: showCancelled ? "white" : "#374151",
-                    border: showCancelled ? "none" : "1px solid #E5E7EB",
-                    borderRadius: "12px",
-                    fontWeight: "600",
-                    fontSize: "13px",
-                    cursor: "pointer",
                     display: "flex",
                     alignItems: "center",
-                    gap: "8px",
-                    transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
-                    boxShadow: showCancelled ? "0 4px 12px rgba(107, 114, 128, 0.3)" : "none"
+                    gap: "10px",
+                    cursor: "pointer",
+                    userSelect: "none",
+                    minHeight: "40px",
+                    outline: "none",
+                    borderRadius: "999px",
+                    padding: "2px 4px",
                   }}
-                  onMouseEnter={(e) => {
-                    if (!showCancelled) {
-                      e.currentTarget.style.background = "#F3F4F6";
-                      e.currentTarget.style.borderColor = "#D1D5DB";
-                    }
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!showCancelled) {
-                      e.currentTarget.style.background = "#F9FAFB";
-                      e.currentTarget.style.borderColor = "#E5E7EB";
-                    }
-                  }}
+                  onFocus={(e) => { e.currentTarget.style.boxShadow = "0 0 0 3px rgba(79,70,229,0.22)"; }}
+                  onBlur={(e) => { e.currentTarget.style.boxShadow = "none"; }}
                 >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <circle cx="12" cy="12" r="10" />
-                    <line x1="4.93" y1="4.93" x2="19.07" y2="19.07" />
-                  </svg>
-                  {showCancelled ? "Hide Cancelled" : "Show Cancelled"}
-                </button>
+                  {/* 트랙 */}
+                  <div style={{
+                    position: "relative",
+                    width: "54px",
+                    height: "30px",
+                    borderRadius: "999px",
+                    background: showCancelled ? "#4F46E5" : "#CBD5E1",
+                    transition: "background 220ms ease",
+                    flexShrink: 0,
+                  }}>
+                    {/* 노브 */}
+                    <div style={{
+                      position: "absolute",
+                      top: "3px",
+                      left: "3px",
+                      width: "24px",
+                      height: "24px",
+                      borderRadius: "50%",
+                      background: "#FFFFFF",
+                      boxShadow: "0 2px 8px rgba(15,23,42,0.2)",
+                      transform: showCancelled ? "translateX(24px)" : "translateX(0px)",
+                      transition: "transform 220ms cubic-bezier(0.22, 1, 0.36, 1)",
+                    }} />
+                  </div>
+                  {/* 라벨 */}
+                  <span style={{
+                    fontSize: "13px",
+                    fontWeight: "600",
+                    color: showCancelled ? "#0F172A" : "#475569",
+                    transition: "color 220ms ease",
+                    whiteSpace: "nowrap",
+                  }}>
+                    {showCancelled ? "Cancelled Only" : "Show Cancelled"}
+                  </span>
+                </div>
 
                 <button
                   onClick={() => setShowManualBookingModal(true)}
                   style={{
-                    padding: "12px 24px",
+                    padding: "10px 22px",
+                    height: "42px",
                     background: "linear-gradient(135deg, #3B82F6 0%, #2563EB 100%)",
                     color: "white",
                     border: "none",
@@ -6479,22 +6575,25 @@ function BuildingCalendar() {
                     fontWeight: "600",
                     fontSize: "13px",
                     cursor: "pointer",
-                    boxShadow: "0 4px 14px rgba(59, 130, 246, 0.4)",
+                    boxShadow: "0 4px 14px rgba(59, 130, 246, 0.38)",
                     display: "flex",
                     alignItems: "center",
-                    gap: "8px",
-                    transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)"
+                    gap: "7px",
+                    transition: "all 0.2s ease",
+                    whiteSpace: "nowrap"
                   }}
                   onMouseEnter={(e) => {
                     e.currentTarget.style.transform = "translateY(-2px)";
-                    e.currentTarget.style.boxShadow = "0 8px 20px rgba(59, 130, 246, 0.5)";
+                    e.currentTarget.style.boxShadow = "0 8px 22px rgba(59, 130, 246, 0.48)";
                   }}
                   onMouseLeave={(e) => {
                     e.currentTarget.style.transform = "translateY(0)";
-                    e.currentTarget.style.boxShadow = "0 4px 14px rgba(59, 130, 246, 0.4)";
+                    e.currentTarget.style.boxShadow = "0 4px 14px rgba(59, 130, 246, 0.38)";
                   }}
+                  onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+                  onMouseUp={(e) => { e.currentTarget.style.transform = "translateY(-2px)"; }}
                 >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
                     <line x1="12" y1="5" x2="12" y2="19" />
                     <line x1="5" y1="12" x2="19" y2="12" />
                   </svg>
@@ -6505,16 +6604,23 @@ function BuildingCalendar() {
           </div>
         </div>
 
-        {/* 건물 탭 - Premium Design */}
+        {/* 카드 B: 건물 필터 칩 */}
         <div style={{
-          display: "flex",
-          gap: "10px",
-          marginBottom: "24px",
-          overflowX: "auto",
-          paddingBottom: "8px",
-          scrollbarWidth: "none",
-          msOverflowStyle: "none"
+          background: "#FFFFFF",
+          border: "1px solid #E2E8F0",
+          borderRadius: "16px",
+          boxShadow: "0 6px 20px rgba(15, 23, 42, 0.06)",
+          padding: "14px 20px",
+          marginBottom: "12px"
         }}>
+          <div style={{
+            display: "flex",
+            gap: "8px",
+            overflowX: "auto",
+            paddingBottom: "2px",
+            scrollbarWidth: "none",
+            msOverflowStyle: "none"
+          }}>
           {["전체", ...ACTIVE_BUILDING_ORDER].map(building => {
             const isActive = selectedBuilding === building;
             const isSold = isBuildingSold(building);
@@ -6533,43 +6639,50 @@ function BuildingCalendar() {
                   setSelectedBuilding(building);
                 }}
                 style={{
-                  padding: "12px 20px",
+                  padding: "9px 18px",
+                  minHeight: "40px",
                   borderRadius: "12px",
-                  border: isActive ? "none" : "1px solid #E5E7EB",
+                  border: isActive ? "none" : `1px solid ${isSold ? "#FECACA" : "#CBD5E1"}`,
                   background: isActive
-                    ? "linear-gradient(135deg, #1F2937 0%, #111827 100%)"
-                    : isSold ? "#FEF2F2" : "white",
-                  color: isActive ? "white" : isSold ? "#991B1B" : "#4B5563",
+                    ? "linear-gradient(135deg, #1E293B 0%, #0F172A 100%)"
+                    : isSold ? "#FEF2F2" : "#FFFFFF",
+                  color: isActive ? "white" : isSold ? "#991B1B" : "#334155",
                   fontWeight: "600",
                   fontSize: "13px",
                   cursor: "pointer",
                   whiteSpace: "nowrap",
-                  transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
+                  transition: "all 0.2s ease",
                   boxShadow: isActive
-                    ? "0 4px 14px rgba(31, 41, 55, 0.3)"
-                    : "0 1px 3px rgba(0,0,0,0.05)",
-                  position: "relative",
-                  overflow: "hidden"
+                    ? "0 8px 18px rgba(30, 41, 59, 0.22)"
+                    : "0 1px 2px rgba(15,23,42,0.04)",
+                  flexShrink: 0
                 }}
                 onMouseEnter={(e) => {
                   if (!isActive) {
-                    e.currentTarget.style.background = isSold ? "#FEE2E2" : "#F9FAFB";
-                    e.currentTarget.style.borderColor = "#D1D5DB";
+                    e.currentTarget.style.background = isSold ? "#FEE2E2" : "#F8FAFC";
+                    e.currentTarget.style.borderColor = isSold ? "#FCA5A5" : "#94A3B8";
                     e.currentTarget.style.transform = "translateY(-1px)";
+                    e.currentTarget.style.boxShadow = "0 4px 10px rgba(15,23,42,0.10)";
                   }
                 }}
                 onMouseLeave={(e) => {
                   if (!isActive) {
-                    e.currentTarget.style.background = isSold ? "#FEF2F2" : "white";
-                    e.currentTarget.style.borderColor = "#E5E7EB";
+                    e.currentTarget.style.background = isSold ? "#FEF2F2" : "#FFFFFF";
+                    e.currentTarget.style.borderColor = isSold ? "#FECACA" : "#CBD5E1";
                     e.currentTarget.style.transform = "translateY(0)";
+                    e.currentTarget.style.boxShadow = "0 1px 2px rgba(15,23,42,0.04)";
                   }
+                }}
+                onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+                onMouseUp={(e) => {
+                  if (!isActive) e.currentTarget.style.transform = "translateY(-1px)";
                 }}
               >
                 {getBuildingNameEN(building)}{isSold && " (Sold)"}
               </button>
             );
           })}
+          </div>
         </div>
 
         {/* 전체 선택 시 통계 표시 섹션 */}
@@ -7589,37 +7702,53 @@ function BuildingCalendar() {
             )}
           </div>
         )}
-        {/* 월 네비게이션 - Premium Design */}
+        {/* 툴바 카드: 월 네비게이션 + 뷰 컨트롤 */}
         <div style={{
           display: "flex",
           justifyContent: "space-between",
           alignItems: "center",
-          marginBottom: isCalendarFullscreen ? "8px" : "20px",
-          background: "white",
-          padding: isCalendarFullscreen ? "8px 12px" : "16px 24px",
+          marginBottom: isCalendarFullscreen ? "8px" : "16px",
+          background: "#FFFFFF",
+          padding: isCalendarFullscreen ? "8px 14px" : "14px 22px",
           borderRadius: isCalendarFullscreen ? "12px" : "16px",
-          boxShadow: isCalendarFullscreen ? "0 10px 22px rgba(15, 23, 42, 0.09)" : "0 4px 16px rgba(0,0,0,0.06)",
-          border: "1px solid #F3F4F6",
+          boxShadow: isCalendarFullscreen ? "0 10px 22px rgba(15, 23, 42, 0.09)" : "0 6px 20px rgba(15, 23, 42, 0.06)",
+          border: "1px solid #E2E8F0",
           flexShrink: 0
         }}>
-          <div style={{ display: "flex", gap: isCalendarFullscreen ? "6px" : "10px", alignItems: "center", flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: isCalendarFullscreen ? "6px" : "8px", alignItems: "center", flexWrap: "wrap" }}>
             {/* 뷰 모드 전환 버튼 */}
             <button
               onClick={toggleViewMode}
               style={{
-                padding: isCalendarFullscreen ? "7px 12px" : "10px 16px",
-                borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                border: viewMode === "rolling" ? "2px solid #7C3AED" : "1px solid #E5E7EB",
-                background: viewMode === "rolling" ? "linear-gradient(135deg, #EDE9FE 0%, #DDD6FE 100%)" : "white",
-                color: viewMode === "rolling" ? "#7C3AED" : "#4B5563",
+                padding: isCalendarFullscreen ? "7px 12px" : "9px 15px",
+                height: isCalendarFullscreen ? "34px" : "38px",
+                borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                border: viewMode === "rolling" ? "2px solid #7C3AED" : "1px solid #CBD5E1",
+                background: viewMode === "rolling" ? "linear-gradient(135deg, #EDE9FE 0%, #DDD6FE 100%)" : "#FFFFFF",
+                color: viewMode === "rolling" ? "#7C3AED" : "#334155",
                 cursor: "pointer",
                 fontWeight: "600",
                 fontSize: isCalendarFullscreen ? "12px" : "13px",
                 display: "flex",
                 alignItems: "center",
                 gap: isCalendarFullscreen ? "5px" : "6px",
-                transition: "all 0.2s"
+                transition: "all 0.2s ease",
+                boxShadow: "0 1px 2px rgba(15,23,42,0.05)"
               }}
+              onMouseEnter={(e) => {
+                if (viewMode !== "rolling") {
+                  e.currentTarget.style.borderColor = "#94A3B8";
+                  e.currentTarget.style.background = "#F8FAFC";
+                }
+              }}
+              onMouseLeave={(e) => {
+                if (viewMode !== "rolling") {
+                  e.currentTarget.style.borderColor = "#CBD5E1";
+                  e.currentTarget.style.background = "#FFFFFF";
+                }
+              }}
+              onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+              onMouseUp={(e) => { e.currentTarget.style.transform = "scale(1)"; }}
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
@@ -7630,7 +7759,7 @@ function BuildingCalendar() {
               {viewMode === "rolling" ? "30-Day View" : "Monthly"}
             </button>
 
-            <div style={{ width: "1px", height: isCalendarFullscreen ? "20px" : "24px", background: "#E5E7EB", margin: "0 4px" }}></div>
+            <div style={{ width: "1px", height: isCalendarFullscreen ? "20px" : "24px", background: "#E2E8F0", margin: "0 8px" }}></div>
 
             {viewMode === "monthly" ? (
               /* 월별 뷰 네비게이터 */
@@ -7638,21 +7767,25 @@ function BuildingCalendar() {
                 <button
                   onClick={goToPrevMonth}
                   style={{
-                    padding: isCalendarFullscreen ? "7px 12px" : "10px 16px",
-                    borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                    border: "1px solid #E5E7EB",
-                    background: "white",
+                    padding: isCalendarFullscreen ? "7px 12px" : "9px 15px",
+                    height: isCalendarFullscreen ? "34px" : "38px",
+                    borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                    border: "1px solid #CBD5E1",
+                    background: "#FFFFFF",
                     cursor: "pointer",
                     fontWeight: "600",
                     fontSize: isCalendarFullscreen ? "12px" : "13px",
-                    color: "#374151",
+                    color: "#334155",
                     display: "flex",
                     alignItems: "center",
                     gap: "4px",
-                    transition: "all 0.2s"
+                    transition: "all 0.2s ease",
+                    boxShadow: "0 1px 2px rgba(15,23,42,0.05)"
                   }}
-                  onMouseEnter={(e) => e.currentTarget.style.background = "#F9FAFB"}
-                  onMouseLeave={(e) => e.currentTarget.style.background = "white"}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = "#F8FAFC"; e.currentTarget.style.borderColor = "#94A3B8"; e.currentTarget.style.transform = "translateY(-1px)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = "#FFFFFF"; e.currentTarget.style.borderColor = "#CBD5E1"; e.currentTarget.style.transform = "translateY(0)"; }}
+                  onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+                  onMouseUp={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; }}
                 >
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
                     <polyline points="15 18 9 12 15 6" />
@@ -7662,40 +7795,47 @@ function BuildingCalendar() {
                 <button
                   onClick={goToToday}
                   style={{
-                    padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                    borderRadius: isCalendarFullscreen ? "8px" : "10px",
+                    padding: isCalendarFullscreen ? "7px 14px" : "9px 17px",
+                    height: isCalendarFullscreen ? "34px" : "38px",
+                    borderRadius: isCalendarFullscreen ? "10px" : "12px",
                     border: "none",
                     background: "linear-gradient(135deg, #10B981 0%, #059669 100%)",
                     color: "white",
                     cursor: "pointer",
                     fontWeight: "600",
                     fontSize: isCalendarFullscreen ? "12px" : "13px",
-                    boxShadow: isCalendarFullscreen ? "0 3px 8px rgba(16, 185, 129, 0.26)" : "0 4px 12px rgba(16, 185, 129, 0.3)",
-                    transition: "all 0.2s"
+                    boxShadow: isCalendarFullscreen ? "0 3px 8px rgba(16, 185, 129, 0.28)" : "0 4px 12px rgba(16, 185, 129, 0.32)",
+                    transition: "all 0.2s ease"
                   }}
-                  onMouseEnter={(e) => e.currentTarget.style.transform = "translateY(-1px)"}
-                  onMouseLeave={(e) => e.currentTarget.style.transform = "translateY(0)"}
+                  onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 16px rgba(16,185,129,0.42)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = isCalendarFullscreen ? "0 3px 8px rgba(16,185,129,0.28)" : "0 4px 12px rgba(16,185,129,0.32)"; }}
+                  onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+                  onMouseUp={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; }}
                 >
                   Today
                 </button>
                 <button
                   onClick={goToNextMonth}
                   style={{
-                    padding: isCalendarFullscreen ? "7px 12px" : "10px 16px",
-                    borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                    border: "1px solid #E5E7EB",
-                    background: "white",
+                    padding: isCalendarFullscreen ? "7px 12px" : "9px 15px",
+                    height: isCalendarFullscreen ? "34px" : "38px",
+                    borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                    border: "1px solid #CBD5E1",
+                    background: "#FFFFFF",
                     cursor: "pointer",
                     fontWeight: "600",
                     fontSize: isCalendarFullscreen ? "12px" : "13px",
-                    color: "#374151",
+                    color: "#334155",
                     display: "flex",
                     alignItems: "center",
                     gap: "4px",
-                    transition: "all 0.2s"
+                    transition: "all 0.2s ease",
+                    boxShadow: "0 1px 2px rgba(15,23,42,0.05)"
                   }}
-                  onMouseEnter={(e) => e.currentTarget.style.background = "#F9FAFB"}
-                  onMouseLeave={(e) => e.currentTarget.style.background = "white"}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = "#F8FAFC"; e.currentTarget.style.borderColor = "#94A3B8"; e.currentTarget.style.transform = "translateY(-1px)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = "#FFFFFF"; e.currentTarget.style.borderColor = "#CBD5E1"; e.currentTarget.style.transform = "translateY(0)"; }}
+                  onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+                  onMouseUp={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; }}
                 >
                   Next
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -7709,21 +7849,25 @@ function BuildingCalendar() {
                 <button
                   onClick={goToRollingPrev}
                   style={{
-                    padding: isCalendarFullscreen ? "7px 12px" : "10px 16px",
-                    borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                    border: "1px solid #E5E7EB",
-                    background: "white",
+                    padding: isCalendarFullscreen ? "7px 12px" : "9px 15px",
+                    height: isCalendarFullscreen ? "34px" : "38px",
+                    borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                    border: "1px solid #CBD5E1",
+                    background: "#FFFFFF",
                     cursor: "pointer",
                     fontWeight: "600",
                     fontSize: isCalendarFullscreen ? "12px" : "13px",
-                    color: "#374151",
+                    color: "#334155",
                     display: "flex",
                     alignItems: "center",
                     gap: "4px",
-                    transition: "all 0.2s"
+                    transition: "all 0.2s ease",
+                    boxShadow: "0 1px 2px rgba(15,23,42,0.05)"
                   }}
-                  onMouseEnter={(e) => e.currentTarget.style.background = "#F9FAFB"}
-                  onMouseLeave={(e) => e.currentTarget.style.background = "white"}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = "#F8FAFC"; e.currentTarget.style.borderColor = "#94A3B8"; e.currentTarget.style.transform = "translateY(-1px)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = "#FFFFFF"; e.currentTarget.style.borderColor = "#CBD5E1"; e.currentTarget.style.transform = "translateY(0)"; }}
+                  onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+                  onMouseUp={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; }}
                 >
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
                     <polyline points="15 18 9 12 15 6" />
@@ -7733,40 +7877,47 @@ function BuildingCalendar() {
                 <button
                   onClick={goToRollingToday}
                   style={{
-                    padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                    borderRadius: isCalendarFullscreen ? "8px" : "10px",
+                    padding: isCalendarFullscreen ? "7px 14px" : "9px 17px",
+                    height: isCalendarFullscreen ? "34px" : "38px",
+                    borderRadius: isCalendarFullscreen ? "10px" : "12px",
                     border: "none",
                     background: "linear-gradient(135deg, #10B981 0%, #059669 100%)",
                     color: "white",
                     cursor: "pointer",
                     fontWeight: "600",
                     fontSize: isCalendarFullscreen ? "12px" : "13px",
-                    boxShadow: isCalendarFullscreen ? "0 3px 8px rgba(16, 185, 129, 0.26)" : "0 4px 12px rgba(16, 185, 129, 0.3)",
-                    transition: "all 0.2s"
+                    boxShadow: isCalendarFullscreen ? "0 3px 8px rgba(16, 185, 129, 0.28)" : "0 4px 12px rgba(16, 185, 129, 0.32)",
+                    transition: "all 0.2s ease"
                   }}
-                  onMouseEnter={(e) => e.currentTarget.style.transform = "translateY(-1px)"}
-                  onMouseLeave={(e) => e.currentTarget.style.transform = "translateY(0)"}
+                  onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 16px rgba(16,185,129,0.42)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = isCalendarFullscreen ? "0 3px 8px rgba(16,185,129,0.28)" : "0 4px 12px rgba(16,185,129,0.32)"; }}
+                  onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+                  onMouseUp={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; }}
                 >
                   From Today
                 </button>
                 <button
                   onClick={goToRollingNext}
                   style={{
-                    padding: isCalendarFullscreen ? "7px 12px" : "10px 16px",
-                    borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                    border: "1px solid #E5E7EB",
-                    background: "white",
+                    padding: isCalendarFullscreen ? "7px 12px" : "9px 15px",
+                    height: isCalendarFullscreen ? "34px" : "38px",
+                    borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                    border: "1px solid #CBD5E1",
+                    background: "#FFFFFF",
                     cursor: "pointer",
                     fontWeight: "600",
                     fontSize: isCalendarFullscreen ? "12px" : "13px",
-                    color: "#374151",
+                    color: "#334155",
                     display: "flex",
                     alignItems: "center",
                     gap: "4px",
-                    transition: "all 0.2s"
+                    transition: "all 0.2s ease",
+                    boxShadow: "0 1px 2px rgba(15,23,42,0.05)"
                   }}
-                  onMouseEnter={(e) => e.currentTarget.style.background = "#F9FAFB"}
-                  onMouseLeave={(e) => e.currentTarget.style.background = "white"}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = "#F8FAFC"; e.currentTarget.style.borderColor = "#94A3B8"; e.currentTarget.style.transform = "translateY(-1px)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = "#FFFFFF"; e.currentTarget.style.borderColor = "#CBD5E1"; e.currentTarget.style.transform = "translateY(0)"; }}
+                  onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+                  onMouseUp={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; }}
                 >
                   Next 30 Days
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -7786,18 +7937,19 @@ function BuildingCalendar() {
               </>
             )}
 
-            <div style={{ width: "1px", height: isCalendarFullscreen ? "20px" : "24px", background: "#E5E7EB", margin: "0 4px" }}></div>
+            <div style={{ width: "1px", height: isCalendarFullscreen ? "20px" : "24px", background: "#E2E8F0", margin: "0 8px" }}></div>
 
             <button
               onClick={togglePriceMode}
               style={{
-                padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                border: priceMode ? "2px solid #F59E0B" : "none",
+                padding: isCalendarFullscreen ? "7px 14px" : "9px 17px",
+                height: isCalendarFullscreen ? "34px" : "38px",
+                borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                border: priceMode ? "2px solid #D97706" : "none",
                 background: priceMode
-                  ? "linear-gradient(135deg, #FFFBEB 0%, #FEF3C7 100%)"
+                  ? "linear-gradient(135deg, #FEF3C7 0%, #FDE68A 100%)"
                   : "linear-gradient(135deg, #F59E0B 0%, #D97706 100%)",
-                color: priceMode ? "#B45309" : "white",
+                color: priceMode ? "#92400E" : "white",
                 cursor: "pointer",
                 fontWeight: "700",
                 fontSize: isCalendarFullscreen ? "12px" : "13px",
@@ -7805,14 +7957,16 @@ function BuildingCalendar() {
                 alignItems: "center",
                 gap: isCalendarFullscreen ? "6px" : "8px",
                 boxShadow: priceMode
-                  ? "0 0 0 2px rgba(245, 158, 11, 0.16)"
+                  ? "0 0 0 2px rgba(217,119,6,0.14)"
                   : isCalendarFullscreen
-                    ? "0 3px 8px rgba(245, 158, 11, 0.24)"
-                    : "0 4px 12px rgba(245, 158, 11, 0.3)",
-                transition: "all 0.2s"
+                    ? "0 3px 8px rgba(217,119,6,0.22)"
+                    : "0 4px 12px rgba(217,119,6,0.26)",
+                transition: "all 0.2s ease"
               }}
-              onMouseEnter={(e) => e.currentTarget.style.transform = "translateY(-1px)"}
-              onMouseLeave={(e) => e.currentTarget.style.transform = "translateY(0)"}
+              onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; }}
+              onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+              onMouseUp={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; }}
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 {priceMode ? (
@@ -8097,26 +8251,29 @@ function BuildingCalendar() {
             <button
               onClick={toggleCalendarFullscreen}
               style={{
-                padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                border: isCalendarFullscreen ? "none" : "1px solid #E5E7EB",
-                background: isCalendarFullscreen ? "linear-gradient(135deg, #0F172A 0%, #334155 100%)" : "white",
-                color: isCalendarFullscreen ? "white" : "#4B5563",
+                padding: isCalendarFullscreen ? "7px 14px" : "9px 17px",
+                height: isCalendarFullscreen ? "34px" : "38px",
+                borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                border: isCalendarFullscreen ? "none" : "1px solid #CBD5E1",
+                background: isCalendarFullscreen ? "linear-gradient(135deg, #0F172A 0%, #334155 100%)" : "#FFFFFF",
+                color: isCalendarFullscreen ? "white" : "#334155",
                 cursor: "pointer",
                 fontWeight: "600",
                 fontSize: isCalendarFullscreen ? "12px" : "13px",
                 display: "flex",
                 alignItems: "center",
                 gap: isCalendarFullscreen ? "6px" : "8px",
-                boxShadow: isCalendarFullscreen ? "0 8px 16px rgba(15, 23, 42, 0.16)" : "none",
-                transition: "all 0.2s"
+                boxShadow: isCalendarFullscreen ? "0 8px 18px rgba(15, 23, 42, 0.18)" : "0 1px 2px rgba(15,23,42,0.05)",
+                transition: "all 0.2s ease"
               }}
               onMouseEnter={(e) => {
-                if (!isCalendarFullscreen) e.currentTarget.style.background = "#F9FAFB";
+                if (!isCalendarFullscreen) { e.currentTarget.style.background = "#F8FAFC"; e.currentTarget.style.borderColor = "#94A3B8"; e.currentTarget.style.transform = "translateY(-1px)"; }
               }}
               onMouseLeave={(e) => {
-                if (!isCalendarFullscreen) e.currentTarget.style.background = "white";
+                if (!isCalendarFullscreen) { e.currentTarget.style.background = "#FFFFFF"; e.currentTarget.style.borderColor = "#CBD5E1"; e.currentTarget.style.transform = "translateY(0)"; }
               }}
+              onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+              onMouseUp={(e) => { e.currentTarget.style.transform = isCalendarFullscreen ? "scale(1)" : "translateY(-1px)"; }}
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 {isCalendarFullscreen ? (
@@ -8141,21 +8298,25 @@ function BuildingCalendar() {
             <button
               onClick={() => navigate('/price-history')}
               style={{
-                padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                border: "1px solid #E5E7EB",
-                background: "white",
-                color: "#4B5563",
+                padding: isCalendarFullscreen ? "7px 14px" : "9px 17px",
+                height: isCalendarFullscreen ? "34px" : "38px",
+                borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                border: "1px solid #CBD5E1",
+                background: "#FFFFFF",
+                color: "#334155",
                 cursor: "pointer",
                 fontWeight: "600",
                 fontSize: isCalendarFullscreen ? "12px" : "13px",
                 display: "flex",
                 alignItems: "center",
                 gap: isCalendarFullscreen ? "6px" : "8px",
-                transition: "all 0.2s"
+                transition: "all 0.2s ease",
+                boxShadow: "0 1px 2px rgba(15,23,42,0.05)"
               }}
-              onMouseEnter={(e) => e.currentTarget.style.background = "#F9FAFB"}
-              onMouseLeave={(e) => e.currentTarget.style.background = "white"}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "#F8FAFC"; e.currentTarget.style.borderColor = "#94A3B8"; e.currentTarget.style.transform = "translateY(-1px)"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "#FFFFFF"; e.currentTarget.style.borderColor = "#CBD5E1"; e.currentTarget.style.transform = "translateY(0)"; }}
+              onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+              onMouseUp={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; }}
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -8166,28 +8327,31 @@ function BuildingCalendar() {
               <button
                 onClick={toggleVacantOnlyMode}
                 style={{
-                  padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
-                  borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                  border: vacantOnlyMode ? "none" : "1px solid #E5E7EB",
+                  padding: isCalendarFullscreen ? "7px 14px" : "9px 17px",
+                  height: isCalendarFullscreen ? "34px" : "38px",
+                  borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                  border: vacantOnlyMode ? "none" : "1px solid #CBD5E1",
                   background: vacantOnlyMode
-                    ? "linear-gradient(135deg, #0F766E 0%, #0F766E 45%, #115E59 100%)"
-                    : "white",
-                  color: vacantOnlyMode ? "white" : "#4B5563",
+                    ? "linear-gradient(135deg, #0F766E 0%, #115E59 100%)"
+                    : "#FFFFFF",
+                  color: vacantOnlyMode ? "white" : "#334155",
                   cursor: "pointer",
                   fontWeight: "600",
                   fontSize: isCalendarFullscreen ? "12px" : "13px",
                   display: "flex",
                   alignItems: "center",
                   gap: isCalendarFullscreen ? "6px" : "8px",
-                  boxShadow: vacantOnlyMode ? "0 4px 12px rgba(15, 118, 110, 0.22)" : "none",
-                  transition: "all 0.2s"
+                  boxShadow: vacantOnlyMode ? "0 4px 14px rgba(15, 118, 110, 0.26)" : "0 1px 2px rgba(15,23,42,0.05)",
+                  transition: "all 0.2s ease"
                 }}
                 onMouseEnter={(e) => {
-                  if (!vacantOnlyMode) e.currentTarget.style.background = "#F9FAFB";
+                  if (!vacantOnlyMode) { e.currentTarget.style.background = "#F0FDFA"; e.currentTarget.style.borderColor = "#94A3B8"; e.currentTarget.style.transform = "translateY(-1px)"; }
                 }}
                 onMouseLeave={(e) => {
-                  if (!vacantOnlyMode) e.currentTarget.style.background = "white";
+                  if (!vacantOnlyMode) { e.currentTarget.style.background = "#FFFFFF"; e.currentTarget.style.borderColor = "#CBD5E1"; e.currentTarget.style.transform = "translateY(0)"; }
                 }}
+                onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+                onMouseUp={(e) => { if (!vacantOnlyMode) e.currentTarget.style.transform = "translateY(-1px)"; else e.currentTarget.style.transform = "scale(1)"; }}
               >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M3 10h18" />
@@ -8238,35 +8402,40 @@ function BuildingCalendar() {
               </button>
             )}
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: isCalendarFullscreen ? "12px" : "20px", flexWrap: "wrap", justifyContent: "flex-end" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: isCalendarFullscreen ? "8px" : "12px", flexWrap: "wrap", justifyContent: "flex-end" }}>
             {/* 월 표시 */}
             <div
               onClick={() => setShowMonthPicker(true)}
               style={{
-                fontSize: isCalendarFullscreen ? "15px" : "18px",
+                fontSize: isCalendarFullscreen ? "14px" : "16px",
                 fontWeight: "700",
-                color: "#111827",
+                color: "#0F172A",
                 cursor: "pointer",
-                padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
+                padding: isCalendarFullscreen ? "7px 14px" : "9px 17px",
+                height: isCalendarFullscreen ? "34px" : "38px",
                 borderRadius: isCalendarFullscreen ? "10px" : "12px",
-                transition: "all 0.2s",
+                transition: "all 0.2s ease",
                 display: "flex",
                 alignItems: "center",
                 gap: isCalendarFullscreen ? "6px" : "8px",
-                background: "#F9FAFB",
-                border: "1px solid #E5E7EB"
+                background: "linear-gradient(135deg, #F8FAFC 0%, #F1F5F9 100%)",
+                border: "1px solid #CBD5E1",
+                letterSpacing: "-0.01em",
+                boxShadow: "0 1px 2px rgba(15,23,42,0.05)"
               }}
               onMouseEnter={(e) => {
-                e.currentTarget.style.background = "#F3F4F6";
-                e.currentTarget.style.borderColor = "#D1D5DB";
+                e.currentTarget.style.background = "linear-gradient(135deg, #F1F5F9 0%, #E2E8F0 100%)";
+                e.currentTarget.style.borderColor = "#94A3B8";
+                e.currentTarget.style.transform = "translateY(-1px)";
               }}
               onMouseLeave={(e) => {
-                e.currentTarget.style.background = "#F9FAFB";
-                e.currentTarget.style.borderColor = "#E5E7EB";
+                e.currentTarget.style.background = "linear-gradient(135deg, #F8FAFC 0%, #F1F5F9 100%)";
+                e.currentTarget.style.borderColor = "#CBD5E1";
+                e.currentTarget.style.transform = "translateY(0)";
               }}
             >
               {["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][month]} {year}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
                 <polyline points="6 9 12 15 18 9" />
               </svg>
             </div>
@@ -8282,35 +8451,40 @@ function BuildingCalendar() {
                 style={{
                   width: isCalendarFullscreen ? "108px" : "128px",
                   padding: isCalendarFullscreen ? "5px 9px" : "7px 11px",
-                  borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                  border: isValidDateSearch(dateSearchInput) ? "1.5px solid #0EA5E9" : "1px solid #D1D5DB",
+                  height: isCalendarFullscreen ? "32px" : "36px",
+                  borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                  border: isValidDateSearch(dateSearchInput) ? "1.5px solid #0EA5E9" : "1px solid #CBD5E1",
                   fontSize: isCalendarFullscreen ? "11px" : "12px",
                   fontFamily: "monospace",
                   outline: "none",
-                  color: "#374151",
-                  background: "white",
-                  transition: "border-color 0.2s"
+                  color: "#334155",
+                  background: "#FFFFFF",
+                  transition: "border-color 0.2s",
+                  boxShadow: "0 1px 2px rgba(15,23,42,0.04)"
                 }}
               />
               <button
                 onClick={() => applyDateSearch(dateSearchInput)}
                 disabled={!isValidDateSearch(dateSearchInput)}
-                onMouseEnter={(e) => { if (isValidDateSearch(dateSearchInput)) { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 18px rgba(2,132,199,0.45)"; } }}
-                onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = isValidDateSearch(dateSearchInput) ? "0 3px 10px rgba(2,132,199,0.30)" : "none"; }}
+                onMouseEnter={(e) => { if (isValidDateSearch(dateSearchInput)) { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 18px rgba(2,132,199,0.42)"; } }}
+                onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = isValidDateSearch(dateSearchInput) ? "0 3px 10px rgba(2,132,199,0.28)" : "none"; }}
+                onMouseDown={(e) => { if (isValidDateSearch(dateSearchInput)) e.currentTarget.style.transform = "scale(0.98)"; }}
+                onMouseUp={(e) => { if (isValidDateSearch(dateSearchInput)) e.currentTarget.style.transform = "translateY(-1px)"; }}
                 style={{
-                  padding: isCalendarFullscreen ? "5px 13px" : "7px 16px",
-                  borderRadius: isCalendarFullscreen ? "8px" : "10px",
+                  padding: isCalendarFullscreen ? "5px 13px" : "6px 15px",
+                  height: isCalendarFullscreen ? "32px" : "36px",
+                  borderRadius: isCalendarFullscreen ? "10px" : "12px",
                   border: "none",
                   background: isValidDateSearch(dateSearchInput)
                     ? "linear-gradient(135deg, #38BDF8 0%, #0EA5E9 45%, #0284C7 100%)"
-                    : "linear-gradient(135deg, #E5E7EB 0%, #D1D5DB 100%)",
-                  color: isValidDateSearch(dateSearchInput) ? "white" : "#9CA3AF",
+                    : "linear-gradient(135deg, #E2E8F0 0%, #CBD5E1 100%)",
+                  color: isValidDateSearch(dateSearchInput) ? "white" : "#94A3B8",
                   fontSize: isCalendarFullscreen ? "11px" : "12px",
                   fontWeight: "700",
                   letterSpacing: "0.04em",
                   cursor: isValidDateSearch(dateSearchInput) ? "pointer" : "not-allowed",
-                  boxShadow: isValidDateSearch(dateSearchInput) ? "0 3px 10px rgba(2,132,199,0.30)" : "none",
-                  transition: "all 0.2s"
+                  boxShadow: isValidDateSearch(dateSearchInput) ? "0 3px 10px rgba(2,132,199,0.28)" : "none",
+                  transition: "all 0.2s ease"
                 }}
               >
                 Go
@@ -8319,9 +8493,12 @@ function BuildingCalendar() {
                 onClick={handleDateSearchToday}
                 onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 18px rgba(16,185,129,0.38)"; }}
                 onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "0 3px 10px rgba(16,185,129,0.22)"; }}
+                onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+                onMouseUp={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; }}
                 style={{
-                  padding: isCalendarFullscreen ? "5px 11px" : "7px 14px",
-                  borderRadius: isCalendarFullscreen ? "8px" : "10px",
+                  padding: isCalendarFullscreen ? "5px 11px" : "6px 13px",
+                  height: isCalendarFullscreen ? "32px" : "36px",
+                  borderRadius: isCalendarFullscreen ? "10px" : "12px",
                   border: "none",
                   background: "linear-gradient(135deg, #34D399 0%, #10B981 50%, #059669 100%)",
                   color: "white",
@@ -8330,7 +8507,7 @@ function BuildingCalendar() {
                   letterSpacing: "0.04em",
                   cursor: "pointer",
                   boxShadow: "0 3px 10px rgba(16,185,129,0.22)",
-                  transition: "all 0.2s",
+                  transition: "all 0.2s ease",
                   whiteSpace: "nowrap"
                 }}
               >
@@ -8341,16 +8518,19 @@ function BuildingCalendar() {
                   onClick={() => setDateSearchInput("")}
                   title="Clear"
                   style={{
-                    padding: isCalendarFullscreen ? "5px 8px" : "7px 10px",
-                    borderRadius: isCalendarFullscreen ? "8px" : "10px",
-                    border: "1px solid #E5E7EB",
-                    background: "white",
-                    color: "#9CA3AF",
+                    padding: isCalendarFullscreen ? "5px 8px" : "6px 10px",
+                    height: isCalendarFullscreen ? "32px" : "36px",
+                    borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                    border: "1px solid #CBD5E1",
+                    background: "#FFFFFF",
+                    color: "#94A3B8",
                     fontSize: isCalendarFullscreen ? "11px" : "12px",
                     cursor: "pointer",
                     lineHeight: 1,
-                    transition: "all 0.2s"
+                    transition: "all 0.2s ease"
                   }}
+                  onMouseEnter={(e) => { e.currentTarget.style.borderColor = "#94A3B8"; e.currentTarget.style.color = "#64748B"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.borderColor = "#CBD5E1"; e.currentTarget.style.color = "#94A3B8"; }}
                 >
                   ✕
                 </button>
@@ -8358,26 +8538,58 @@ function BuildingCalendar() {
             </div>
 
             {/* 범례 */}
-            <div style={{ display: "flex", gap: isCalendarFullscreen ? "12px" : "16px", fontSize: isCalendarFullscreen ? "11px" : "12px", color: "#6B7280" }}>
-              <span style={{ display: "flex", alignItems: "center", gap: isCalendarFullscreen ? "5px" : "6px" }}>
+            <div style={{ display: "flex", gap: isCalendarFullscreen ? "6px" : "8px", alignItems: "center" }}>
+              <span
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: isCalendarFullscreen ? "5px" : "6px",
+                  padding: isCalendarFullscreen ? "4px 9px" : "5px 10px",
+                  borderRadius: "999px",
+                  background: "rgba(242,163,165,0.12)",
+                  border: "1px solid rgba(242,163,165,0.35)",
+                  fontSize: isCalendarFullscreen ? "11px" : "12px",
+                  color: "#6B7280",
+                  fontWeight: "500",
+                  transition: "background 0.18s"
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(242,163,165,0.22)"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(242,163,165,0.12)"; }}
+              >
                 <span style={{
-                  width: isCalendarFullscreen ? "12px" : "14px",
-                  height: isCalendarFullscreen ? "12px" : "14px",
-                  borderRadius: isCalendarFullscreen ? "3px" : "4px",
+                  width: "8px",
+                  height: "8px",
+                  borderRadius: "50%",
                   background: PLATFORM_COLORS.Airbnb,
-                  boxShadow: "0 2px 4px rgba(242, 163, 165, 0.5)"
+                  flexShrink: 0
                 }}></span>
-                <span style={{ fontWeight: "500" }}>Airbnb</span>
+                Airbnb
               </span>
-              <span style={{ display: "flex", alignItems: "center", gap: isCalendarFullscreen ? "5px" : "6px" }}>
+              <span
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: isCalendarFullscreen ? "5px" : "6px",
+                  padding: isCalendarFullscreen ? "4px 9px" : "5px 10px",
+                  borderRadius: "999px",
+                  background: "rgba(143,220,221,0.12)",
+                  border: "1px solid rgba(143,220,221,0.35)",
+                  fontSize: isCalendarFullscreen ? "11px" : "12px",
+                  color: "#6B7280",
+                  fontWeight: "500",
+                  transition: "background 0.18s"
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(143,220,221,0.22)"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(143,220,221,0.12)"; }}
+              >
                 <span style={{
-                  width: isCalendarFullscreen ? "12px" : "14px",
-                  height: isCalendarFullscreen ? "12px" : "14px",
-                  borderRadius: isCalendarFullscreen ? "3px" : "4px",
+                  width: "8px",
+                  height: "8px",
+                  borderRadius: "50%",
                   background: PLATFORM_COLORS.Booking,
-                  boxShadow: "0 2px 4px rgba(143, 220, 221, 0.5)"
+                  flexShrink: 0
                 }}></span>
-                <span style={{ fontWeight: "500" }}>Booking</span>
+                Booking
               </span>
             </div>
           </div>
@@ -8468,7 +8680,13 @@ function BuildingCalendar() {
                     style={{
                       display: "flex",
                       borderBottom: "1px solid #F3F4F6",
-                      minHeight: showBeds24DetailView ? `${BEDS24_DETAIL_ROW_HEIGHT}px` : priceMode ? "60px" : "52px",
+                      minHeight: showBeds24DetailView
+                        ? `${BEDS24_DETAIL_ROW_HEIGHT}px`
+                        : priceMode
+                          ? "60px"
+                          : showCancelled && (cancelledBarLaneMap.maxByRoom[room] || 1) > 1
+                            ? `${Math.max(52, (cancelledBarLaneMap.maxByRoom[room] || 1) * 22 + 12)}px`
+                            : "52px",
                       position: "relative",
                       transition: 'background 0.2s',
                       marginBottom: roomIndex < visibleRooms.length - 1 ? (isMobile ? "2px" : "4px") : "0"
@@ -9152,7 +9370,7 @@ function BuildingCalendar() {
                       })}
 
                       {/* 예약 바 */}
-                      {roomReservationsMap[room]?.map(reservation =>
+                      {roomReservationsMapVisual[room]?.map(reservation =>
                         renderReservationBar(reservation, roomIndex)
                       )}
                     </div>
