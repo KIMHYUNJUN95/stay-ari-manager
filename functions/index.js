@@ -2863,10 +2863,107 @@ exports.triggerMinStaySync = onRequest({ cors: true, timeoutSeconds: 540 }, asyn
 // fromDate: 조회 시작일 (기본값: 최근 30일)
 // options.insertOnly: true면 Firestore에 없는 것만 저장 (기존 덮어쓰기 안함)
 // ==========================================
+const REVIEW_RETENTION_DAYS = 90;
+
+function toReviewDateKey(value) {
+    if (!value) return null;
+    if (typeof value?.toDate === "function") {
+        const d = value.toDate();
+        return dayjs(d).isValid() ? dayjs(d).format("YYYY-MM-DD") : null;
+    }
+    const s = String(value).trim();
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (m) return m[1];
+    const d = dayjs(s);
+    return d.isValid() ? d.format("YYYY-MM-DD") : null;
+}
+
+async function cleanupOldReviews(companyId, cutoffDate = null) {
+    const cutoffDateKey = cutoffDate || dayjs().utcOffset(9).subtract(REVIEW_RETENTION_DAYS, "day").format("YYYY-MM-DD");
+    const snap = await db.collection("reviews").where("companyId", "==", companyId).get();
+    const staleRefs = [];
+
+    snap.forEach((docSnap) => {
+        const data = docSnap.data() || {};
+        const dateKey = data.createdDateKey || toReviewDateKey(data.createdAt);
+        if (dateKey && dateKey < cutoffDateKey) staleRefs.push(docSnap.ref);
+    });
+
+    const CHUNK = 400;
+    for (let i = 0; i < staleRefs.length; i += CHUNK) {
+        const wb = db.batch();
+        staleRefs.slice(i, i + CHUNK).forEach((ref) => wb.delete(ref));
+        await wb.commit();
+    }
+
+    console.log(`[reviewsRetention] companyId=${companyId}, cutoff=${cutoffDateKey}, deleted=${staleRefs.length}`);
+    return staleRefs.length;
+}
+
+// booking 리뷰에 예약 컨텍스트(linkedRoom/Arrival/Departure/Building) 보강
+async function enrichBookingReviewsWithReservationContext(companyId, batchItems) {
+    const targets = batchItems.filter(item =>
+        item.data.channel === "booking" && item.data.reservationId
+    );
+    console.log(`[enrichReviews] 대상 booking 리뷰: ${targets.length}건`);
+    if (!targets.length) return;
+
+    // reservationId 중복 제거 후 10개씩 Firestore 'in' 쿼리
+    const allIds = [...new Set(targets.map(item => String(item.data.reservationId)))];
+    const reservationIndex = {};
+    const ID_CHUNK = 10;
+    for (let i = 0; i < allIds.length; i += ID_CHUNK) {
+        const chunk = allIds.slice(i, i + ID_CHUNK);
+        try {
+            const snap = await db.collection("reservations")
+                .where("companyId", "==", companyId)
+                .where("bookId", "in", chunk)
+                .get();
+            snap.docs.forEach(doc => {
+                const d = doc.data();
+                if (d.bookId) reservationIndex[String(d.bookId)] = d;
+            });
+        } catch (e) {
+            console.warn(`[enrichReviews] reservations 조회 실패 (chunk ${i}):`, e.message);
+        }
+    }
+
+    // 매칭 → batch update
+    let matched = 0, skipped = 0;
+    const updates = [];
+    for (const item of targets) {
+        const resId = String(item.data.reservationId);
+        const res = reservationIndex[resId];
+        if (!res) { skipped++; continue; }
+        updates.push({
+            id: item.id,
+            fields: {
+                linkedRoom: res.room || null,
+                linkedArrival: res.arrival || null,
+                linkedDeparture: res.departure || null,
+                linkedBuilding: res.building || null,
+                linkedAt: admin.firestore.FieldValue.serverTimestamp()
+            }
+        });
+        matched++;
+    }
+
+    const WRITE_CHUNK = 400;
+    for (let i = 0; i < updates.length; i += WRITE_CHUNK) {
+        const chunk = updates.slice(i, i + WRITE_CHUNK);
+        const wb = db.batch();
+        for (const u of chunk) {
+            wb.update(db.collection("reviews").doc(u.id), u.fields);
+        }
+        await wb.commit();
+    }
+    console.log(`[enrichReviews] 매칭 성공: ${matched}건, 실패(스킵): ${skipped}건`);
+}
+
 async function syncAllReviews(companyId, fromDate = null, options = {}) {
     const { insertOnly = false, toDate = null } = options;
     const tokyoNow = dayjs().utcOffset(9);
-    if (!fromDate) fromDate = tokyoNow.subtract(30, "day").format("YYYY-MM-DD");
+    if (!fromDate) fromDate = tokyoNow.subtract(REVIEW_RETENTION_DAYS, "day").format("YYYY-MM-DD");
     const effectiveToDate = toDate || tokyoNow.format("YYYY-MM-DD");
     const batch = [];
 
@@ -2917,6 +3014,7 @@ async function syncAllReviews(companyId, fromDate = null, options = {}) {
                             hasReply: !!review.reply,
                             reply: review.reply || null,
                             createdAt: review.created_timestamp || null,
+                            createdDateKey: toReviewDateKey(review.created_timestamp),
                             reservationId: String(review.reservation_id || ""),
                             syncedAt: admin.firestore.FieldValue.serverTimestamp()
                         }
@@ -3005,6 +3103,7 @@ async function syncAllReviews(companyId, fromDate = null, options = {}) {
                                 hasReply: false,
                                 reply: null,
                                 createdAt: review.submitted_at || review.first_completed_at || null,
+                                createdDateKey: toReviewDateKey(review.submitted_at || review.first_completed_at),
                                 reservationId: review.reservation_confirmation_code || null,
                                 listingId: review.listing_id || null,
                                 syncedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -3065,6 +3164,12 @@ async function syncAllReviews(companyId, fromDate = null, options = {}) {
                 wb.set(ref, item.data, { merge: true });
             }
             await wb.commit();
+        }
+        // 예약 컨텍스트 보강 (booking 리뷰만, 오류 시 전체 실패 방지)
+        try {
+            await enrichBookingReviewsWithReservationContext(companyId, batch);
+        } catch (e) {
+            console.warn("[syncReviews] enrichment 실패:", e.message);
         }
         return batch.length;
     }
@@ -3159,8 +3264,10 @@ exports.unifiedSync = onRequest({ cors: true, timeoutSeconds: 900, memory: "2GiB
 
         // 2. 리뷰 동기화 — 과거 데이터 모드에서는 스킵 (Airbnb 리뷰가 roomId별 65회+ 호출로 타임아웃 유발)
         let reviewCount = 0;
+        let prunedReviews = 0;
         if (!isLegacyRange) {
             reviewCount = await syncAllReviews(companyId, fromDate, { insertOnly: true, toDate: arrivalTo });
+            prunedReviews = await cleanupOldReviews(companyId);
             console.log(`✅ [UnifiedSync] 리뷰 완료: ${reviewCount}건 신규`);
         } else {
             console.log(`⏭️ [UnifiedSync] 리뷰 동기화 스킵 (과거 데이터 모드)`);
@@ -3169,7 +3276,7 @@ exports.unifiedSync = onRequest({ cors: true, timeoutSeconds: 900, memory: "2GiB
         res.json({
             success: true,
             reservations: { upserted: reservationResult.upsertedCount },
-            reviews: { inserted: reviewCount }
+            reviews: { inserted: reviewCount, pruned: prunedReviews }
         });
     } catch (err) {
         console.error("[unifiedSync] 실패:", err);
@@ -3177,7 +3284,7 @@ exports.unifiedSync = onRequest({ cors: true, timeoutSeconds: 900, memory: "2GiB
     }
 });
 
-// 리뷰 증분 자동 동기화 (3시간마다, 최근 30일)
+// 리뷰 증분 자동 동기화 (3시간마다, 최근 90일 + 90일 초과 자동 삭제)
 exports.scheduledReviewsSync = onSchedule({
     schedule: "0 0,3,6,9,12,15,18,21 * * *",
     timeoutSeconds: 540,
@@ -3185,7 +3292,8 @@ exports.scheduledReviewsSync = onSchedule({
 }, async () => {
     const companyId = DEFAULT_COMPANY_ID;
     const count = await syncAllReviews(companyId);
-    console.log(`✅ 리뷰 증분 동기화 완료: ${count}건 (${dayjs().utcOffset(9).format("YYYY-MM-DD HH:mm")})`);
+    const pruned = await cleanupOldReviews(companyId);
+    console.log(`✅ 리뷰 증분 동기화 완료: ${count}건, 정리: ${pruned}건 (${dayjs().utcOffset(9).format("YYYY-MM-DD HH:mm")})`);
 });
 
 // 리뷰 풀 재대사 (매일 새벽 3시 JST — 삭제된 리뷰 정리)
@@ -6414,10 +6522,11 @@ exports.syncReviewsManual = onRequest({ cors: true, timeoutSeconds: 540, memory:
     try {
         const { companyId, fromDate, toDate } = req.body;
         if (!companyId) return res.status(400).json({ success: false, error: "Missing companyId" });
-        const from = fromDate || dayjs().tz("Asia/Tokyo").subtract(30, "day").format("YYYY-MM-DD");
+        const from = fromDate || dayjs().tz("Asia/Tokyo").subtract(REVIEW_RETENTION_DAYS, "day").format("YYYY-MM-DD");
         console.log(`🔄 [syncReviewsManual] fromDate=${from}, toDate=${toDate || "auto"}, companyId=${companyId}`);
         const synced = await syncAllReviews(companyId, from, { insertOnly: false, toDate: toDate || null });
-        res.json({ success: true, synced });
+        const pruned = await cleanupOldReviews(companyId);
+        res.json({ success: true, synced, pruned });
     } catch (e) {
         console.error("syncReviewsManual:", e);
         res.status(500).json({ success: false, error: e.message });

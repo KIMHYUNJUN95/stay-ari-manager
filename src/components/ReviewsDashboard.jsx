@@ -3,6 +3,7 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { collection, query, where, getDocs } from 'firebase/firestore';
 import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
+import dayjs from 'dayjs';
 import {
   RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
   LineChart, Line, BarChart, Bar,
@@ -930,6 +931,12 @@ function ReviewsTab({ reviews, channel: parentChannel, dateSearchReversed, hasDa
                 <span style={{ fontSize: 12, fontWeight: 600, color: "#4F46E5" }}>
                   {getBuildingEn(r.building)}{r.roomName ? ` · ${r.roomName}` : ""}
                 </span>
+                {r.channel === "booking" && r.linkedRoom && (
+                  <span style={{ fontSize: 12, color: "#64748B", fontWeight: 500 }}>
+                    {r.linkedRoom}
+                    {r.linkedArrival && r.linkedDeparture ? ` · ${r.linkedArrival} ~ ${r.linkedDeparture}` : ""}
+                  </span>
+                )}
                 {r.reviewerName && (
                   <span style={{ fontSize: 12, fontWeight: 600, color: "#374151" }}>
                     {r.reviewerName}{r.reviewerCountry ? ` (${r.reviewerCountry.toUpperCase()})` : ""}
@@ -1265,7 +1272,8 @@ function ReviewSyncDateDropdown({ label, value, onChange }) {
 
 function ReviewSyncModal({ isOpen, onClose, onDone, companyId }) {
   const today = new Date().toISOString().split('T')[0];
-  const [fromDate, setFromDate] = useState('2022-01-01');
+  const defaultFromDate = dayjs().subtract(90, "day").format("YYYY-MM-DD");
+  const [fromDate, setFromDate] = useState(defaultFromDate);
   const [toDate, setToDate] = useState(today);
   const [syncing, setSyncing] = useState(false);
   const [result, setResult] = useState(null);
@@ -1318,7 +1326,7 @@ function ReviewSyncModal({ isOpen, onClose, onDone, companyId }) {
 
             <div style={{ background: "#F0FDF4", border: "1px solid #BBF7D0", borderRadius: 10, padding: "11px 14px", fontSize: 12, color: "#166534", lineHeight: 1.6 }}>
               ✅ Booking.com & Airbnb reviews will be fetched<br />
-              ✅ Existing reviews will be updated
+              ✅ Only recent 3 months are retained (older reviews are auto-pruned)
             </div>
 
             {syncing && (
@@ -1384,7 +1392,20 @@ export default function ReviewsDashboard() {
         collection(db, "reviews"),
         where("companyId", "==", companyId)
       ));
-      const data = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      const cutoff = dayjs().subtract(90, "day").format("YYYY-MM-DD");
+      const toDateKey = (value) => {
+        if (!value) return null;
+        if (typeof value?.toDate === "function") return dayjs(value.toDate()).format("YYYY-MM-DD");
+        const s = String(value);
+        const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+        return m ? m[1] : (dayjs(s).isValid() ? dayjs(s).format("YYYY-MM-DD") : null);
+      };
+      const data = snap.docs
+        .map(doc => ({ id: doc.id, ...doc.data() }))
+        .filter((r) => {
+          const key = r.createdDateKey || toDateKey(r.createdAt);
+          return key ? key >= cutoff : true;
+        });
       setReviews(data);
 
       let latest = null;
