@@ -176,8 +176,19 @@ function computeTrendData(reviews) {
     if (r.score > 0) byMonthBuilding[month][r.building].push(r.score);
   }
 
-  const months = Object.keys(byMonthBuilding).sort();
-  return months.map(month => {
+  const existingMonths = Object.keys(byMonthBuilding).sort();
+  if (existingMonths.length === 0) return [];
+
+  // minMonth~maxMonth 연속 월 배열 — 데이터 없는 월도 row로 포함해 x축 연속성 보장
+  const months = [];
+  let cur = dayjs(existingMonths[0], 'YYYY-MM');
+  const end = dayjs(existingMonths[existingMonths.length - 1], 'YYYY-MM');
+  while (!cur.isAfter(end, 'month')) {
+    months.push(cur.format('YYYY-MM'));
+    cur = cur.add(1, 'month');
+  }
+
+  const rows = months.map(month => {
     const row = { month };
     for (const building of BUILDING_ORDER) {
       const scores = byMonthBuilding[month]?.[building] || [];
@@ -185,6 +196,30 @@ function computeTrendData(reviews) {
     }
     return row;
   });
+
+  // 건물별 중간 null 구간은 선형 보간해 차트 선이 중간에서 끊겨 보이지 않게 보정
+  for (const building of BUILDING_ORDER) {
+    const key = getBuildingEn(building);
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i][key] !== null) continue;
+
+      let prev = i - 1;
+      while (prev >= 0 && rows[prev][key] === null) prev--;
+      let next = i + 1;
+      while (next < rows.length && rows[next][key] === null) next++;
+
+      // 앞뒤 유효값이 있는 "중간 공백"만 보간 (시작/끝 공백은 원값 유지)
+      if (prev >= 0 && next < rows.length) {
+        const prevVal = rows[prev][key];
+        const nextVal = rows[next][key];
+        const ratio = (i - prev) / (next - prev);
+        const interpolated = prevVal + (nextVal - prevVal) * ratio;
+        rows[i][key] = parseFloat(interpolated.toFixed(2));
+      }
+    }
+  }
+
+  return rows;
 }
 
 function computeWeaknesses(buildingStats, threshold = 8.0) {
@@ -705,8 +740,16 @@ function TrendsTab({ trendData, buildingStats }) {
                 <Tooltip formatter={(v, name) => [v?.toFixed(2), name]} labelFormatter={formatMonth} contentStyle={{ borderRadius: 10, border: "1px solid #E2E8F0", fontSize: 12 }} />
                 <Legend />
                 {selectedBuildings.map(b => (
-                  <Line key={b} type="monotone" dataKey={getBuildingEn(b)} stroke={getBuildingColor(b)}
-                    strokeWidth={2} dot={{ r: 3, strokeWidth: 0 }} activeDot={{ r: 5 }} connectNulls />
+                  <Line
+                    key={b}
+                    type="linear"
+                    dataKey={getBuildingEn(b)}
+                    stroke={getBuildingColor(b)}
+                    strokeWidth={2.2}
+                    dot={false}
+                    activeDot={{ r: 3, stroke: "#FFFFFF", strokeWidth: 1 }}
+                    connectNulls
+                  />
                 ))}
               </LineChart>
             </ResponsiveContainer>
@@ -1531,19 +1574,6 @@ export default function ReviewsDashboard() {
   ];
 
   const TABS = activeChannel === "booking" ? BOOKING_TABS : AIRBNB_TABS;
-
-  // ★ 임시: owner만 접근 가능 (기능 완료 후 제거)
-  if (userData && userData.role !== 'owner') {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "60vh", padding: 40 }}>
-        <div style={{ fontSize: 48, marginBottom: 16 }}>🔧</div>
-        <h2 style={{ fontSize: 22, fontWeight: 700, color: "#1E293B", margin: "0 0 8px 0" }}>Coming Soon</h2>
-        <p style={{ fontSize: 14, color: "#94A3B8", textAlign: "center" }}>
-          This feature is currently under development.<br />It will be available soon.
-        </p>
-      </div>
-    );
-  }
 
   return (
     <div style={{ padding: "28px 32px", maxWidth: 1200, margin: "0 auto" }}>
