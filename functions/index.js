@@ -2338,6 +2338,7 @@ async function syncAllPrices({
                             }),
                             lastSyncRoom: admin.firestore.FieldValue.serverTimestamp()
                         }, { merge: true });
+                        await mergePriceSyncMonthCache(buildingName, rid, room.name, datesObj, { cacheComplete: true });
                         successInBuilding++;
                         syncedRooms++;
                         syncedRoomIds.add(rid);
@@ -2583,6 +2584,7 @@ async function syncMinStayOnly({ reason = "scheduled" } = {}) {
                                 throw updateErr;
                             }
                         }
+                        await mergePriceSyncMonthCache(buildingName, rid, room.name, datesPatch);
                     }
                     totalFetched++;
                 } catch (err) {
@@ -3580,6 +3582,130 @@ exports.triggerPriceJobNow = onRequest({ cors: true, timeoutSeconds: 540 }, asyn
     }
 });
 
+function getPriceCacheMonthKeys(fromKey, toKey) {
+    if (!fromKey || !toKey || fromKey > toKey) return [];
+    const months = [];
+    let cursor = dayjs(`${fromKey.slice(0, 4)}-${fromKey.slice(4, 6)}-01`);
+    const end = dayjs(`${toKey.slice(0, 4)}-${toKey.slice(4, 6)}-01`);
+    while (cursor.isValid() && (cursor.isBefore(end, "month") || cursor.isSame(end, "month"))) {
+        months.push(cursor.format("YYYYMM"));
+        cursor = cursor.add(1, "month");
+    }
+    return months;
+}
+
+function groupPriceDatesByMonth(datesObj = {}) {
+    const grouped = {};
+    Object.entries(datesObj || {}).forEach(([dateKey, value]) => {
+        const monthKey = String(dateKey).slice(0, 6);
+        if (!/^\d{6}$/.test(monthKey)) return;
+        if (!grouped[monthKey]) grouped[monthKey] = {};
+        grouped[monthKey][dateKey] = value;
+    });
+    return grouped;
+}
+
+async function mergePriceSyncMonthCache(building, roomId, roomName, datesObj = {}, { cacheComplete = false } = {}) {
+    const grouped = groupPriceDatesByMonth(datesObj);
+    const monthKeys = Object.keys(grouped);
+    if (monthKeys.length === 0) return;
+
+    const buildingRef = db.collection("price_sync").doc(building);
+    const batch = db.batch();
+    monthKeys.forEach((monthKey) => {
+        const monthRef = buildingRef.collection("months").doc(monthKey);
+        const roomPayload = {
+            roomName,
+            roomId: String(roomId),
+            dates: grouped[monthKey],
+            lastSyncRoom: admin.firestore.FieldValue.serverTimestamp()
+        };
+        if (cacheComplete) {
+            roomPayload.cacheComplete = true;
+        }
+
+        batch.set(monthRef, {
+            building,
+            month: monthKey,
+            rooms: {
+                [String(roomId)]: roomPayload
+            },
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+    });
+    await batch.commit();
+}
+
+async function patchPriceSyncMonthCacheFields(building, roomId, roomName, dateFieldPatches = {}) {
+    const grouped = groupPriceDatesByMonth(dateFieldPatches);
+    const monthKeys = Object.keys(grouped);
+    if (monthKeys.length === 0) return;
+
+    const buildingRef = db.collection("price_sync").doc(building);
+    for (const monthKey of monthKeys) {
+        const monthRef = buildingRef.collection("months").doc(monthKey);
+        await monthRef.set({
+            building,
+            month: monthKey,
+            rooms: {
+                [String(roomId)]: {
+                    roomName,
+                    roomId: String(roomId),
+                    dates: {}
+                }
+            },
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        const updates = {
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            [`rooms.${String(roomId)}.lastSyncRoom`]: admin.firestore.FieldValue.serverTimestamp()
+        };
+        Object.entries(grouped[monthKey]).forEach(([dateKey, fields]) => {
+            Object.entries(fields || {}).forEach(([field, value]) => {
+                updates[`rooms.${String(roomId)}.dates.${dateKey}.${field}`] = value;
+            });
+        });
+        await monthRef.update(updates);
+    }
+}
+
+async function readPriceSyncMonthCache({ buildingRef, building, fromKey, toKey, filterRoomDataByDateRange }) {
+    const monthKeys = getPriceCacheMonthKeys(fromKey, toKey);
+    if (monthKeys.length === 0) return { hit: false, priceData: {}, monthKeys };
+
+    const monthRefs = monthKeys.map((monthKey) => buildingRef.collection("months").doc(monthKey));
+    const monthSnaps = await db.getAll(...monthRefs);
+    const existingSnaps = monthSnaps.filter((snap) => snap.exists);
+    if (existingSnaps.length === 0) return { hit: false, priceData: {}, monthKeys };
+    if (existingSnaps.length !== monthKeys.length) return { hit: false, priceData: {}, monthKeys };
+
+    const priceData = {};
+    existingSnaps.forEach((snap) => {
+        const rooms = snap.data()?.rooms || {};
+        Object.entries(rooms).forEach(([roomId, roomData]) => {
+            if (!priceData[roomId]) {
+                priceData[roomId] = {
+                    roomName: roomData.roomName,
+                    roomId: String(roomId),
+                    dates: {}
+                };
+            }
+            Object.assign(priceData[roomId].dates, roomData.dates || {});
+        });
+    });
+
+    Object.keys(priceData).forEach((roomId) => {
+        priceData[roomId] = filterRoomDataByDateRange(priceData[roomId]);
+    });
+
+    const expectedRoomIds = (BUILDING_ROOMS[building] || []).map((room) => String(room.roomId));
+    const hasAllExpectedRooms = expectedRoomIds.length > 0 && expectedRoomIds.every((roomId) => {
+        return existingSnaps.every((snap) => snap.data()?.rooms?.[roomId]?.cacheComplete === true);
+    });
+    return { hit: hasAllExpectedRooms, priceData, monthKeys };
+}
+
 exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
     try {
         const { companyId, building, dateFrom, dateTo } = req.body;
@@ -3707,11 +3833,28 @@ exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
         }
 
         // 새 구조: rooms 서브컬렉션에서 모든 방 데이터 가져오기
-        const priceData = {};
-        const roomsSnap = await docRef.collection("rooms").get();
-        roomsSnap.forEach(roomDoc => {
-            priceData[roomDoc.id] = filterRoomDataByDateRange(roomDoc.data());
-        });
+        let priceData = {};
+        let cacheMode = "legacy_rooms";
+        if (useDateRangeFilter) {
+            const monthCache = await readPriceSyncMonthCache({
+                buildingRef: docRef,
+                building,
+                fromKey,
+                toKey,
+                filterRoomDataByDateRange
+            });
+            if (monthCache.hit) {
+                priceData = monthCache.priceData;
+                cacheMode = "month_slices";
+            }
+        }
+
+        if (Object.keys(priceData).length === 0) {
+            const roomsSnap = await docRef.collection("rooms").get();
+            roomsSnap.forEach(roomDoc => {
+                priceData[roomDoc.id] = filterRoomDataByDateRange(roomDoc.data());
+            });
+        }
         Object.entries(liveRoomDataById).forEach(([roomId, roomData]) => {
             priceData[roomId] = filterRoomDataByDateRange(roomData);
         });
@@ -3730,6 +3873,7 @@ exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
             requestedDateTo: useDateRangeFilter ? `${toKey.slice(0, 4)}-${toKey.slice(4, 6)}-${toKey.slice(6, 8)}` : null,
             lastSync: lastSync?.toISOString(),
             syncAge: diffMinutes,
+            cacheMode,
             roomCount: Object.keys(priceData).length // 실제 로드된 방 개수
         });
     } catch (e) {
@@ -4253,6 +4397,13 @@ async function processPriceJob(jobId) {
                                     }
                                 });
                                 await roomDocRef.set(roomData, { merge: true });
+                                const changedDatesForMonthCache = {};
+                                Object.keys(roomDates).forEach((dKey) => {
+                                    if (roomData.dates?.[dKey]) {
+                                        changedDatesForMonthCache[dKey] = roomData.dates[dKey];
+                                    }
+                                });
+                                await mergePriceSyncMonthCache(building, rid, roomData.roomName || getRoomNameByRoomId(rid), changedDatesForMonthCache);
                             } catch (cacheErr) {
                                 console.error(`[PriceJob ${jobId}] 캐시 패치 실패 roomId=${rid}:`, cacheErr.message);
                             }
@@ -4800,6 +4951,7 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, 
                     roomData.dates[dKey].m = String(values.m);
                 });
                 await roomDocRef.set(roomData, { merge: true });
+                await mergePriceSyncMonthCache(building, sRid, roomData.roomName || getRoomNameByRoomId(sRid), group.datesToUpdate);
             } catch (err) {
                 console.error(`[setMinStay] 캐시 패치 실패 roomId=${roomId}:`, err.message);
             }
@@ -5009,6 +5161,7 @@ async function syncSingleRoomPriceCache(building, roomId, roomName, { reason = "
         outputImpact: buildPriceOutputImpact({ building, roomName, roomId: String(roomId), fromDate, toDate }),
         lastSyncRoom: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
+    await mergePriceSyncMonthCache(building, roomId, roomName, datesObj, { cacheComplete: true });
 
     try {
         await cleanupStaleInventoryOverrideBlocks({
@@ -5465,17 +5618,20 @@ async function patchPriceSyncForBlackout(building, roomId, arrival, departure) {
     if (!snap.exists) return;
     const currentDates = snap.data()?.dates || {};
     const updates = {};
+    const datesPatch = {};
     let d = dayjs(arrival);
     const depDate = dayjs(departure);
     while (d.isBefore(depDate)) {
         const dateKey = d.format("YYYYMMDD");
         if (currentDates[dateKey] !== undefined) {
             updates[`dates.${dateKey}.ov`] = "blackout";
+            datesPatch[dateKey] = { ov: "blackout" };
         }
         d = d.add(1, "day");
     }
     if (Object.keys(updates).length > 0) {
         await roomDocRef.update(updates);
+        await patchPriceSyncMonthCacheFields(building, roomId, snap.data()?.roomName || getRoomNameByRoomId(roomId), datesPatch);
     }
 }
 
@@ -5485,6 +5641,7 @@ async function patchPriceSyncForBlackoutClear(building, roomId, arrival, departu
     if (!snap.exists) return;
     const currentDates = snap.data()?.dates || {};
     const updates = {};
+    const datesPatch = {};
     let d = dayjs(arrival);
     const depDate = dayjs(departure);
     while (d.isBefore(depDate)) {
@@ -5492,15 +5649,18 @@ async function patchPriceSyncForBlackoutClear(building, roomId, arrival, departu
         const dayKey = d.format("YYYY-MM-DD");
         if (currentDates[dateKey] !== undefined) {
             updates[`dates.${dateKey}.ov`] = admin.firestore.FieldValue.delete();
+            datesPatch[dateKey] = { ov: admin.firestore.FieldValue.delete() };
             const restoredNumAvail = parseInt(restoreNumAvailByDate?.[dayKey], 10);
             if (Number.isFinite(restoredNumAvail)) {
                 updates[`dates.${dateKey}.na`] = String(restoredNumAvail);
+                datesPatch[dateKey].na = String(restoredNumAvail);
             }
         }
         d = d.add(1, "day");
     }
     if (Object.keys(updates).length > 0) {
         await roomDocRef.update(updates);
+        await patchPriceSyncMonthCacheFields(building, roomId, snap.data()?.roomName || getRoomNameByRoomId(roomId), datesPatch);
     }
 }
 

@@ -2848,6 +2848,7 @@ function BuildingCalendar() {
   const pendingPriceJobsRef = useRef({});
   const prevPendingJobIdsRef = useRef(new Set());
   const priceJobListenersRef = useRef({});
+  const reservationUnsubRef = useRef(null);
   const lastInterventionFetchKeyRef = useRef(null);
   const lastInterventionFetchAtRef = useRef(0);
   const [priceJobToast, setPriceJobToast] = useState(null);     // { status: 'success'|'error'|'partial'|'queued', message }
@@ -4291,10 +4292,236 @@ function BuildingCalendar() {
     }
   }, [companyId, selectedBuilding, year, month, daysInMonth, showCancelled, viewMode, rollingStartDate, portfolioAnalysisRange.startDate, portfolioAnalysisRange.endDate]);
 
-  // 예약 데이터 재조회 트리거
+  // 전체 뷰 — getDocs 기반 조회 (portfolioAnalysisRange 의존)
   useEffect(() => {
-    fetchReservations();
-  }, [fetchReservations]);
+    if (selectedBuilding === '전체') fetchReservations();
+  }, [fetchReservations, selectedBuilding]);
+
+  // 단일 building 실시간 구독 — building/기간 변경 시 listener 교체, 언마운트 시 해제
+  useEffect(() => {
+    if (!companyId || selectedBuilding === '전체') {
+      if (reservationUnsubRef.current) {
+        try { reservationUnsubRef.current(); } catch (_) {}
+        reservationUnsubRef.current = null;
+      }
+      return;
+    }
+
+    let rangeStart, rangeEnd;
+    if (viewMode === "rolling") {
+      rangeStart = dayjs(rollingStartDate).format('YYYY-MM-DD');
+      rangeEnd = dayjs(rollingStartDate).add(30, 'day').format('YYYY-MM-DD');
+    } else {
+      rangeStart = `${year}-${String(month + 1).padStart(2, '0')}-01`;
+      rangeEnd = `${year}-${String(month + 1).padStart(2, '0')}-${daysInMonth}`;
+    }
+    const extendedRangeStart = dayjs(rangeStart).subtract(1, 'day').format('YYYY-MM-DD');
+    const extendedRangeEnd = dayjs(rangeEnd).add(1, 'day').format('YYYY-MM-DD');
+    const statuses = showCancelled
+      ? ["confirmed", "cancelled", "blackout", "maintenance"]
+      : ["confirmed", "blackout", "maintenance"];
+
+    if (reservationUnsubRef.current) {
+      try { reservationUnsubRef.current(); } catch (_) {}
+      reservationUnsubRef.current = null;
+    }
+
+    setLoading(true);
+
+    let retryCount = 0;
+    let retryTimerId = null;
+    let q2FallbackTimerId = null;
+    // Q1/Q2 동시 에러 시 retry가 중복 예약되지 않도록 guard
+    let isRetryScheduled = false;
+
+    const startSubscription = () => {
+      isRetryScheduled = false; // 진입마다 초기화
+      // [P1] 두 쿼리로 분할해 서버에서 구독 범위를 현재 기간으로 제한
+      // Q1: 범위 내 체크아웃 예약 (이전에 도착해 이 기간 안에 나가는 체류 포함)
+      // Q2: 범위 내 체크인 예약 (이 기간에 도착해 이후에 나가는 체류 포함)
+      // 두 쿼리를 병합해 전체 화면 기간을 교차하는 모든 예약을 커버
+      // (단, 기간 전체를 가로지르는 초장기 체류는 클라이언트 필터에서 처리)
+      let q1Docs = [];
+      let q2Docs = [];
+      // qLong: 장기 체류 실시간 구독 (arrival <= start && departure >= end)
+      // 인덱스 없을 때는 onQLongError에서 getDocs 폴백으로 1회 보완
+      let qLongDocs = new Map();
+
+      const applyFilter = () => {
+        if (!isMountedRef.current) return;
+        retryCount = 0; // 정상 snapshot — 연속 실패 카운터 리셋
+        // qLongDocs(장기 체류)를 베이스로 Q1/Q2 live 데이터를 덮어써 병합
+        const byId = new Map(qLongDocs);
+        [...q1Docs, ...q2Docs].forEach(d => byId.set(d.id, d));
+        const filtered = [...byId.values()].filter(r => {
+          if (!r.arrival || !r.departure) return false;
+          return r.arrival <= extendedRangeEnd && r.departure >= extendedRangeStart;
+        });
+        setReservations(filtered);
+        setLoading(false);
+      };
+
+      // 에러 시 지수 백오프 재구독 — isRetryScheduled로 Q1/Q2 동시 에러도 1회만 처리
+      const onError = (error) => {
+        if (isRetryScheduled) return;
+        isRetryScheduled = true;
+        console.warn('[BuildingCalendar] reservation onSnapshot 오류:', error.message);
+        if (reservationUnsubRef.current) {
+          try { reservationUnsubRef.current(); } catch (_) {}
+          reservationUnsubRef.current = null;
+        }
+        if (retryCount < 5 && isMountedRef.current) {
+          const delay = 2000 * Math.pow(2, retryCount++);
+          retryTimerId = setTimeout(() => {
+            if (isMountedRef.current) startSubscription();
+          }, delay);
+        } else if (isMountedRef.current) {
+          fetchReservations(); // 데이터 최소 보장
+          // 60s 복구 루프 — retryCount 리셋 후 재진입으로 실시간 끊김 방지
+          retryTimerId = setTimeout(() => {
+            if (isMountedRef.current) { retryCount = 0; startSubscription(); }
+          }, 60000);
+        }
+      };
+
+      // qLong 인덱스 없을 때: getDocs 폴백으로 장기 체류 1회 보완 (비치명적)
+      const onQLongError = (error) => {
+        if (!isMountedRef.current) return;
+        if (error.code === 'failed-precondition') {
+          console.warn('[BuildingCalendar] qLong 인덱스 없음, getDocs 폴백');
+          const fallbackQ = query(
+            collection(db, "reservations"),
+            where("companyId", "==", companyId),
+            where("building", "==", selectedBuilding),
+            where("status", "in", statuses),
+            where("departure", ">=", extendedRangeStart)
+          );
+          getDocs(fallbackQ).then(snap => {
+            if (!isMountedRef.current) return;
+            const nextLongMap = new Map();
+            snap.docs.forEach(d => {
+              const item = { id: d.id, ...d.data() };
+              if (item.arrival && item.departure &&
+                  item.arrival <= extendedRangeStart &&
+                  item.departure >= extendedRangeEnd) {
+                nextLongMap.set(d.id, item);
+              }
+            });
+            qLongDocs = nextLongMap;
+            applyFilter();
+          }).catch((err) => onError(err));
+        } else {
+          onError(error);
+        }
+      };
+
+      const loadQ2Fallback = async () => {
+        const fallbackQ = query(
+          collection(db, "reservations"),
+          where("companyId", "==", companyId),
+          where("building", "==", selectedBuilding),
+          where("status", "in", statuses),
+          where("departure", ">=", extendedRangeStart)
+        );
+        const snap = await getDocs(fallbackQ);
+        if (!isMountedRef.current) return;
+        q2Docs = snap.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .filter((r) => r.arrival && r.arrival >= extendedRangeStart && r.arrival <= extendedRangeEnd);
+        applyFilter();
+      };
+
+      const scheduleQ2FallbackRefresh = () => {
+        if (q2FallbackTimerId) clearTimeout(q2FallbackTimerId);
+        q2FallbackTimerId = setTimeout(async () => {
+          if (!isMountedRef.current) return;
+          try {
+            await loadQ2Fallback();
+          } catch (_) {
+            // q2 fallback refresh failure is tolerated; q1/qLong still keep base coverage
+          } finally {
+            if (isMountedRef.current) scheduleQ2FallbackRefresh();
+          }
+        }, 60000);
+      };
+
+      // Q2 인덱스 누락 시 fallback snapshot + 60s refresh 루프로 누락 방지
+      const onQ2Error = (error) => {
+        if (error.code === 'failed-precondition') {
+          console.warn('[BuildingCalendar] arrival 인덱스 없음, Q1+qLong으로 구독 유지');
+          loadQ2Fallback()
+            .then(() => scheduleQ2FallbackRefresh())
+            .catch((err) => onError(err));
+        } else {
+          onError(error);
+        }
+      };
+
+      const q1 = query(
+        collection(db, "reservations"),
+        where("companyId", "==", companyId),
+        where("building", "==", selectedBuilding),
+        where("status", "in", statuses),
+        where("departure", ">=", extendedRangeStart),
+        where("departure", "<=", extendedRangeEnd)
+      );
+      const q2 = query(
+        collection(db, "reservations"),
+        where("companyId", "==", companyId),
+        where("building", "==", selectedBuilding),
+        where("status", "in", statuses),
+        where("arrival", ">=", extendedRangeStart),
+        where("arrival", "<=", extendedRangeEnd)
+      );
+
+      // Q1: 범위 내 체크아웃 예약 (범위 전 도착 → 범위 내 출발 포함)
+      // Q2: 범위 내 체크인 예약 (범위 내 도착 → 범위 후 출발 포함)
+      // qLong: 범위 전체를 가로지르는 장기 체류 실시간 구독
+      const qLong = query(
+        collection(db, "reservations"),
+        where("companyId", "==", companyId),
+        where("building", "==", selectedBuilding),
+        where("status", "in", statuses),
+        where("arrival", "<=", extendedRangeStart),
+        where("departure", ">=", extendedRangeEnd)
+      );
+
+      const unsub1 = onSnapshot(q1, (snap) => {
+        q1Docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        applyFilter();
+      }, onError);
+
+      const unsub2 = onSnapshot(q2, (snap) => {
+        q2Docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        applyFilter();
+      }, onQ2Error);
+
+      const unsubLong = onSnapshot(qLong, (snap) => {
+        const newMap = new Map();
+        snap.docs.forEach(d => newMap.set(d.id, { id: d.id, ...d.data() }));
+        qLongDocs = newMap;
+        applyFilter();
+      }, onQLongError);
+
+      reservationUnsubRef.current = () => {
+        try { unsub1(); } catch (_) {}
+        try { unsub2(); } catch (_) {}
+        try { unsubLong(); } catch (_) {}
+      };
+    };
+
+    startSubscription();
+
+    return () => {
+      if (retryTimerId) clearTimeout(retryTimerId);
+      if (q2FallbackTimerId) clearTimeout(q2FallbackTimerId);
+      if (reservationUnsubRef.current) {
+        try { reservationUnsubRef.current(); } catch (_) {}
+        reservationUnsubRef.current = null;
+      }
+    };
+  // fetchReservations는 에러 최종 fallback 전용 — portfolioAnalysisRange 변경이 이 effect를 불필요하게 트리거하지 않도록 의존성 제외
+  }, [companyId, selectedBuilding, year, month, daysInMonth, showCancelled, viewMode, rollingStartDate]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const externalInventoryBlocks = useMemo(() => {
     if (!calendarBuilding || calendarBuilding === '전체' || stableDisplayDays.length === 0 || rooms.length === 0) return [];
