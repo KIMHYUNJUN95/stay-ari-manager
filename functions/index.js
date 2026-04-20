@@ -5203,10 +5203,23 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
 
             try {
                 if (syncResult?.success) {
-                    await db.collection("price_sync").doc(building).update({
-                        invalidatedRoomIds: admin.firestore.FieldValue.arrayRemove(roomIdStr),
-                        lastWebhookAt: admin.firestore.FieldValue.serverTimestamp(),
-                        lastSyncAt: admin.firestore.FieldValue.serverTimestamp()
+                    await db.runTransaction(async (tx) => {
+                        const snap = await tx.get(priceSyncDoc);
+                        const data = snap.data() || {};
+                        const currentIds = new Set((data.invalidatedRoomIds || []).map(String));
+                        currentIds.delete(roomIdStr);
+                        const remaining = [...currentIds];
+                        const updates = {
+                            invalidatedRoomIds: remaining,
+                            pendingInvalidationCount: remaining.length,
+                            lastWebhookAt: admin.firestore.FieldValue.serverTimestamp(),
+                            lastSyncAt: admin.firestore.FieldValue.serverTimestamp()
+                        };
+                        if (remaining.length === 0) {
+                            updates.invalidatedAt = admin.firestore.FieldValue.delete();
+                            updates.invalidatedBy = admin.firestore.FieldValue.delete();
+                        }
+                        tx.update(priceSyncDoc, updates);
                     });
                     await recordPriceSyncAudit({
                         syncType: "webhook",
