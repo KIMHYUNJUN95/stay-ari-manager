@@ -84,6 +84,17 @@ const getMonthKey = (dateStr) => {
 
 const avg = (arr) => arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : 0;
 
+const getReplyText = (reply) => {
+  if (!reply) return "";
+  if (typeof reply === "string") return reply.trim();
+  if (typeof reply === "object") {
+    if (typeof reply.text === "string") return reply.text.trim();
+    if (typeof reply.message === "string") return reply.message.trim();
+    return "";
+  }
+  return String(reply);
+};
+
 // ─── Data Computation ─────────────────────────────────────────────────────────
 
 function computeBuildingStats(reviews) {
@@ -986,10 +997,10 @@ function ReviewsTab({ reviews, channel: parentChannel, dateSearchReversed, hasDa
             )}
 
             {/* Reply */}
-            {r.reply && (
+            {getReplyText(r.reply) && (
               <div style={{ marginTop: 10, padding: "10px 14px", background: "#F8FAFC", borderRadius: 8, borderLeft: "3px solid #4F46E5" }}>
                 <div style={{ fontSize: 11, color: "#4F46E5", fontWeight: 600, marginBottom: 4 }}>Host Reply</div>
-                <p style={{ fontSize: 12, color: "#374151", lineHeight: 1.5, margin: 0 }}>{r.reply}</p>
+                <p style={{ fontSize: 12, color: "#374151", lineHeight: 1.5, margin: 0 }}>{getReplyText(r.reply)}</p>
               </div>
             )}
           </motion.div>

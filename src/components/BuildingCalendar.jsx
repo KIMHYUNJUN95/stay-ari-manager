@@ -59,7 +59,7 @@ const BUILDING_ROOMS = {
     { roomId: "543189", name: "502호" }, { roomId: "601560", name: "502호" },
     { roomId: "383985", name: "603호" }, { roomId: "452064", name: "603호" },
     { roomId: "441885", name: "802호" }, { roomId: "452065", name: "802호" },
-    { roomId: "624198", name: "803호" }, { roomId: "648398", name: "803호" }
+    { roomId: "648398", name: "803호" }, { roomId: "624198", name: "803호" }
   ],
   "오쿠보A동": [{ roomId: "437952", name: "오쿠보A" }],
   "오쿠보B동": [{ roomId: "615969", name: "오쿠보B" }],
@@ -79,8 +79,17 @@ const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || "https://us-central1-
 
 // 비활성 계정 minStay 기준값 (50 이상 = 비활성 판단)
 const INACTIVE_MINSTAY_THRESHOLD = 50;
+const PREFERRED_DUAL_ROOM_IDS = {
+  "가부키초__803호": "648398"
+};
 const PRICE_INTERVENTION_LIMIT = 400;
 const CALENDAR_NUMERIC_FONT_FAMILY = '"Bahnschrift", "DIN Alternate", "Inter", "Aptos", "Segoe UI", sans-serif';
+
+function pickPreferredRoomInfo(buildingName, roomName, roomInfos) {
+  const preferredRoomId = PREFERRED_DUAL_ROOM_IDS[`${buildingName}__${roomName}`];
+  if (!preferredRoomId || !Array.isArray(roomInfos) || roomInfos.length === 0) return roomInfos?.[0] || null;
+  return roomInfos.find((info) => String(info.roomId) === String(preferredRoomId)) || roomInfos[0];
+}
 
 // 가격 설정 모달 (고급 버전)
 function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose, onSave, onJobQueued, selectedRooms, selectedCells, companyId, pendingPriceCellMap }) {
@@ -1785,7 +1794,7 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
     const lowerGuestName = String(guestName || "").toLowerCase();
     const isBlackout = lowerGuestName.includes("blackout") || lowerGuestName.includes("room block");
     const isBlockGuest = isBlackout;
-    let mainRoomInfo = targetRoomInfos[0];
+    let mainRoomInfo = pickPreferredRoomInfo(building, room, targetRoomInfos);
     if (targetRoomInfos.length > 1 && !isBlockGuest) {
       const stayDates = [];
       let cursor = dayjs(arrival);
@@ -1802,7 +1811,8 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
           const minStay = parseInt(priceInfo?.m, 10);
           return Number.isFinite(minStay) && minStay >= 1 && minStay < INACTIVE_MINSTAY_THRESHOLD;
         });
-        return activeInfos[0] ? String(activeInfos[0].roomId) : "";
+        const preferredInfo = pickPreferredRoomInfo(building, room, activeInfos);
+        return preferredInfo ? String(preferredInfo.roomId) : "";
       });
 
       const unresolvedDates = stayDates.filter((_, idx) => !resolvedIdsByDate[idx]);
@@ -1835,10 +1845,12 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
           const minStay = parseInt(priceInfo?.m, 10);
           return Number.isFinite(minStay) && minStay >= 1 && minStay < INACTIVE_MINSTAY_THRESHOLD;
         });
-        return activeInfos[0] || null;
+        return pickPreferredRoomInfo(building, room, activeInfos);
       };
 
-      const firstInfo = stayDates[0] ? resolveRoomInfoForDate(stayDates[0]) : targetRoomInfos[0];
+      const firstInfo = stayDates[0]
+        ? resolveRoomInfoForDate(stayDates[0])
+        : pickPreferredRoomInfo(building, room, targetRoomInfos);
       if (!firstInfo) {
         alert("Active room could not be resolved for this block stay after building change. Please refresh prices and try again.");
         return;
@@ -3741,9 +3753,20 @@ function BuildingCalendar() {
           .filter(d => d.date >= today)
           .map(d => d.dateStr);
 
-      const newCells = datesToUse.map(date => ({ room, date }));
+      const newCells = [];
+      let skipped = 0;
+      datesToUse.forEach((date) => {
+        if (priceMode && isCellPriceBlocked(room, date)) { skipped++; return; }
+        if (selectedCellKeySet.has(getSelectedCellKey(room, date))) return;
+        newCells.push({ room, date });
+      });
       setSelectedCells(prev => [...prev, ...newCells]);
       setSelectedRoom(room);
+      if (newCells.length === 0) {
+        setBulkSelectMsg('No vacant cells available for selected scope');
+      } else {
+        setBulkSelectMsg(skipped > 0 ? `${skipped} occupied cell${skipped > 1 ? 's' : ''} excluded` : '');
+      }
     }
   };
 
@@ -3765,7 +3788,8 @@ function BuildingCalendar() {
       selectableRooms.forEach(room => {
         selectedDates.forEach(date => {
           if (selectedCellKeySet.has(getSelectedCellKey(room, date))) return;
-          if (isCellOccupied(room, date)) { skipped++; return; }
+          const blocked = priceMode ? isCellPriceBlocked(room, date) : isCellOccupied(room, date);
+          if (blocked) { skipped++; return; }
           newCells.push({ room, date });
         });
       });
@@ -3816,7 +3840,8 @@ function BuildingCalendar() {
     let skipped = 0;
     roomsToUse.forEach(room => {
       newDates.forEach(date => {
-        if (isCellOccupied(room, date)) { skipped++; return; }
+        const blocked = priceMode ? isCellPriceBlocked(room, date) : isCellOccupied(room, date);
+        if (blocked) { skipped++; return; }
         newCells.push({ room, date });
       });
     });
@@ -4479,6 +4504,20 @@ function BuildingCalendar() {
     return reservations.some(r => date >= r.arrival && date < r.departure);
   }, [roomReservationsMap]);
 
+  // Price edit availability follows the same rule as cell-level canEditSelect:
+  // non-cancelled reservations block selection, but blackout/inventory blocks do not.
+  const isCellPriceBlocked = useCallback((room, date) => {
+    const reservations = roomReservationsMap[room] || [];
+    return reservations.some((reservation) =>
+      date >= reservation.arrival &&
+      date < reservation.departure &&
+      reservation.status !== "cancelled" &&
+      reservation.status !== "blackout" &&
+      !reservation.isExternalInventoryBlock &&
+      !reservation.isInventoryOverrideBlock
+    );
+  }, [roomReservationsMap]);
+
   const activePriceInterventionLogs = useMemo(() => {
     if (!calendarBuilding || calendarBuilding === "전체") {
       return priceInterventionLogs;
@@ -4566,9 +4605,11 @@ function BuildingCalendar() {
       isOneNightMinStayGap: false
     };
 
-    // Row-level vacancy: same source as cell renderer (includes all statuses).
+    // Row-level vacancy shortcut is only safe for single-room units.
+    // Dual rooms must be checked by resolved roomId-aware status below.
+    const dualRoomCount = (BUILDING_ROOMS[calendarBuilding] || []).filter((info) => info.name === roomName).length;
     const rowRes = roomReservationsMap[roomName] || [];
-    if (rowRes.some(r => dateStr >= r.arrival && dateStr < r.departure)) return noGap;
+    if (dualRoomCount <= 1 && rowRes.some(r => dateStr >= r.arrival && dateStr < r.departure)) return noGap;
 
     // minStay: same calculation as cell renderer badge value (getDisplayUnitInfosForDate based).
     const cellMinStay = getCellMinStayForDate(roomName, dateStr);
@@ -4603,6 +4644,14 @@ function BuildingCalendar() {
     const overlapsDate = (reservations, targetDateStr) => reservations.some((reservation) =>
       targetDateStr >= reservation.arrival && targetDateStr < reservation.departure
     );
+    const isSellableByPriceInfo = (priceInfo) => {
+      const ms = parseInt(priceInfo?.m, 10);
+      if (!Number.isFinite(ms) || ms < 1 || ms >= INACTIVE_MINSTAY_THRESHOLD) return false;
+      if (String(priceInfo?.ov || "").toLowerCase() === "blackout") return false;
+      const numAvail = parseInt(priceInfo?.na, 10);
+      if (Number.isFinite(numAvail) && numAvail <= 0) return false;
+      return true;
+    };
     const todayStr = dayjs().format('YYYY-MM-DD');
     const previousDateStr = dayjs(dateStr).subtract(1, 'day').format('YYYY-MM-DD');
     const nextDateStr = dayjs(dateStr).add(1, 'day').format('YYYY-MM-DD');
@@ -4620,7 +4669,11 @@ function BuildingCalendar() {
       if (!(targetMinStay >= 1 && targetMinStay < INACTIVE_MINSTAY_THRESHOLD)) {
         return { status: "blocked", reason: "inactive_room" };
       }
-      if (overlapsDate(roomAllReservationsMap[roomName] || [], targetDateStr)) {
+      const numAvail = parseInt(priceInfo?.na, 10);
+      if (Number.isFinite(numAvail) && numAvail <= 0) {
+        return { status: "blocked", reason: "numavail_zero" };
+      }
+      if (overlapsDate(buildUnitReservations(targetRoomId), targetDateStr)) {
         return { status: "blocked", reason: "reservation_or_block" };
       }
       return { status: "available", reason: "sellable" };
@@ -4628,7 +4681,7 @@ function BuildingCalendar() {
 
     const getDualRoomStatus = (targetDateStr, targetRoomId) => {
       if (overlapsDate(genericUnknownReservations, targetDateStr)) {
-        return { status: "unknown", reason: "generic_reservation_without_roomid" };
+        return { status: "blocked", reason: "generic_reservation_without_roomid" };
       }
       if (overlapsDate(genericBlockingReservations, targetDateStr)) {
         return { status: "blocked", reason: "generic_block_without_roomid" };
@@ -4636,20 +4689,17 @@ function BuildingCalendar() {
 
       const activeInfos = roomInfos.filter((info) => {
         const targetPriceInfo = getPriceInfoForRoomIdDate(info.roomId, targetDateStr);
-        const ms = parseInt(targetPriceInfo?.m, 10);
-        return Number.isFinite(ms) &&
-          ms >= 1 &&
-          ms < INACTIVE_MINSTAY_THRESHOLD &&
-          String(targetPriceInfo?.ov || "").toLowerCase() !== "blackout";
+        return isSellableByPriceInfo(targetPriceInfo);
       });
 
-      if (activeInfos.length > 1) {
-        return { status: "unknown", reason: "multiple_active_roomids" };
-      }
       if (activeInfos.length === 0) {
         return { status: "blocked", reason: "no_active_roomid" };
       }
-      if (String(activeInfos[0].roomId) !== String(targetRoomId)) {
+      const resolvedActiveInfo = pickPreferredRoomInfo(calendarBuilding, roomName, activeInfos);
+      if (!resolvedActiveInfo) {
+        return { status: "unknown", reason: "multiple_active_roomids" };
+      }
+      if (String(resolvedActiveInfo.roomId) !== String(targetRoomId)) {
         return { status: "blocked", reason: "different_roomid_active" };
       }
       if (overlapsDate(buildUnitReservations(targetRoomId), targetDateStr)) {
@@ -4660,7 +4710,7 @@ function BuildingCalendar() {
 
     const getDualRoomPhysicalStatus = (targetDateStr) => {
       if (overlapsDate(genericUnknownReservations, targetDateStr)) {
-        return { status: "unknown", reason: "generic_reservation_without_roomid" };
+        return { status: "blocked", reason: "generic_reservation_without_roomid" };
       }
       if (overlapsDate(genericBlockingReservations, targetDateStr)) {
         return { status: "blocked", reason: "generic_block_without_roomid" };
@@ -4668,20 +4718,17 @@ function BuildingCalendar() {
 
       const activeInfos = roomInfos.filter((info) => {
         const targetPriceInfo = getPriceInfoForRoomIdDate(info.roomId, targetDateStr);
-        const ms = parseInt(targetPriceInfo?.m, 10);
-        return Number.isFinite(ms) &&
-          ms >= 1 &&
-          ms < INACTIVE_MINSTAY_THRESHOLD &&
-          String(targetPriceInfo?.ov || "").toLowerCase() !== "blackout";
+        return isSellableByPriceInfo(targetPriceInfo);
       });
 
       if (activeInfos.length === 0) {
         return { status: "blocked", reason: "no_active_roomid" };
       }
-      if (activeInfos.length > 1) {
+      const resolvedActiveInfo = pickPreferredRoomInfo(calendarBuilding, roomName, activeInfos);
+      if (!resolvedActiveInfo) {
         return { status: "unknown", reason: "multiple_active_roomids" };
       }
-      if (overlapsDate(buildUnitReservations(activeInfos[0].roomId), targetDateStr)) {
+      if (overlapsDate(buildUnitReservations(resolvedActiveInfo.roomId), targetDateStr)) {
         return { status: "blocked", reason: "active_roomid_reserved_or_blocked" };
       }
       return { status: "available", reason: "physical_room_sellable" };
@@ -4696,8 +4743,9 @@ function BuildingCalendar() {
       const sellableInfos = roomInfos.filter((info) =>
         getDualRoomStatus(dateStr, String(info.roomId)).status === "available"
       );
-      if (sellableInfos.length === 1) {
-        resolvedRoomId = String(sellableInfos[0].roomId);
+      if (sellableInfos.length >= 1) {
+        const preferredSellableInfo = pickPreferredRoomInfo(calendarBuilding, roomName, sellableInfos);
+        resolvedRoomId = preferredSellableInfo ? String(preferredSellableInfo.roomId) : null;
         currentDateStatusInfo = { status: "available", reason: "sellable" };
       }
     }
@@ -4825,7 +4873,7 @@ function BuildingCalendar() {
           );
           if (isReserved) continue; // 해당 room/date는 건너뜀
           const activeInfos = getActiveUnitInfosForDate(roomName, dateStr);
-          const roomInfo = activeInfos[0];
+          const roomInfo = pickPreferredRoomInfo(calendarBuilding, roomName, activeInfos);
           if (!roomInfo) continue; // 해당 room/date는 건너뜀
           const priceData = roomPrices[roomInfo.roomId]?.dates?.[dateKey];
           if (priceData) {
@@ -4864,7 +4912,7 @@ function BuildingCalendar() {
 
       rooms.forEach((roomName) => {
         const activeInfos = getActiveUnitInfosForDate(roomName, dateStr);
-        const roomInfo = activeInfos[0];
+        const roomInfo = pickPreferredRoomInfo(calendarBuilding, roomName, activeInfos);
         if (!roomInfo) return;
 
         const priceData = roomPrices?.[roomInfo.roomId]?.dates?.[dateKey];
@@ -5428,7 +5476,7 @@ function BuildingCalendar() {
     if (selectedBuilding === '전체') return 0;
             const dateKey = dStr.replace(/-/g, '');
             const activeInfos = getActiveUnitInfosForDate(roomName, dStr);
-            const firstRoomInfo = activeInfos[0];
+            const firstRoomInfo = pickPreferredRoomInfo(calendarBuilding, roomName, activeInfos);
             if (!firstRoomInfo) return 0;
             const priceData = roomPrices?.[firstRoomInfo.roomId]?.dates?.[dateKey];
             return priceData ? (parseFloat(priceData.p1) || 0) : 0;
@@ -6617,6 +6665,7 @@ function BuildingCalendar() {
             display: "flex",
             gap: "8px",
             overflowX: "auto",
+            paddingTop: "2px",
             paddingBottom: "2px",
             scrollbarWidth: "none",
             msOverflowStyle: "none"
@@ -6642,7 +6691,7 @@ function BuildingCalendar() {
                   padding: "9px 18px",
                   minHeight: "40px",
                   borderRadius: "12px",
-                  border: isActive ? "none" : `1px solid ${isSold ? "#FECACA" : "#CBD5E1"}`,
+                  border: `1px solid ${isActive ? "rgba(255,255,255,0.16)" : (isSold ? "#FECACA" : "#CBD5E1")}`,
                   background: isActive
                     ? "linear-gradient(135deg, #1E293B 0%, #0F172A 100%)"
                     : isSold ? "#FEF2F2" : "#FFFFFF",
@@ -6653,7 +6702,7 @@ function BuildingCalendar() {
                   whiteSpace: "nowrap",
                   transition: "all 0.2s ease",
                   boxShadow: isActive
-                    ? "0 8px 18px rgba(30, 41, 59, 0.22)"
+                    ? "inset 0 1px 0 rgba(255,255,255,0.22), 0 8px 18px rgba(30, 41, 59, 0.22)"
                     : "0 1px 2px rgba(15,23,42,0.04)",
                   flexShrink: 0
                 }}

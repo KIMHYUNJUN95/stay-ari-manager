@@ -3365,7 +3365,7 @@ const BUILDING_ROOMS = {
         { roomId: "543189", name: "502호" }, { roomId: "601560", name: "502호" },
         { roomId: "383985", name: "603호" }, { roomId: "452064", name: "603호" },
         { roomId: "441885", name: "802호" }, { roomId: "452065", name: "802호" },
-        { roomId: "624198", name: "803호" }, { roomId: "648398", name: "803호" }
+        { roomId: "648398", name: "803호" }, { roomId: "624198", name: "803호" }
     ],
     "다카다노바바": [
         { roomId: "513698", name: "201호" }, { roomId: "513699", name: "301호" },
@@ -4689,12 +4689,17 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, 
                     return String(explicitRoomId);
                 }
                 if (roomInfos.length === 1) return String(roomInfos[0].roomId);
+                const activeRoomIds = [];
                 for (const info of roomInfos) {
                     const rid = String(info.roomId);
                     const m = parseInt(roomCacheByRoomId[rid]?.dates?.[dateKey]?.m, 10);
-                    if (Number.isFinite(m) && m >= 1 && m < INACTIVE_MS_THRESHOLD) return rid;
+                    if (Number.isFinite(m) && m >= 1 && m < INACTIVE_MS_THRESHOLD) activeRoomIds.push(rid);
                 }
-                return null;
+                if (activeRoomIds.length === 0) return null;
+                if (building === "가부키초" && rn === "803호" && activeRoomIds.includes("648398")) {
+                    return "648398";
+                }
+                return activeRoomIds[0];
             };
 
             if (normalizedCells.length > 0) {
