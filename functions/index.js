@@ -3678,7 +3678,6 @@ async function readPriceSyncMonthCache({ buildingRef, building, fromKey, toKey, 
     const monthSnaps = await db.getAll(...monthRefs);
     const existingSnaps = monthSnaps.filter((snap) => snap.exists);
     if (existingSnaps.length === 0) return { hit: false, priceData: {}, monthKeys };
-    if (existingSnaps.length !== monthKeys.length) return { hit: false, priceData: {}, monthKeys };
 
     const priceData = {};
     existingSnaps.forEach((snap) => {
@@ -3700,10 +3699,11 @@ async function readPriceSyncMonthCache({ buildingRef, building, fromKey, toKey, 
     });
 
     const expectedRoomIds = (BUILDING_ROOMS[building] || []).map((room) => String(room.roomId));
+    const hasAllRequestedMonths = existingSnaps.length === monthKeys.length;
     const hasAllExpectedRooms = expectedRoomIds.length > 0 && expectedRoomIds.every((roomId) => {
         return existingSnaps.every((snap) => snap.data()?.rooms?.[roomId]?.cacheComplete === true);
     });
-    return { hit: hasAllExpectedRooms, priceData, monthKeys };
+    return { hit: hasAllRequestedMonths && hasAllExpectedRooms, priceData, monthKeys };
 }
 
 exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
@@ -3835,8 +3835,9 @@ exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
         // 새 구조: rooms 서브컬렉션에서 모든 방 데이터 가져오기
         let priceData = {};
         let cacheMode = "legacy_rooms";
+        let monthCache = null;
         if (useDateRangeFilter) {
-            const monthCache = await readPriceSyncMonthCache({
+            monthCache = await readPriceSyncMonthCache({
                 buildingRef: docRef,
                 building,
                 fromKey,
@@ -3854,6 +3855,22 @@ exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
             roomsSnap.forEach(roomDoc => {
                 priceData[roomDoc.id] = filterRoomDataByDateRange(roomDoc.data());
             });
+        }
+        if (monthCache && !monthCache.hit && Object.keys(monthCache.priceData || {}).length > 0) {
+            Object.entries(monthCache.priceData).forEach(([roomId, roomData]) => {
+                const existing = priceData[roomId] || {};
+                priceData[roomId] = {
+                    ...existing,
+                    ...roomData,
+                    roomName: roomData.roomName || existing.roomName,
+                    roomId: String(roomId),
+                    dates: {
+                        ...(existing.dates || {}),
+                        ...(roomData.dates || {})
+                    }
+                };
+            });
+            cacheMode = "legacy_rooms_month_overlay";
         }
         Object.entries(liveRoomDataById).forEach(([roomId, roomData]) => {
             priceData[roomId] = filterRoomDataByDateRange(roomData);
@@ -4392,7 +4409,9 @@ async function processPriceJob(jobId) {
                                             u: jobData.worker || "Admin",
                                             t: nowFormatted,
                                             o: oldP1,
-                                            n: newP1
+                                            n: newP1,
+                                            s: "system",
+                                            ts: Date.now()
                                         };
                                     }
                                 });
@@ -4448,7 +4467,9 @@ async function processPriceJob(jobId) {
                                         u: jobData.worker || "Admin",
                                         t: nowFormatted,
                                         o: oldP1,
-                                        n: newP1
+                                        n: newP1,
+                                        s: "system",
+                                        ts: Date.now()
                                     };
                                 }
                             });
@@ -5146,7 +5167,8 @@ async function syncSingleRoomPriceCache(building, roomId, roomName, { reason = "
                     t: dayjs().utcOffset(9).format("MM-DD HH:mm"),
                     o: oldP1,
                     n: newP1,
-                    s: "beds24"
+                    s: "beds24",
+                    ts: Date.now()
                 };
             } else if (oldDates[dKey]?.lm) {
                 datesObj[dKey].lm = oldDates[dKey].lm;

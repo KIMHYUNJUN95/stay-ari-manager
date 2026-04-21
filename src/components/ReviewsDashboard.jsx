@@ -38,12 +38,18 @@ const BUILDING_COLORS = [
   "#F59E0B", "#10B981", "#06B6D4", "#8B5CF6"
 ];
 
+
 const API_BASE = process.env.REACT_APP_API_BASE_URL || "https://us-central1-my-booking-app-3f0e7.cloudfunctions.net";
+
+// 캘린더와 동일 기준: minStay >= 1 && minStay < 50 = 활성 roomId
+const INACTIVE_MINSTAY_THRESHOLD = 50;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const getBuildingEn = (name) => BUILDING_NAMES_EN[name] || name;
 const getBuildingColor = (name) => BUILDING_COLORS[BUILDING_ORDER.indexOf(name) % BUILDING_COLORS.length] || "#4F46E5";
+// 한국어 '호' 접미사 제거 (예: "201호" → "201", 기존 Firestore 데이터 대응용)
+const normalizeRoomName = (name) => (name ? String(name).replace(/호$/, '').trim() : name);
 
 const getScoreColor = (score, max = 10) => {
   const pct = (score / max) * 10;
@@ -252,17 +258,34 @@ function computeWeaknesses(buildingStats, threshold = 8.0) {
   return weaknesses.sort((a, b) => a.score - b.score);
 }
 
-function computeRoomStats(reviews) {
+// activeRoomsByBuilding: 오늘 날짜 기준 활성 roomId 목록 (minStay >= 1 && < 50)
+function computeRoomStats(reviews, activeRoomsByBuilding) {
   const airbnbReviews = reviews.filter(r => r.channel === "airbnb" && r.roomId);
-  // roomId 기준으로 그룹핑 (듀얼 어카운트 분리)
+  // roomId 기준으로 그룹핑 (활성 roomId만 포함)
   const byBuildingRoomId = {};
+
+  for (const [building, rooms] of Object.entries(activeRoomsByBuilding || {})) {
+    if (!BUILDING_ORDER.includes(building)) continue;
+    if (!byBuildingRoomId[building]) byBuildingRoomId[building] = {};
+    for (const [rid, info] of Object.entries(rooms || {})) {
+      byBuildingRoomId[building][String(rid)] = {
+        roomName: normalizeRoomName(info?.roomName) || String(rid),
+        scores: [],
+        categories: {}
+      };
+    }
+  }
 
   for (const r of airbnbReviews) {
     const b = r.building;
     if (!BUILDING_ORDER.includes(b)) continue;
+    const rid = String(r.roomId);
+    // 활성 roomId 목록에 없으면 집계 제외
+    if (activeRoomsByBuilding && !activeRoomsByBuilding[b]?.[rid]) continue;
     if (!byBuildingRoomId[b]) byBuildingRoomId[b] = {};
-    const rid = r.roomId;
-    if (!byBuildingRoomId[b][rid]) byBuildingRoomId[b][rid] = { roomName: r.roomName || "Unknown", scores: [], categories: {} };
+    if (!byBuildingRoomId[b][rid]) byBuildingRoomId[b][rid] = { roomName: normalizeRoomName(r.roomName) || "Unknown", scores: [], categories: {} };
+    const reviewRoomName = normalizeRoomName(r.roomName);
+    if (reviewRoomName && byBuildingRoomId[b][rid].roomName === rid) byBuildingRoomId[b][rid].roomName = reviewRoomName;
     const airbnbScore = r.rawScore || (r.score > 0 ? r.score / 2 : 0);
     if (airbnbScore > 0) byBuildingRoomId[b][rid].scores.push(airbnbScore);
     if (r.categories) {
@@ -275,11 +298,14 @@ function computeRoomStats(reviews) {
     }
   }
 
-  // 같은 roomName이 2개 이상이면 A/B 접미사 추가
+  // ARAKICHO_A_DUAL_ROOM_IDS 강제추가 로직 제거:
+  // 비활성 roomId까지 0점 카드로 노출되는 원인이었음.
+  // 활성 roomId 필터(위)가 이를 대체함.
+
   const result = {};
   for (const [building, roomIds] of Object.entries(byBuildingRoomId)) {
     result[building] = {};
-    // roomName별 roomId 목록
+    // roomName별 roomId 목록 (같은 방이름에 여러 roomId → 표시명에 roomId 병기)
     const nameToIds = {};
     for (const [rid, data] of Object.entries(roomIds)) {
       if (!nameToIds[data.roomName]) nameToIds[data.roomName] = [];
@@ -287,12 +313,8 @@ function computeRoomStats(reviews) {
     }
     for (const [rid, data] of Object.entries(roomIds)) {
       const ids = nameToIds[data.roomName];
-      let displayName = data.roomName;
-      if (ids.length > 1) {
-        const idx = ids.indexOf(rid);
-        displayName = `${data.roomName} (${String.fromCharCode(65 + idx)})`;
-      }
-      const roomAvg = avg(data.scores);
+      const displayName = ids.length > 1 ? `${data.roomName} (${rid})` : data.roomName;
+      const roomAvg = data.scores.length ? avg(data.scores) : null;
       const catAvgs = {};
       for (const [k, vs] of Object.entries(data.categories)) catAvgs[k] = avg(vs);
       result[building][displayName] = { count: data.scores.length, avg: roomAvg, catAvgs, roomId: rid };
@@ -1070,7 +1092,7 @@ function ReviewsTab({ reviews, channel: parentChannel, dateSearchReversed, hasDa
 
 // ─── Rooms Tab ────────────────────────────────────────────────────────────────
 
-function RoomsTab({ roomStats, buildingStats }) {
+function RoomsTab({ roomStats, buildingStats, roomsLoading }) {
   const availableBuildings = BUILDING_ORDER.filter(b => roomStats[b] && Object.keys(roomStats[b]).length > 0);
   const [selectedBuilding, setSelectedBuilding] = useState(null);
 
@@ -1079,6 +1101,15 @@ function RoomsTab({ roomStats, buildingStats }) {
       setSelectedBuilding(availableBuildings[0]);
     }
   }, [availableBuildings.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 활성 roomId 로딩 중: 비활성 리스팅이 잠깐 보이지 않도록 로딩 상태 표시
+  if (roomsLoading) {
+    return (
+      <div style={{ textAlign: "center", padding: "80px", color: "#94A3B8" }}>
+        <div style={{ fontSize: 13, color: "#64748B" }}>Loading active room data...</div>
+      </div>
+    );
+  }
 
   if (availableBuildings.length === 0) {
     return (
@@ -1090,10 +1121,16 @@ function RoomsTab({ roomStats, buildingStats }) {
     );
   }
 
-  const rooms = selectedBuilding ? Object.entries(roomStats[selectedBuilding] || {}).sort((a, b) => b[1].avg - a[1].avg) : [];
+  const rooms = selectedBuilding ? Object.entries(roomStats[selectedBuilding] || {}).sort((a, b) => {
+    const aHasReviews = a[1].count > 0;
+    const bHasReviews = b[1].count > 0;
+    if (aHasReviews !== bHasReviews) return bHasReviews ? 1 : -1;
+    if (aHasReviews && bHasReviews) return b[1].avg - a[1].avg;
+    return a[0].localeCompare(b[0], undefined, { numeric: true, sensitivity: "base" });
+  }) : [];
 
   const barData = rooms.map(([room, data]) => ({
-    room, avg: parseFloat(data.avg.toFixed(2)), count: data.count
+    room, avg: data.count > 0 ? parseFloat(data.avg.toFixed(2)) : null, count: data.count
   }));
 
   return (
@@ -1128,7 +1165,7 @@ function RoomsTab({ roomStats, buildingStats }) {
                 <CartesianGrid strokeDasharray="3 3" stroke="#F1F5F9" horizontal={false} />
                 <XAxis type="number" domain={[3, 5]} tick={{ fontSize: 11, fill: "#94A3B8" }} />
                 <YAxis type="category" dataKey="room" tick={{ fontSize: 12, fill: "#374151", fontWeight: 500 }} width={52} />
-                <Tooltip formatter={(v, n) => [v, "Avg Score"]} contentStyle={{ borderRadius: 10, border: "1px solid #E2E8F0", fontSize: 12 }} />
+                <Tooltip formatter={(v, n) => [v == null ? "N/A" : v, "Avg Score"]} contentStyle={{ borderRadius: 10, border: "1px solid #E2E8F0", fontSize: 12 }} />
                 <Bar dataKey="avg" fill={getBuildingColor(selectedBuilding)} radius={[0, 6, 6, 0]} />
               </BarChart>
             </ResponsiveContainer>
@@ -1146,14 +1183,30 @@ function RoomsTab({ roomStats, buildingStats }) {
                 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                   <span style={{ fontSize: 14, fontWeight: 700, color: "#1E293B" }}>{room}</span>
-                  <ScoreBadge score={data.avg} max={5} size="sm" />
+                  {data.count > 0 ? (
+                    <ScoreBadge score={data.avg} max={5} size="sm" />
+                  ) : (
+                    <span style={{
+                      display: "inline-flex", alignItems: "center", justifyContent: "center",
+                      background: "#F8FAFC", color: "#94A3B8", border: "1.5px solid #E2E8F0",
+                      borderRadius: 8, fontWeight: 700, fontSize: 12, padding: "3px 7px", letterSpacing: "-0.3px"
+                    }}>N/A</span>
+                  )}
                 </div>
-                <div style={{ fontSize: 11, color: "#94A3B8", marginBottom: 10 }}>{data.count} reviews</div>
-                {AIRBNB_CATEGORIES.map(({ key, label }) => {
-                  const catScore = data.catAvgs[key];
-                  if (catScore === undefined) return null;
-                  return <CategoryBar key={key} label={label} score={catScore} max={5} />;
-                })}
+                <div style={{ fontSize: 11, color: "#94A3B8", marginBottom: 10 }}>
+                  {data.count > 0 ? `${data.count} reviews` : "No reviews yet"}
+                </div>
+                {data.count > 0 ? (
+                  AIRBNB_CATEGORIES.map(({ key, label }) => {
+                    const catScore = data.catAvgs[key];
+                    if (catScore === undefined) return null;
+                    return <CategoryBar key={key} label={label} score={catScore} max={5} />;
+                  })
+                ) : (
+                  <div style={{ fontSize: 12, color: "#94A3B8", lineHeight: 1.5 }}>
+                    This active room has no synced Airbnb reviews yet.
+                  </div>
+                )}
               </motion.div>
             ))}
           </div>
@@ -1430,6 +1483,9 @@ export default function ReviewsDashboard() {
   const [dateTo, setDateTo] = useState("");
   const [appliedFrom, setAppliedFrom] = useState("");
   const [appliedTo, setAppliedTo] = useState("");
+  // 오늘 기준 활성 roomId 목록 (null=로딩 전, object=완료)
+  const [activeRoomsByBuilding, setActiveRoomsByBuilding] = useState(null);
+  const [activeRoomsLoading, setActiveRoomsLoading] = useState(false);
 
   // 채널 변경 시 탭 리셋
   const handleChannelChange = (ch) => {
@@ -1476,6 +1532,61 @@ export default function ReviewsDashboard() {
   }, [companyId]);
 
   useEffect(() => { loadReviews(); }, [loadReviews]);
+
+  // 리뷰 로드 완료 후 오늘 날짜 기준 활성 roomId Set 구성 (캘린더와 동일 기준)
+  useEffect(() => {
+    if (!companyId || loading) return;
+    let cancelled = false;
+    const fetchActiveRooms = async () => {
+      setActiveRoomsLoading(true);
+      try {
+        const today = dayjs().format("YYYY-MM-DD");
+        const todayKey = today.replace(/-/g, "");
+        const airbnbBuildings = BUILDING_ORDER;
+
+        const newActiveRoomsByBuilding = {};
+        await Promise.all(
+          airbnbBuildings.map(async (building) => {
+            try {
+              const res = await fetch(`${API_BASE}/getCachedPrices`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ companyId, building, dateFrom: today, dateTo: today, forceRefresh: false })
+              });
+              const data = await res.json();
+              if (data?.success && data?.priceData) {
+                for (const [roomId, roomData] of Object.entries(data.priceData)) {
+                  const ms = parseInt(roomData?.dates?.[todayKey]?.m, 10);
+                  if (Number.isFinite(ms) && ms >= 1 && ms < INACTIVE_MINSTAY_THRESHOLD) {
+                    if (!newActiveRoomsByBuilding[building]) newActiveRoomsByBuilding[building] = {};
+                    newActiveRoomsByBuilding[building][String(roomId)] = {
+                      roomId: String(roomId),
+                      roomName: normalizeRoomName(roomData?.roomName) || String(roomId)
+                    };
+                  }
+                }
+              }
+            } catch (e) {
+              console.warn(`[ReviewsDashboard] price fetch skipped for ${building}:`, e.message);
+            }
+          })
+        );
+        if (!cancelled) {
+          setActiveRoomsByBuilding(newActiveRoomsByBuilding);
+        }
+      } catch (err) {
+        console.error("[ReviewsDashboard] active rooms fetch error:", err);
+        // Do not fall back to all listings; that would re-show inactive rooms.
+        if (!cancelled) {
+          setActiveRoomsByBuilding({});
+        }
+      } finally {
+        if (!cancelled) setActiveRoomsLoading(false);
+      }
+    };
+    fetchActiveRooms();
+    return () => { cancelled = true; };
+  }, [companyId, loading]);
 
   // Manual sync
   // eslint-disable-next-line no-unused-vars
@@ -1554,7 +1665,11 @@ export default function ReviewsDashboard() {
   const buildingStats = useMemo(() => computeBuildingStats(dateFilteredReviews), [dateFilteredReviews]);
   const trendData = useMemo(() => computeTrendData(dateFilteredReviews), [dateFilteredReviews]);
   const weaknesses = useMemo(() => computeWeaknesses(buildingStats), [buildingStats]);
-  const roomStats = useMemo(() => computeRoomStats(dateFilteredReviews), [dateFilteredReviews]);
+  // activeRoomsByBuilding이 null(로딩 중)이면 null 반환 — RoomsTab에서 로딩 상태로 처리
+  const roomStats = useMemo(
+    () => activeRoomsByBuilding !== null ? computeRoomStats(dateFilteredReviews, activeRoomsByBuilding) : null,
+    [dateFilteredReviews, activeRoomsByBuilding]
+  );
   const unansweredCount = dateFilteredReviews.filter(r => r.channel === "booking" && !r.hasReply).length;
 
   // 채널별 탭 구성
@@ -1691,7 +1806,13 @@ export default function ReviewsDashboard() {
             {activeTab === "trends" && activeChannel === "booking" && <TrendsTab trendData={trendData} buildingStats={buildingStats} />}
             {activeTab === "insights" && <InsightsTab weaknesses={weaknesses.filter(w => (activeChannel === "booking" ? w.channel === "Booking.com" : w.channel === "Airbnb"))} buildingStats={buildingStats} channel={activeChannel} />}
             {activeTab === "reviews" && <ReviewsTab reviews={channelReviews} channel={activeChannel} dateSearchReversed={dateSearchReversed} hasDateFilter={hasDateFilter} />}
-            {activeTab === "rooms" && activeChannel === "airbnb" && <RoomsTab roomStats={roomStats} buildingStats={buildingStats} />}
+            {activeTab === "rooms" && activeChannel === "airbnb" && (
+              <RoomsTab
+                roomStats={roomStats || {}}
+                buildingStats={buildingStats}
+                roomsLoading={activeRoomsLoading || roomStats === null}
+              />
+            )}
             {activeTab === "unanswered" && activeChannel === "booking" && <UnansweredTab reviews={reviews} />}
           </motion.div>
         </AnimatePresence>

@@ -91,6 +91,63 @@ function pickPreferredRoomInfo(buildingName, roomName, roomInfos) {
   return roomInfos.find((info) => String(info.roomId) === String(preferredRoomId)) || roomInfos[0];
 }
 
+/**
+ * 두 lm(lastModInfo) 후보 중 더 최신인 것을 반환한다.
+ * 비교 기준 (우선순위):
+ *   1. ts(epoch ms) 양쪽 모두 있으면 숫자 비교 — 연도 경계 안전
+ *   2. 한쪽만 ts 있으면 ts 있는 쪽이 무조건 최신 (신규 데이터)
+ *   3. 양쪽 모두 ts 없는 legacy: t("MM-DD HH:mm") 문자열 비교 (같은 연도 내 결정론적)
+ * null/undefined 허용: 유효한 값이 있으면 그것을 반환
+ */
+function pickNewerLm(a, b) {
+  if (!b) return a;
+  if (!a) return b;
+  const hasA = a.ts != null;
+  const hasB = b.ts != null;
+  if (hasA && hasB) return a.ts >= b.ts ? a : b;
+  if (hasA) return a;  // a는 신규(ts 있음), b는 legacy → a가 최신
+  if (hasB) return b;  // b는 신규(ts 있음), a는 legacy → b가 최신
+  // 양쪽 모두 legacy: t 문자열 사전순 비교 (동일 연도 내 안전)
+  return (a.t || '') >= (b.t || '') ? a : b;
+}
+
+function normalizeRoomSourceKey(roomName) {
+  return String(roomName || "").trim().replace(/호$/, "");
+}
+
+function toYmd(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  if (/^\d{8}$/.test(raw)) return `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
+  return raw.slice(0, 10);
+}
+
+function parseLogTimestampMs(log) {
+  const tsCandidates = [log?.timestampMs, log?.ts, log?.createdAtMs, log?.updatedAtMs];
+  for (const candidate of tsCandidates) {
+    const n = Number(candidate);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  const t = log?.timestamp;
+  if (typeof t?.toMillis === "function") {
+    const ms = t.toMillis();
+    if (Number.isFinite(ms)) return ms;
+  }
+  if (typeof t?.toDate === "function") {
+    const ms = t.toDate().getTime();
+    if (Number.isFinite(ms)) return ms;
+  }
+  const parsed = new Date(t || "").getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getLogSource(log) {
+  const origin = String(log?.origin || "").toLowerCase();
+  const worker = String(log?.worker || "").toLowerCase();
+  return (origin.includes("beds24") || worker.includes("beds24")) ? "beds24" : "system";
+}
+
 // 가격 설정 모달 (고급 버전)
 function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose, onSave, onJobQueued, selectedRooms, selectedCells, companyId, pendingPriceCellMap }) {
   // 조정 모드: 'direct' (직접입력), 'percent' (퍼센트)
@@ -4752,6 +4809,61 @@ function BuildingCalendar() {
     return priceInterventionLogs.filter((log) => log?.building === calendarBuilding);
   }, [calendarBuilding, priceInterventionLogs]);
 
+  const latestPriceSourceByRoomDate = useMemo(() => {
+    const map = {};
+
+    const upsert = (roomName, dateStr, source, ts) => {
+      const roomKey = normalizeRoomSourceKey(roomName);
+      const dayKey = toYmd(dateStr);
+      if (!roomKey || !dayKey || !source) return;
+      const key = `${roomKey}__${dayKey}`;
+      const prev = map[key];
+      if (!prev || ts > prev.ts) {
+        map[key] = { source, ts };
+      }
+    };
+
+    activePriceInterventionLogs.forEach((log) => {
+      const source = getLogSource(log);
+      const ts = parseLogTimestampMs(log);
+      const roomList = (Array.isArray(log?.rooms) && log.rooms.length > 0)
+        ? log.rooms
+        : (log?.room ? [log.room] : []);
+
+      if (Array.isArray(log?.priceSnapshot) && log.priceSnapshot.length > 0) {
+        log.priceSnapshot.forEach((row) => {
+          const rowRoom = row?.room || roomList[0];
+          upsert(rowRoom, row?.date, source, ts);
+        });
+        return;
+      }
+
+      if (log?.dates && typeof log.dates === "object") {
+        Object.keys(log.dates).forEach((dateKey) => {
+          roomList.forEach((roomName) => {
+            upsert(roomName, dateKey, source, ts);
+          });
+        });
+        return;
+      }
+
+      const start = dayjs(toYmd(log?.dateFrom));
+      const end = dayjs(toYmd(log?.dateTo || log?.dateFrom));
+      if (!start.isValid() || !end.isValid() || roomList.length === 0) return;
+
+      let cursor = start;
+      while (!cursor.isAfter(end, "day")) {
+        const day = cursor.format("YYYY-MM-DD");
+        roomList.forEach((roomName) => {
+          upsert(roomName, day, source, ts);
+        });
+        cursor = cursor.add(1, "day");
+      }
+    });
+
+    return map;
+  }, [activePriceInterventionLogs]);
+
   const updatePriceCellTooltip = useCallback((nextTooltip) => {
     priceCellTooltipRef.current = nextTooltip;
     if (priceCellTooltipFrameRef.current) return;
@@ -9194,21 +9306,19 @@ function BuildingCalendar() {
                           if (priceInfo) {
                             const ms = parseInt(priceInfo.m, 10); // 문자열/NaN이면 무시하고 1박 기준으로 처리하지 않음
                             if (Number.isFinite(ms) && ms >= 1 && ms < INACTIVE_MINSTAY_THRESHOLD && (minStay === 0 || ms < minStay)) minStay = ms;
-                            if (priceInfo.lm && !lastModInfo) {
-                              lastModInfo = priceInfo.lm;
+                            // 최신 lm 선택: ts(epoch ms) 우선, legacy는 t 문자열 fallback (pickNewerLm)
+                            if (priceInfo.lm) {
+                              lastModInfo = pickNewerLm(priceInfo.lm, lastModInfo);
                             }
                           }
                         });
 
-                        if (!lastModInfo) {
-                          allRoomInfosForDate.forEach((info) => {
-                            if (lastModInfo) return;
-                            const fallbackLm = roomPrices?.[info.roomId]?.dates?.[dateKey]?.lm;
-                            if (fallbackLm) {
-                              lastModInfo = fallbackLm;
-                            }
-                          });
-                        }
+                        allRoomInfosForDate.forEach((info) => {
+                          const fallbackLm = roomPrices?.[info.roomId]?.dates?.[dateKey]?.lm;
+                          if (fallbackLm) {
+                            lastModInfo = pickNewerLm(fallbackLm, lastModInfo);
+                          }
+                        });
 
                         if (isPendingPriceCell && pendingPriceCell.airbnbPrice > 0) {
                           airbnbPrice = pendingPriceCell.airbnbPrice;
@@ -9253,10 +9363,19 @@ function BuildingCalendar() {
                           hoveredRoom === room;
                         const isDetailSelectionVisible = showBeds24DetailView &&
                           (isSelected || isSelectionStart || isInQuickSelectionRange || isHoveredSelectableCell);
+                        const latestSourceEntry = latestPriceSourceByRoomDate[`${normalizeRoomSourceKey(room)}__${dateStr}`] || null;
+                        const resolvedLastModSource = latestSourceEntry?.source
+                          || (lastModInfo?.s === 'beds24' ? 'beds24' : (lastModInfo?.s === 'system' ? 'system' : null));
+                        const hasLastModMarker = !!(lastModInfo || latestSourceEntry);
+                        const lastModMarkerColor = resolvedLastModSource === 'beds24'
+                          ? "#EF4444"
+                          : resolvedLastModSource === 'system'
+                            ? "#2563EB"
+                            : "#94A3B8";
                         const priceCellHoverText = (priceMode || showBeds24DetailView) && (airbnbPrice || minStay)
                           ? `Airbnb: ¥${airbnbPrice.toLocaleString()}\nMin Stay: ${minStay || 0} nights${isPendingPriceCell ? "\nStatus: Pending sync" : ""}${
-                              lastModInfo
-                                ? `\n\n[History]\n${lastModInfo.s === 'beds24' ? `Modified in Beds24` : `Modified by: ${lastModInfo.u}`}\nAt: ${lastModInfo.t}\nChange: ¥${lastModInfo.o.toLocaleString()} -> ¥${lastModInfo.n.toLocaleString()}`
+                              hasLastModMarker
+                                ? `\n\n[History]\n${resolvedLastModSource === 'beds24' ? `Modified in Beds24` : `Modified by: ${lastModInfo?.u || "System"}`}${lastModInfo?.t ? `\nAt: ${lastModInfo.t}` : ""}${Number.isFinite(lastModInfo?.o) && Number.isFinite(lastModInfo?.n) ? `\nChange: ¥${lastModInfo.o.toLocaleString()} -> ¥${lastModInfo.n.toLocaleString()}` : ""}`
                                 : ""
                             }`
                           : (isPastDate && priceMode ? "Cannot edit past dates" : "");
@@ -9394,7 +9513,7 @@ function BuildingCalendar() {
                                   position: "relative"
                                 }}>
                                   {formatCalendarPriceShort(airbnbPrice)}
-                                  {lastModInfo && (
+                                  {hasLastModMarker && (
                                     <div style={{
                                       position: "absolute",
                                       top: "2px",
@@ -9406,7 +9525,7 @@ function BuildingCalendar() {
                                       maxWidth: "4px",
                                       maxHeight: "4px",
                                       borderRadius: "50%",
-                                      background: lastModInfo.s === 'beds24' ? "#EF4444" : "#2563EB",
+                                      background: lastModMarkerColor,
                                       boxShadow: "none",
                                       border: "none",
                                       outline: "none",
@@ -9526,7 +9645,7 @@ function BuildingCalendar() {
                                   position: "relative"
                                 }}>
                                   {`${(airbnbPrice / 1000).toFixed(airbnbPrice % 1000 === 0 ? 0 : 1)}K`}
-                                  {lastModInfo && (
+                                  {hasLastModMarker && (
                                     <div style={{
                                       position: "absolute",
                                       top: "2px",
@@ -9538,7 +9657,7 @@ function BuildingCalendar() {
                                       maxWidth: "4px",
                                       maxHeight: "4px",
                                       borderRadius: "50%",
-                                      background: lastModInfo.s === 'beds24' ? "#EF4444" : "#2563EB",
+                                      background: lastModMarkerColor,
                                       boxShadow: "none",
                                       border: "none",
                                       outline: "none",
