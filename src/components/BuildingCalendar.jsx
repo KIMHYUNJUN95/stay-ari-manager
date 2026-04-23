@@ -4812,11 +4812,11 @@ function BuildingCalendar() {
   const latestPriceSourceByRoomDate = useMemo(() => {
     const map = {};
 
-    const upsert = (roomName, dateStr, source, ts) => {
+    const upsert = (buildingName, roomName, dateStr, source, ts) => {
       const roomKey = normalizeRoomSourceKey(roomName);
       const dayKey = toYmd(dateStr);
       if (!roomKey || !dayKey || !source) return;
-      const key = `${roomKey}__${dayKey}`;
+      const key = `${buildingName || ""}__${roomKey}__${dayKey}`;
       const prev = map[key];
       if (!prev || ts > prev.ts) {
         map[key] = { source, ts };
@@ -4826,6 +4826,7 @@ function BuildingCalendar() {
     activePriceInterventionLogs.forEach((log) => {
       const source = getLogSource(log);
       const ts = parseLogTimestampMs(log);
+      const building = log?.building || "";
       const roomList = (Array.isArray(log?.rooms) && log.rooms.length > 0)
         ? log.rooms
         : (log?.room ? [log.room] : []);
@@ -4833,7 +4834,7 @@ function BuildingCalendar() {
       if (Array.isArray(log?.priceSnapshot) && log.priceSnapshot.length > 0) {
         log.priceSnapshot.forEach((row) => {
           const rowRoom = row?.room || roomList[0];
-          upsert(rowRoom, row?.date, source, ts);
+          upsert(building, rowRoom, row?.date, source, ts);
         });
         return;
       }
@@ -4841,7 +4842,7 @@ function BuildingCalendar() {
       if (log?.dates && typeof log.dates === "object") {
         Object.keys(log.dates).forEach((dateKey) => {
           roomList.forEach((roomName) => {
-            upsert(roomName, dateKey, source, ts);
+            upsert(building, roomName, dateKey, source, ts);
           });
         });
         return;
@@ -4855,7 +4856,7 @@ function BuildingCalendar() {
       while (!cursor.isAfter(end, "day")) {
         const day = cursor.format("YYYY-MM-DD");
         roomList.forEach((roomName) => {
-          upsert(roomName, day, source, ts);
+          upsert(building, roomName, day, source, ts);
         });
         cursor = cursor.add(1, "day");
       }
@@ -4863,6 +4864,19 @@ function BuildingCalendar() {
 
     return map;
   }, [activePriceInterventionLogs]);
+
+  // 전체 보기용: building 무시하고 room__date 기준 최신 source 엔트리 선계산
+  const latestAnyBuildingSourceByRoomDate = useMemo(() => {
+    const out = {};
+    Object.entries(latestPriceSourceByRoomDate).forEach(([key, entry]) => {
+      const firstDunder = key.indexOf("__");
+      if (firstDunder < 0) return;
+      const roomDateKey = key.slice(firstDunder + 2);
+      const prev = out[roomDateKey];
+      if (!prev || entry.ts > prev.ts) out[roomDateKey] = entry;
+    });
+    return out;
+  }, [latestPriceSourceByRoomDate]);
 
   const updatePriceCellTooltip = useCallback((nextTooltip) => {
     priceCellTooltipRef.current = nextTooltip;
@@ -9313,12 +9327,14 @@ function BuildingCalendar() {
                           }
                         });
 
-                        allRoomInfosForDate.forEach((info) => {
-                          const fallbackLm = roomPrices?.[info.roomId]?.dates?.[dateKey]?.lm;
-                          if (fallbackLm) {
-                            lastModInfo = pickNewerLm(fallbackLm, lastModInfo);
+                        if (!lastModInfo) {
+                          for (const info of allRoomInfosForDate) {
+                            const lm = roomPrices?.[info.roomId]?.dates?.[dateKey]?.lm;
+                            if (lm) {
+                              lastModInfo = pickNewerLm(lm, lastModInfo);
+                            }
                           }
-                        });
+                        }
 
                         if (isPendingPriceCell && pendingPriceCell.airbnbPrice > 0) {
                           airbnbPrice = pendingPriceCell.airbnbPrice;
@@ -9363,7 +9379,10 @@ function BuildingCalendar() {
                           hoveredRoom === room;
                         const isDetailSelectionVisible = showBeds24DetailView &&
                           (isSelected || isSelectionStart || isInQuickSelectionRange || isHoveredSelectableCell);
-                        const latestSourceEntry = latestPriceSourceByRoomDate[`${normalizeRoomSourceKey(room)}__${dateStr}`] || null;
+                        const roomSourceKey = normalizeRoomSourceKey(room);
+                        const latestSourceEntry = calendarBuilding && calendarBuilding !== "전체"
+                          ? (latestPriceSourceByRoomDate[`${calendarBuilding}__${roomSourceKey}__${dateStr}`] || null)
+                          : (latestAnyBuildingSourceByRoomDate[`${roomSourceKey}__${dateStr}`] || null);
                         const resolvedLastModSource = latestSourceEntry?.source
                           || (lastModInfo?.s === 'beds24' ? 'beds24' : (lastModInfo?.s === 'system' ? 'system' : null));
                         const hasLastModMarker = !!(lastModInfo || latestSourceEntry);
