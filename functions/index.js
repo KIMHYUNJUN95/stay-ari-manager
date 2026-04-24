@@ -3075,10 +3075,20 @@ async function syncAllReviews(companyId, fromDate = null, options = {}) {
                         if (reviewDate && reviewDate.substring(0, 10) > effectiveToDate) continue;
 
                         const docId = `airbnb_${review.id}`;
+                        const _catAlias = {
+                            "check_in": "checkin", "check-in": "checkin", "check in": "checkin",
+                            "cleanliness_rating": "cleanliness",
+                        };
+                        const _stdKeys = new Set(["cleanliness", "accuracy", "checkin", "communication", "location", "value"]);
                         const cats = {};
                         if (Array.isArray(review.category_ratings)) {
                             for (const c of review.category_ratings) {
-                                cats[c.category] = c.rating;
+                                const rawKey = String(c.category || "").toLowerCase().trim();
+                                if (!rawKey) continue;
+                                const aliased = _catAlias[rawKey];
+                                const stripped = rawKey.replace(/[\s\-_]+/g, "");
+                                const key = aliased || (_stdKeys.has(stripped) ? stripped : null) || rawKey;
+                                cats[key] = c.rating;
                             }
                         }
                         batch.push({
@@ -3137,6 +3147,41 @@ async function syncAllReviews(companyId, fromDate = null, options = {}) {
     }
 
     // Firestore batch write (400개씩 분할)
+    // 카테고리 정합성 검증 로그 (batch 완성 후 write 전, 1회 실행)
+    const _REVIEW_REQUIRED_KEYS = {
+        booking: ["clean", "comfort", "facilities", "staff", "value", "location"],
+        airbnb:  ["cleanliness", "accuracy", "checkin", "communication", "location", "value"],
+    };
+    function collectCategoryStats(items) {
+        const acc = {
+            booking: { reviews: 0, keyCounts: {}, missing: 0 },
+            airbnb:  { reviews: 0, keyCounts: {}, missing: 0 },
+        };
+        for (const { data } of items) {
+            const s = acc[data.channel];
+            if (!s) continue;
+            s.reviews++;
+            const cats = data.categories || {};
+            for (const [k, v] of Object.entries(cats)) {
+                if (v !== null && v !== undefined) s.keyCounts[k] = (s.keyCounts[k] || 0) + 1;
+            }
+            const required = _REVIEW_REQUIRED_KEYS[data.channel] || [];
+            if (required.some(rk => cats[rk] === null || cats[rk] === undefined)) s.missing++;
+        }
+        const out = {};
+        for (const [ch, s] of Object.entries(acc)) {
+            out[ch] = {
+                reviews: s.reviews,
+                keyCounts: s.keyCounts,
+                missing: s.missing,
+                missingRate: s.reviews > 0 ? +(s.missing / s.reviews).toFixed(3) : 0,
+            };
+        }
+        return out;
+    }
+    const _catStats = collectCategoryStats(batch);
+    console.log("[syncReviews][validation]", JSON.stringify(_catStats));
+
     const CHUNK = 400;
     if (insertOnly) {
         // insertOnly: Firestore에 없는 것만 저장

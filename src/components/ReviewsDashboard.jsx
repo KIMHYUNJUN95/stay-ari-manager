@@ -51,6 +51,20 @@ const getBuildingColor = (name) => BUILDING_COLORS[BUILDING_ORDER.indexOf(name) 
 // 한국어 '호' 접미사 제거 (예: "201호" → "201", 기존 Firestore 데이터 대응용)
 const normalizeRoomName = (name) => (name ? String(name).replace(/호$/, '').trim() : name);
 
+const _AIRBNB_CAT_ALIAS = {
+  "check_in": "checkin", "check-in": "checkin", "check in": "checkin",
+  "cleanliness_rating": "cleanliness",
+};
+const _AIRBNB_STD_KEYS = new Set(["cleanliness", "accuracy", "checkin", "communication", "location", "value"]);
+function normalizeAirbnbCategoryKey(rawKey) {
+  const lower = String(rawKey || "").toLowerCase().trim();
+  if (!lower) return null;
+  if (_AIRBNB_CAT_ALIAS[lower]) return _AIRBNB_CAT_ALIAS[lower];
+  const stripped = lower.replace(/[\s\-_]+/g, "");
+  if (_AIRBNB_STD_KEYS.has(stripped)) return stripped;
+  return lower;
+}
+
 const getScoreColor = (score, max = 10) => {
   const pct = (score / max) * 10;
   if (pct >= 9) return "#10B981";
@@ -133,8 +147,10 @@ function computeBuildingStats(reviews) {
       if (r.categories) {
         for (const [k, v] of Object.entries(r.categories)) {
           if (v !== null && v !== undefined) {
-            if (!s.airbnb.categories[k]) s.airbnb.categories[k] = [];
-            s.airbnb.categories[k].push(v);
+            const nk = normalizeAirbnbCategoryKey(k);
+            if (!nk) continue;
+            if (!s.airbnb.categories[nk]) s.airbnb.categories[nk] = [];
+            s.airbnb.categories[nk].push(v);
           }
         }
       }
@@ -291,8 +307,10 @@ function computeRoomStats(reviews, activeRoomsByBuilding) {
     if (r.categories) {
       for (const [k, v] of Object.entries(r.categories)) {
         if (v !== null && v !== undefined) {
-          if (!byBuildingRoomId[b][rid].categories[k]) byBuildingRoomId[b][rid].categories[k] = [];
-          byBuildingRoomId[b][rid].categories[k].push(v);
+          const nk = normalizeAirbnbCategoryKey(k);
+          if (!nk) continue;
+          if (!byBuildingRoomId[b][rid].categories[nk]) byBuildingRoomId[b][rid].categories[nk] = [];
+          byBuildingRoomId[b][rid].categories[nk].push(v);
         }
       }
     }
