@@ -24,6 +24,7 @@ const {
     DEFAULT_EXCLUDED_BUILDING_ALIASES,
     normalizeText,
     createBuildingResolver,
+    calculateCapacityHeadcount,
     enrichCapacityRows,
     addLaborCostScenarios,
     buildDateRange,
@@ -730,10 +731,63 @@ function dateRange(start, end) {
 }
 
 /**
- * Builds one row per calendar week (Tokyo TZ, same week boundaries as getWeekKey / startOf("week"))
- * that intersects model.daily. Aggregates only days present in model.daily (forecast window).
+ * Build a map of physicalRoomKey → sorted confirmed reservations.
+ * physicalRoomKey = `${buildingKey}__${room}` — NOT roomId-based.
  */
-function buildWeeklySummaryRowsFromDaily(dailyMap) {
+function buildRoomReservationMap(reservations, resolver) {
+    const roomMap = new Map();
+    reservations.forEach((r) => {
+        if (r.status !== "confirmed") return;
+        const buildingKey = resolver(r.building);
+        if (!BUILDING_ORDER.includes(buildingKey)) return;
+        const roomKey = `${buildingKey}__${String(r.room || "").trim()}`;
+        if (!roomKey || roomKey === "__") return;
+        if (!roomMap.has(roomKey)) roomMap.set(roomKey, []);
+        roomMap.get(roomKey).push(r);
+    });
+    roomMap.forEach((list) => list.sort((a, b) => a.arrival.localeCompare(b.arrival)));
+    return roomMap;
+}
+
+/**
+ * Returns true if a 1-night (or longer) stay can start on or after weekStart and
+ * checkout on or before weekEnd, without overlapping any existing reservation.
+ */
+function hasAvailableStayInsideWeek(roomReservations, weekStart, weekEnd) {
+    const weekEndMinus1 = dayjs.tz(weekEnd, TOKYO_TZ).subtract(1, "day").format("YYYY-MM-DD");
+    if (weekEndMinus1 < weekStart) return false; // degenerate week
+    const nights = dateRange(weekStart, weekEndMinus1);
+    for (const night of nights) {
+        // 1-night stay: checkin=night, checkout=night+1
+        const checkout = dayjs.tz(night, TOKYO_TZ).add(1, "day").format("YYYY-MM-DD");
+        if (checkout > weekEnd) continue;
+        const isFree = !roomReservations.some((r) => r.arrival < checkout && r.departure > night);
+        if (isFree) return true;
+    }
+    return false;
+}
+
+/**
+ * Count physical rooms that can accept a new stay fully within the remaining usable window.
+ * For past weeks returns 0; for the current week only checks from todayKey onward.
+ */
+function countWeeklyShortStayAvailableCheckouts(roomMap, weekStart, weekEnd, todayKey) {
+    if (weekEnd < todayKey) return 0;
+    const effectiveStart = todayKey > weekStart ? todayKey : weekStart;
+    const effectiveEnd = weekEnd;
+    if (effectiveStart >= effectiveEnd) return 0; // need at least one night
+    let count = 0;
+    roomMap.forEach((roomReservations) => {
+        if (hasAvailableStayInsideWeek(roomReservations, effectiveStart, effectiveEnd)) count++;
+    });
+    return count;
+}
+
+/**
+ * Builds one row per calendar week with confirmed-only operational metrics.
+ * Columns: weekStart, weekEnd, 확정청소, 주내추가가능CO, 확정피크일, 피크대응, 주간확보풀, 확정인건비
+ */
+function buildWeeklySummaryRowsFromDaily(dailyMap, roomMap = new Map(), todayKey = "") {
     const daily = dailyMap instanceof Map ? dailyMap : new Map(Object.entries(dailyMap || {}));
     const dateKeys = [...daily.keys()].filter(Boolean).sort();
     if (!dateKeys.length) return [];
@@ -748,18 +802,44 @@ function buildWeeklySummaryRowsFromDaily(dailyMap) {
 
     return weekStarts.map((weekStart) => {
         const weekEnd = dayjs.tz(weekStart, TOKYO_TZ).add(6, "day").format("YYYY-MM-DD");
-        const agg = dateRange(weekStart, weekEnd).reduce((acc, d) => {
-            const s = daily.get(d) || {};
-            acc.cleaning += safeInt(s.cleaning);
-            acc.projected += safeInt(s.projected);
-            acc.mathMinPeak = Math.max(acc.mathMinPeak, safeInt(s.mathMinHeadcount));
-            acc.opMinPeak = Math.max(acc.opMinPeak, safeInt(s.operationalMinHeadcount));
-            acc.recPeak = Math.max(acc.recPeak, safeInt(s.recommendedHeadcount));
-            acc.cost += safeInt(s.costBase);
-            return acc;
-        }, { cleaning: 0, projected: 0, mathMinPeak: 0, opMinPeak: 0, recPeak: 0, cost: 0 });
 
-        return [weekStart, weekEnd, agg.cleaning, agg.projected, agg.mathMinPeak, agg.opMinPeak, agg.recPeak, yen(agg.cost)];
+        // Remaining-operation window: skip past dates, zero-out fully past weeks.
+        const isPastWeek = todayKey && weekEnd < todayKey;
+        const effectiveStart = isPastWeek ? null : (todayKey && todayKey > weekStart ? todayKey : weekStart);
+        const effectiveEnd = isPastWeek ? null : weekEnd;
+
+        let confirmedCleaning = 0;
+        let confirmedCost = 0;
+        let confirmedNeedPeak = 0;
+        let confirmedPeakDate = "";
+        let confirmedNeedSum = 0;
+
+        if (effectiveStart && effectiveEnd) {
+            dateRange(effectiveStart, effectiveEnd).forEach((d) => {
+                const s = daily.get(d) || {};
+                const need = safeInt(s.operationalMinHeadcount);
+                confirmedCleaning += safeInt(s.confirmed);
+                confirmedCost += safeInt(s.confirmedCostBase);
+                confirmedNeedSum += need;
+                if (need > confirmedNeedPeak) { confirmedNeedPeak = need; confirmedPeakDate = d; }
+            });
+        }
+
+        const weeklyPool = confirmedNeedSum > 0
+            ? Math.ceil(confirmedNeedSum / Math.max(1, AVG_WORK_DAYS_PER_WEEK))
+            : 0;
+        const weeklyAvailableCO = countWeeklyShortStayAvailableCheckouts(roomMap, weekStart, weekEnd, todayKey);
+
+        return [
+            weekStart,
+            weekEnd,
+            confirmedCleaning,
+            weeklyAvailableCO,
+            confirmedPeakDate || "-",
+            confirmedNeedPeak,
+            weeklyPool,
+            yen(confirmedCost),
+        ];
     });
 }
 
@@ -1068,11 +1148,14 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
         );
 
         const aggregate = capacityRows.reduce((acc, row) => {
+            const rule = DEFAULT_BUILDING_RULES[row.buildingKey] || {};
+            const confirmedHeadcount = calculateCapacityHeadcount(rule, Number(row.physicalConfirmedCO || 0));
             acc.confirmed += safeInt(row.confirmedCO);
             acc.projected += safeInt(row.projectedCO);
             acc.cleaning += safeInt(row.totalCO);
             acc.turnover += safeInt(row.turnoverCount);
             acc.totalJobHours += Number(row.estimatedJobHours || 0);
+            acc.confirmedHeadcount += confirmedHeadcount;
             acc.mathMinHeadcount += safeInt(row.mathMinHeadcount);
             acc.operationalMinHeadcount += safeInt(row.operationalMinHeadcount);
             acc.minHeadcount += safeInt(row.operationalMinHeadcount);
@@ -1080,6 +1163,11 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
             acc.costLow += safeInt(row.estimatedLaborCostLow);
             acc.costBase += safeInt(row.estimatedLaborCostBase);
             acc.costHigh += safeInt(row.estimatedLaborCostHigh);
+            // Confirmed-only cost: proportional share of base cost by confirmed physical units
+            const physUnits = Number(row.physicalCheckoutUnits || 0);
+            const physConfirmed = Number(row.physicalConfirmedCO || 0);
+            const confirmedFraction = physUnits > 0 ? physConfirmed / physUnits : 0;
+            acc.confirmedCostBase += Math.round(safeInt(row.estimatedLaborCostBase) * confirmedFraction);
             return acc;
         }, {
             confirmed: 0,
@@ -1087,6 +1175,7 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
             cleaning: 0,
             turnover: 0,
             totalJobHours: 0,
+            confirmedHeadcount: 0,
             mathMinHeadcount: 0,
             operationalMinHeadcount: 0,
             minHeadcount: 0,
@@ -1094,10 +1183,13 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
             costLow: 0,
             costBase: 0,
             costHigh: 0,
+            confirmedCostBase: 0,
         });
 
         daily.set(dateKey, aggregate);
         capacityRows.forEach((row) => {
+            const rule = DEFAULT_BUILDING_RULES[row.buildingKey] || {};
+            const confirmedHeadcount = calculateCapacityHeadcount(rule, Number(row.physicalConfirmedCO || 0));
             dailyByBuilding.push({
                 date: dateKey,
                 weekday: dayjs.tz(dateKey, TOKYO_TZ).format("ddd"),
@@ -1107,11 +1199,17 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
                 projected: safeInt(row.projectedCO),
                 setting: 0,
                 estimatedJobHours: Number(row.estimatedJobHours || 0),
+                confirmedHeadcount,
                 mathMinHeadcount: safeInt(row.mathMinHeadcount),
                 operationalMinHeadcount: safeInt(row.operationalMinHeadcount),
                 minHeadcount: safeInt(row.operationalMinHeadcount),
                 recommendedHeadcount: safeInt(row.recommendedHeadcount),
                 costBase: safeInt(row.estimatedLaborCostBase),
+                confirmedCostBase: Math.round(safeInt(row.estimatedLaborCostBase) * (
+                    Number(row.physicalCheckoutUnits || 0) > 0
+                        ? Number(row.physicalConfirmedCO || 0) / Number(row.physicalCheckoutUnits || 0)
+                        : 0
+                )),
                 confidence: getConfidence(dayjs.tz(dateKey, TOKYO_TZ).diff(dayjs.tz(todayKey, TOKYO_TZ), "day")),
             });
         });
@@ -1120,20 +1218,151 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
     return { daily, dailyByBuilding };
 }
 
-function buildCalendarCell(dateKey, stats, isToday) {
-    const d = dayjs.tz(dateKey, TOKYO_TZ);
-    return [
-        `${d.format("M/D ddd")}${isToday ? "  TODAY" : ""}`,
-        `\uccad\uc18c ${stats.confirmed}\uac74`,
-        `\ud655\uc815 ${stats.confirmed}`,
-        `\uc608\uc0c1 ${stats.projected}`,
-        `\uad8c\uc7a5 ${stats.recommendedHeadcount}\uba85`,
-        yen(stats.costBase),
-    ].join("\n");
+function computeConfirmedWeekdayWeekendAverages(monthDates, daily) {
+    let weekdayCount = 0;
+    let weekendCount = 0;
+    let weekdayDays = 0;
+    let weekendDays = 0;
+    monthDates.forEach((dateKey) => {
+        const dow = dayjs.tz(dateKey, TOKYO_TZ).day();
+        const confirmed = safeInt((daily.get(dateKey) || {}).confirmed || 0);
+        if (dow === 0 || dow === 6) { weekendDays += 1; weekendCount += confirmed; }
+        else { weekdayDays += 1; weekdayCount += confirmed; }
+    });
+    const weekdayAvg = weekdayDays ? weekdayCount / weekdayDays : 0;
+    const weekendAvg = weekendDays ? weekendCount / weekendDays : 0;
+    const concentration = weekdayAvg > 0 ? weekendAvg / weekdayAvg : (weekendAvg > 0 ? null : 0);
+    return { weekdayAvg, weekendAvg, concentration };
 }
 
-function buildCalendarCellRichText(dateKey, stats, isToday) {
-    const text = buildCalendarCell(dateKey, stats, isToday);
+function formatWeekendIncrease(concentration) {
+    if (concentration === null) return "\uc8fc\ub9d0\ub9cc"; // 주말만
+    if (!Number.isFinite(Number(concentration))) return "-";
+    const pct = Math.round((Number(concentration) - 1) * 100);
+    return `\ud3c9\uc77c \ub300\ube44 ${pct >= 0 ? "+" : ""}${pct}%`;
+}
+
+function percentile(values, p) {
+    const sorted = values.filter((v) => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
+    if (!sorted.length) return 0;
+    const idx = Math.ceil((p / 100) * sorted.length) - 1;
+    return sorted[Math.max(0, Math.min(sorted.length - 1, idx))];
+}
+
+function average(values) {
+    const nums = values.filter((v) => Number.isFinite(v));
+    if (!nums.length) return 0;
+    return nums.reduce((sum, v) => sum + v, 0) / nums.length;
+}
+
+function getMonthPeakStats(monthDates, daily) {
+    const confirmedCounts = [];
+    const confirmedNeeds = [];
+    const projectedCounts = [];
+    const reserveNeeds = [];
+    monthDates.forEach((d) => {
+        const s = daily.get(d) || {};
+        confirmedCounts.push(safeInt(s.confirmed));
+        confirmedNeeds.push(safeInt(s.confirmedHeadcount));
+        projectedCounts.push(safeInt(s.projected));
+        reserveNeeds.push(safeInt(s.operationalMinHeadcount || s.minHeadcount || 0));
+    });
+    return {
+        confirmedAvg: average(confirmedCounts),
+        confirmedP80: percentile(confirmedCounts, 80),
+        confirmedP90: percentile(confirmedCounts, 90),
+        confirmedNeedAvg: average(confirmedNeeds),
+        projectedP80: percentile(projectedCounts, 80),
+        reserveAvg: average(reserveNeeds),
+        reserveP80: percentile(reserveNeeds, 80),
+    };
+}
+
+function getDayPeakSignal(stats, monthPeakStats) {
+    const confirmed = safeInt(stats.confirmed);
+    const confirmedNeed = safeInt(stats.confirmedHeadcount);
+    const projected = safeInt(stats.projected);
+    const reserveNeed = safeInt(stats.operationalMinHeadcount || stats.minHeadcount || 0);
+    if (!monthPeakStats) return { type: "", label: "" };
+
+    const confirmedHigh = confirmed > 0 && (
+        confirmed >= monthPeakStats.confirmedP90
+        || confirmed >= monthPeakStats.confirmedAvg + 3
+        || confirmedNeed >= monthPeakStats.confirmedNeedAvg + 2
+    );
+    if (confirmedHigh) {
+        return { type: "confirmed_high", label: "\ud655\uc815\ud53c\ud06c \ub192\uc74c" };
+    }
+
+    const confirmedWarning = confirmed > 0 && (
+        confirmed >= monthPeakStats.confirmedP80
+        || confirmed >= monthPeakStats.confirmedAvg + 2
+        || confirmedNeed >= monthPeakStats.confirmedNeedAvg + 1
+    );
+    if (confirmedWarning) {
+        return { type: "confirmed_warning", label: "\ud655\uc815\ud53c\ud06c \uc8fc\uc758" };
+    }
+
+    const projectedWarning = projected > 0 && (
+        projected >= monthPeakStats.projectedP80
+        || reserveNeed >= monthPeakStats.reserveP80
+        || reserveNeed >= monthPeakStats.reserveAvg + 1
+    );
+    if (projectedWarning) {
+        return { type: "projected_warning", label: "\uc608\uc0c1\uc8fc\uc758" };
+    }
+
+    return { type: "", label: "" };
+}
+
+function getMonthPeakRiskLabel(monthDates, daily) {
+    const monthPeakStats = getMonthPeakStats(monthDates, daily);
+    let hasHigh = false;
+    let hasWarning = false;
+    let hasProjectedWarning = false;
+    monthDates.forEach((d) => {
+        const signal = getDayPeakSignal(daily.get(d) || {}, monthPeakStats);
+        if (signal.type === "confirmed_high") hasHigh = true;
+        else if (signal.type === "confirmed_warning") hasWarning = true;
+        else if (signal.type === "projected_warning") hasProjectedWarning = true;
+    });
+    if (hasHigh) return "\ud655\uc815\ud53c\ud06c \ub192\uc74c";
+    if (hasWarning) return "\ud655\uc815\ud53c\ud06c \uc8fc\uc758";
+    if (hasProjectedWarning) return "\uc608\uc0c1\uc8fc\uc758";
+    return "\ub0ae\uc74c"; // \ub0ae\uc74c
+}
+
+function getMonthPeakDayCountDisplay(monthDates, daily) {
+    const monthPeakStats = getMonthPeakStats(monthDates, daily);
+    const peakDayCount = monthDates.reduce((count, d) => {
+        const signal = getDayPeakSignal(daily.get(d) || {}, monthPeakStats);
+        return signal.type ? count + 1 : count;
+    }, 0);
+    return `${peakDayCount}\uac74`;
+}
+
+function buildCalendarCell(dateKey, stats, isToday, peakSignal = { type: "", label: "" }) {
+    const d = dayjs.tz(dateKey, TOKYO_TZ);
+    const confirmed = safeInt(stats.confirmed);
+    const projected = safeInt(stats.projected);
+    const confirmedNeed = safeInt(stats.confirmedHeadcount);
+    const reserveNeed = safeInt(stats.operationalMinHeadcount);
+    const lines = [
+        `${d.format("M/D ddd")}${isToday ? "  TODAY" : ""}`,
+        `\ud655\uc815 ${confirmed}\uac74`,
+        `\uc608\uc0c1 ${projected}\uac74`,
+        `\ud655\uc815\ud544\uc694 ${confirmedNeed}\uba85`,
+        `\ub300\ube44\ud544\uc694 ${reserveNeed}\uba85`,
+        yen(stats.confirmedCostBase),
+    ];
+    if (peakSignal.label) {
+        lines.push(peakSignal.label);
+    }
+    return lines.join("\n");
+}
+
+function buildCalendarCellRichText(dateKey, stats, isToday, peakSignal = { type: "", label: "" }) {
+    const text = buildCalendarCell(dateKey, stats, isToday, peakSignal);
     const lines = text.split("\n");
     let cursor = 0;
     const starts = lines.map((line) => {
@@ -1142,60 +1371,26 @@ function buildCalendarCellRichText(dateKey, stats, isToday) {
         return start;
     });
 
-    // Line indices: 0=date, 1=청소 total, 2=확정, 3=예상, 4=권장, 5=cost
-    return {
-        text,
-        textFormatRuns: [
-            // Line 0: date — dark navy, bold
-            {
-                startIndex: starts[0],
-                format: {
-                    bold: true,
-                    foregroundColorStyle: { rgbColor: { red: 0.07, green: 0.13, blue: 0.27 } },
-                },
-            },
-            // Line 1: 청소 total — black, bold
-            {
-                startIndex: starts[1],
-                format: {
-                    bold: true,
-                    foregroundColorStyle: { rgbColor: { red: 0.1, green: 0.1, blue: 0.1 } },
-                },
-            },
-            // Line 2: 확정 — amber/orange (#B45309), bold
-            {
-                startIndex: starts[2],
-                format: {
-                    bold: true,
-                    foregroundColorStyle: { rgbColor: { red: 0.706, green: 0.325, blue: 0.035 } },
-                },
-            },
-            // Line 3: 예상 — slate gray (#475569)
-            {
-                startIndex: starts[3],
-                format: {
-                    bold: false,
-                    foregroundColorStyle: { rgbColor: { red: 0.278, green: 0.333, blue: 0.412 } },
-                },
-            },
-            // Line 4: 권장 — navy (#1E3A8A), bold
-            {
-                startIndex: starts[4],
-                format: {
-                    bold: true,
-                    foregroundColorStyle: { rgbColor: { red: 0.118, green: 0.227, blue: 0.541 } },
-                },
-            },
-            // Line 5: cost — green (#047857), bold
-            {
-                startIndex: starts[5],
-                format: {
-                    bold: true,
-                    foregroundColorStyle: { rgbColor: { red: 0.016, green: 0.471, blue: 0.341 } },
-                },
-            },
-        ],
-    };
+    // Line indices: 0=date, 1=확정(amber), 2=예상(blue), 3=확정필요, 4=대비필요, 5=cost, 6=peak(optional)
+    const runs = [
+        // Line 0: date — dark navy, bold
+        { startIndex: starts[0], format: { bold: true, foregroundColorStyle: { rgbColor: { red: 0.07, green: 0.13, blue: 0.27 } } } },
+        // Line 1: 확정 — amber (#B45309)
+        { startIndex: starts[1], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.706, green: 0.325, blue: 0.035 } } } },
+        // Line 2: 예상 — blue (#2563EB)
+        { startIndex: starts[2], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.145, green: 0.388, blue: 0.922 } } } },
+        // Line 3: 확정필요 — dark slate
+        { startIndex: starts[3], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.1, green: 0.1, blue: 0.1 } } } },
+        // Line 4: 대비필요 — dark navy
+        { startIndex: starts[4], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.118, green: 0.227, blue: 0.541 } } } },
+        // Line 5: cost — green (#047857)
+        { startIndex: starts[5], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.016, green: 0.471, blue: 0.341 } } } },
+    ];
+    // Line 6 (optional): peak risk — red (#DC2626), bold
+    if (lines.length > 6 && lines[6]) {
+        runs.push({ startIndex: starts[6], format: { bold: true, foregroundColorStyle: { rgbColor: { red: 0.863, green: 0.149, blue: 0.149 } } } });
+    }
+    return { text, textFormatRuns: runs };
 }
 
 function computeMonthlyMinimumWorkforce(daily, months, manualInputs = new Map()) {
@@ -1318,7 +1513,8 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
     let apiRow = apiRowInitial;
     let manualInputRow = manualInputRowInitial;
 
-    const weeklySummaryRowsAll = buildWeeklySummaryRowsFromDaily(model.daily);
+    const todayKeyForWeekly = dayjs().tz(TOKYO_TZ).format("YYYY-MM-DD");
+    const weeklySummaryRowsAll = buildWeeklySummaryRowsFromDaily(model.daily, opts.roomMap || new Map(), todayKeyForWeekly);
     const weeklyTargetCount = Math.min(weeklySummaryRowsAll.length, MAX_WEEKLY_SUMMARY_ROWS_HARD_CAP);
 
     if (weeklyRow >= 0 && buildingRowInitial > weeklyRow && weeklyTargetCount > 0) {
@@ -1352,19 +1548,62 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
 
     const todayKey = dayjs().tz(TOKYO_TZ).format("YYYY-MM-DD");
     let todayCellPosition = null;
+    const layoutSheetId = await getSheetIdByTitle(sheets, SPREADSHEET_ID, SHEET_TITLE);
+
+    // Detect calendar title rows and run one-time migration to ensure 3 KPI rows above each.
+    let calendarValues = values;
     const monthRows = [];
-    for (let i = 0; i < values.length; i += 1) {
-        const text = String(values[i]?.[0] || "");
-        if (text.startsWith("\uc6d4\uac04 \uce98\ub9b0\ub354 | ")) monthRows.push(i);
+    for (let i = 0; i < calendarValues.length; i += 1) {
+        if (String(calendarValues[i]?.[0] || "").startsWith("\uc6d4\uac04 \uce98\ub9b0\ub354 | ")) monthRows.push(i);
+    }
+
+    // Process from bottom to top so earlier row indices are not invalidated by insertions.
+    const sortedForMigration = [...monthRows].sort((a, b) => b - a);
+    let migrationInsertions = 0;
+    for (const rowIdx of sortedForMigration) {
+        if (rowIdx < 3) continue;
+        const threeAbove = String(calendarValues[rowIdx - 3]?.[0] || "").trim();
+        if (!threeAbove) continue; // blank row \u2014 can write KPI row 1 there, no insert needed
+        if (/^\d{1,2}\uc6d4 /.test(threeAbove)) continue; // already has our KPI row 1 (e.g. "5\uc6d4 \uc608\uc0c1 \ucd1d \uccad\uc18c")
+        // Row is occupied by non-KPI content (e.g. calendar day cell, title) \u2014 insert 1 row.
+        await sheets.spreadsheets.batchUpdate({
+            spreadsheetId: SPREADSHEET_ID,
+            resource: {
+                requests: [{
+                    insertDimension: {
+                        range: {
+                            sheetId: layoutSheetId,
+                            dimension: "ROWS",
+                            startIndex: rowIdx - 2,
+                            endIndex: rowIdx - 1,
+                        },
+                        inheritFromBefore: false,
+                    },
+                }],
+            },
+        });
+        migrationInsertions++;
+    }
+    if (migrationInsertions > 0) {
+        const refreshed = await sheets.spreadsheets.values.get({
+            spreadsheetId: SPREADSHEET_ID,
+            range: `${SHEET_TITLE}!A1:H400`,
+        });
+        calendarValues = refreshed.data.values || [];
+        monthRows.length = 0;
+        for (let i = 0; i < calendarValues.length; i += 1) {
+            if (String(calendarValues[i]?.[0] || "").startsWith("\uc6d4\uac04 \uce98\ub9b0\ub354 | ")) monthRows.push(i);
+        }
+        console.log(`[forecast] calendar migration: inserted ${migrationInsertions} KPI row(s), re-detected ${monthRows.length} calendars`);
     }
 
     const updates = [];
     const calendarLayoutRequests = [];
     const calendarRichTextRequests = [];
+    const peakCellPositions = [];
     const weeklyFormatRequests = [];
     const buildingSummaryFormatRequests = [];
     const attendanceAppFormatRequests = [];
-    const layoutSheetId = await getSheetIdByTitle(sheets, SPREADSHEET_ID, SHEET_TITLE);
     const updateTs = dayjs().tz(TOKYO_TZ).format("YYYY-MM-DD HH:mm");
     let staleApiRow = -1;
     if (apiRow >= 0 && manualInputRow >= 0 && apiRow < manualInputRow) {
@@ -1372,67 +1611,119 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
         apiRow = -1;
     }
     monthRows.forEach((rowIdx) => {
-        const title = String(values[rowIdx]?.[0] || "");
+        const title = String(calendarValues[rowIdx]?.[0] || "");
         const m = title.match(/(\d{4})\ub144 (\d{1,2})\uc6d4/);
         if (!m) return;
         const year = Number(m[1]);
         const monthNum = Number(m[2]);
         const monthKey = `${m[1]}-${String(monthNum).padStart(2, "0")}`;
 
-        // Write month-scoped KPI to the 2 dedicated rows above the calendar title.
-        // kpiRow1 sheet row = rowIdx - 1 (1-indexed), kpiRow2 = rowIdx (1-indexed).
-        if (rowIdx >= 2) {
-            const monthDates = [...model.daily.keys()].filter((d) => d.startsWith(monthKey));
+        const monthDates = [...model.daily.keys()].filter((d) => d.startsWith(monthKey)).sort();
+
+        // Write 3 KPI rows above the calendar title.
+        // KPI row 1: A${rowIdx-2}, KPI row 2: A${rowIdx-1}, KPI row 3: A${rowIdx}  (1-indexed A1 notation)
+        // Title remains at A${rowIdx+1}.
+        if (rowIdx >= 3) {
             const monthKpi = monthDates.reduce((acc, d) => {
                 const s = model.daily.get(d) || {};
                 acc.cleaning += safeInt(s.cleaning);
                 acc.confirmed += safeInt(s.confirmed);
                 acc.projected += safeInt(s.projected);
                 acc.cost += safeInt(s.costBase);
+                acc.confirmedCost += safeInt(s.confirmedCostBase);
                 return acc;
-            }, { cleaning: 0, confirmed: 0, projected: 0, cost: 0 });
+            }, { cleaning: 0, confirmed: 0, projected: 0, cost: 0, confirmedCost: 0 });
 
             const mData = monthlyData && monthlyData.find((d) => d && d.monthKey === monthKey);
             const fixedStaff = mData ? mData.fixedStaff : 0;
             const systemFixedStaff = mData ? mData.systemFixedStaff : 0;
-            const fixedShortage = mData ? mData.fixedShortage : 0;
             const supportPool = mData ? mData.supportPool : 0;
             const totalPool = mData ? mData.monthlyMinWorkforce : 0;
 
-            // KPI row 1: monthly cleaning + fixed-staff hiring signal.
+            const projectedLow = Math.max(0, Math.round(monthKpi.projected * (0.85 / 0.90)));
+            const projectedHigh = Math.round(monthKpi.projected * (0.95 / 0.90));
+            const monthPeakLabel = getMonthPeakRiskLabel(monthDates, model.daily);
+            const monthPeakDayCountDisplay = getMonthPeakDayCountDisplay(monthDates, model.daily);
+            const { weekdayAvg, weekendAvg, concentration } = computeConfirmedWeekdayWeekendAverages(monthDates, model.daily);
+            const weekendIncreaseDisplay = formatWeekendIncrease(concentration);
+
+            // KPI row 1: demand summary
+            updates.push({
+                range: `${SHEET_TITLE}!A${rowIdx - 2}:H${rowIdx - 2}`,
+                values: [[
+                    `${monthNum}\uc6d4 \ud655\uc815+\uc608\uc0c1 \ub300\ube44`,
+                    `${monthKpi.cleaning}\uac74`,
+                    "\ud655\uc815 \uccad\uc18c",
+                    `${monthKpi.confirmed}\uac74`,
+                    "\uc608\uc0c1 \ucd94\uac00(Base)",
+                    `${monthKpi.projected}\uac74`,
+                    "\uc608\uc0c1 \ubc94\uc704(85~95%)",
+                    `${projectedLow}~${projectedHigh}\uac74`,
+                ]],
+            });
+            // KPI row 2: workforce summary
             updates.push({
                 range: `${SHEET_TITLE}!A${rowIdx - 1}:H${rowIdx - 1}`,
                 values: [[
-                    `${monthNum}\uc6d4 \uc608\uc0c1 \ucd1d \uccad\uc18c`,
-                    `${monthKpi.cleaning}\uac74`,
                     "\ucd5c\uc18c \uace0\uc815\uc778\uc6d0",
                     `${systemFixedStaff}\uba85`,
                     "\uc801\uc6a9 \uace0\uc815\uc778\uc6d0",
                     `${fixedStaff}\uba85`,
-                    "\uace0\uc815 \ubd80\uc871",
-                    `${fixedShortage}\uba85`,
-                ]],
-            });
-            // KPI row 2: demand split + support pool + total required pool.
-            updates.push({
-                range: `${SHEET_TITLE}!A${rowIdx}:H${rowIdx}`,
-                values: [[
-                    "\ud655\uc815/\uc608\uc0c1 CO",
-                    `${monthKpi.confirmed}/${monthKpi.projected}`,
                     "\ubcf4\ucda9\ud480 \ud544\uc694",
                     `${supportPool}\uba85`,
                     "\ucd1d \ud655\ubcf4 \ud544\uc694",
                     `${totalPool}\uba85`,
-                    "\uc608\uc0c1\uc778\uac74\ube44(Base)",
-                    yen(monthKpi.cost),
                 ]],
             });
+            // KPI row 3: daily average weekday/weekend + peak cleaning + confirmed labor cost
+            updates.push({
+                range: `${SHEET_TITLE}!A${rowIdx}:H${rowIdx}`,
+                values: [[
+                    "\ud3c9/\uc8fc \uc77c\ud3c9\uade0",
+                    `${weekdayAvg.toFixed(1)}/${weekendAvg.toFixed(1)}`,
+                    "\uc8fc\ub9d0 \uc99d\uac00\uc728",
+                    weekendIncreaseDisplay,
+                    "\ud53c\ud06c\uc77c \uc218",
+                    monthPeakDayCountDisplay,
+                    "\ud655\uc815 \uc778\uac74\ube44",
+                    yen(monthKpi.confirmedCost),
+                ]],
+            });
+
+            // KPI row 1 E-H: projected demand \u2014 blue text only
+            calendarLayoutRequests.push({
+                repeatCell: {
+                    range: { sheetId: null, startRowIndex: rowIdx - 3, endRowIndex: rowIdx - 2, startColumnIndex: 4, endColumnIndex: 8 },
+                    cell: { userEnteredFormat: { textFormat: { bold: true, foregroundColorStyle: { rgbColor: { red: 0.145, green: 0.388, blue: 0.922 } } } } },
+                    fields: "userEnteredFormat.textFormat.bold,userEnteredFormat.textFormat.foregroundColorStyle",
+                },
+            });
+            calendarLayoutRequests.push({
+                updateDimensionProperties: {
+                    range: { sheetId: null, dimension: "ROWS", startIndex: rowIdx - 3, endIndex: rowIdx - 2 },
+                    properties: { pixelSize: 24 },
+                    fields: "pixelSize",
+                },
+            });
+            // KPI row 3 E-F: peak risk \u2014 red when warning/high
+            if (monthPeakLabel !== "\ub0ae\uc74c") {
+                calendarLayoutRequests.push({
+                    repeatCell: {
+                        range: { sheetId: null, startRowIndex: rowIdx - 1, endRowIndex: rowIdx, startColumnIndex: 4, endColumnIndex: 6 },
+                        cell: { userEnteredFormat: { textFormat: { bold: true, foregroundColorStyle: { rgbColor: { red: 0.863, green: 0.149, blue: 0.149 } } } } },
+                        fields: "userEnteredFormat.textFormat.bold,userEnteredFormat.textFormat.foregroundColorStyle",
+                    },
+                });
+            }
         }
+
+        // Confirmed workload is the primary peak signal; projected demand is secondary.
+        const monthPeakStats = getMonthPeakStats(monthDates, model.daily);
 
         for (let w = 0; w < 6; w += 1) {
             for (let c = 0; c < 7; c += 1) {
                 const r = rowIdx + 2 + w;
-                const currentCell = String(values[r]?.[c] || "");
+                const currentCell = String(calendarValues[r]?.[c] || "");
                 if (!currentCell.trim()) continue;
                 const first = currentCell.split("\n")[0] || "";
                 const dm = first.match(/^(\d{1,2})\/(\d{1,2})/);
@@ -1441,132 +1732,78 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
                 const day = Number(dm[2]);
                 const dateKey = dayjs.tz(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`, TOKYO_TZ).format("YYYY-MM-DD");
                 const stats = model.daily.get(dateKey) || {
-                    cleaning: 0,
-                    minHeadcount: 0,
-                    recommendedHeadcount: 0,
-                    costBase: 0,
-                    confirmed: 0,
-                    projected: 0,
+                    cleaning: 0, confirmedHeadcount: 0, minHeadcount: 0, operationalMinHeadcount: 0, recommendedHeadcount: 0, costBase: 0, confirmedCostBase: 0, confirmed: 0, projected: 0,
                 };
                 if (dateKey === todayKey) todayCellPosition = { r, c };
-                const richCell = buildCalendarCellRichText(dateKey, stats, dateKey === todayKey);
+                const dayPeakSignal = getDayPeakSignal(stats, monthPeakStats);
+                if (dayPeakSignal.type) {
+                    peakCellPositions.push({ r, c, type: dayPeakSignal.type });
+                }
+                const richCell = buildCalendarCellRichText(dateKey, stats, dateKey === todayKey, dayPeakSignal);
                 updates.push({
                     range: `${SHEET_TITLE}!${colToA1(c)}${r + 1}`,
                     values: [[richCell.text]],
                 });
                 calendarRichTextRequests.push({
                     updateCells: {
-                        range: {
-                            sheetId: layoutSheetId,
-                            startRowIndex: r,
-                            endRowIndex: r + 1,
-                            startColumnIndex: c,
-                            endColumnIndex: c + 1,
-                        },
-                        rows: [{
-                            values: [{
-                                userEnteredValue: { stringValue: richCell.text },
-                                textFormatRuns: richCell.textFormatRuns,
-                            }],
-                        }],
+                        range: { sheetId: layoutSheetId, startRowIndex: r, endRowIndex: r + 1, startColumnIndex: c, endColumnIndex: c + 1 },
+                        rows: [{ values: [{ userEnteredValue: { stringValue: richCell.text }, textFormatRuns: richCell.textFormatRuns }] }],
                         fields: "userEnteredValue,textFormatRuns",
                     },
                 });
             }
         }
 
-        // Calendar readability: enforce wrapped text and enough row height for day cells.
-        // First, reset all day cell backgrounds to white to clear stale TODAY highlights.
+        // Calendar readability: reset day cell backgrounds, apply weekday header and row heights.
         calendarLayoutRequests.push({
             repeatCell: {
-                range: {
-                    sheetId: null,
-                    startRowIndex: rowIdx + 2,
-                    endRowIndex: rowIdx + 8,
-                    startColumnIndex: 0,
-                    endColumnIndex: 7,
-                },
-                cell: {
-                    userEnteredFormat: {
-                        backgroundColorStyle: { rgbColor: { red: 1, green: 1, blue: 1 } },
-                    },
-                },
+                range: { sheetId: null, startRowIndex: rowIdx + 2, endRowIndex: rowIdx + 8, startColumnIndex: 0, endColumnIndex: 7 },
+                cell: { userEnteredFormat: { backgroundColorStyle: { rgbColor: { red: 1, green: 1, blue: 1 } } } },
                 fields: "userEnteredFormat.backgroundColorStyle",
             },
         });
         calendarLayoutRequests.push(
             {
                 repeatCell: {
-                    range: {
-                        sheetId: null,
-                        startRowIndex: rowIdx + 1,
-                        endRowIndex: rowIdx + 2,
-                        startColumnIndex: 0,
-                        endColumnIndex: 7,
-                    },
-                    cell: {
-                        userEnteredFormat: {
-                            backgroundColorStyle: { rgbColor: { red: 0.05, green: 0.12, blue: 0.22 } },
-                            textFormat: {
-                                bold: true,
-                                fontSize: 11,
-                                foregroundColorStyle: { rgbColor: { red: 1, green: 1, blue: 1 } },
-                            },
-                            horizontalAlignment: "CENTER",
-                            verticalAlignment: "MIDDLE",
-                        },
-                    },
+                    range: { sheetId: null, startRowIndex: rowIdx + 1, endRowIndex: rowIdx + 2, startColumnIndex: 0, endColumnIndex: 7 },
+                    cell: { userEnteredFormat: { backgroundColorStyle: { rgbColor: { red: 0.05, green: 0.12, blue: 0.22 } }, textFormat: { bold: true, fontSize: 11, foregroundColorStyle: { rgbColor: { red: 1, green: 1, blue: 1 } } }, horizontalAlignment: "CENTER", verticalAlignment: "MIDDLE" } },
                     fields: "userEnteredFormat.backgroundColorStyle,userEnteredFormat.textFormat,userEnteredFormat.horizontalAlignment,userEnteredFormat.verticalAlignment",
                 },
             },
-            {
-                updateDimensionProperties: {
-                    range: {
-                        sheetId: null,
-                        dimension: "ROWS",
-                        startIndex: rowIdx + 1,
-                        endIndex: rowIdx + 2,
-                    },
-                    properties: {
-                        pixelSize: 28,
-                    },
-                    fields: "pixelSize",
-                },
-            },
+            { updateDimensionProperties: { range: { sheetId: null, dimension: "ROWS", startIndex: rowIdx + 1, endIndex: rowIdx + 2 }, properties: { pixelSize: 28 }, fields: "pixelSize" } },
             {
                 repeatCell: {
-                    range: {
-                        sheetId: null,
-                        startRowIndex: rowIdx + 2,
-                        endRowIndex: rowIdx + 8,
-                        startColumnIndex: 0,
-                        endColumnIndex: 7,
-                    },
-                    cell: {
-                        userEnteredFormat: {
-                            wrapStrategy: "WRAP",
-                            verticalAlignment: "TOP",
-                            horizontalAlignment: "LEFT",
-                        },
-                    },
+                    range: { sheetId: null, startRowIndex: rowIdx + 2, endRowIndex: rowIdx + 8, startColumnIndex: 0, endColumnIndex: 7 },
+                    cell: { userEnteredFormat: { wrapStrategy: "WRAP", verticalAlignment: "TOP", horizontalAlignment: "LEFT" } },
                     fields: "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment,userEnteredFormat.horizontalAlignment",
                 },
             },
-            {
-                updateDimensionProperties: {
-                    range: {
-                        sheetId: null,
-                        dimension: "ROWS",
-                        startIndex: rowIdx + 2,
-                        endIndex: rowIdx + 8,
-                    },
-                    properties: {
-                        pixelSize: 120,
-                    },
-                    fields: "pixelSize",
-                },
-            }
+            { updateDimensionProperties: { range: { sheetId: null, dimension: "ROWS", startIndex: rowIdx + 2, endIndex: rowIdx + 8 }, properties: { pixelSize: 140 }, fields: "pixelSize" } }
         );
+    });
+
+    peakCellPositions.forEach(({ r, c, type }) => {
+        if (type === "projected_warning") return;
+        const rgbColor = type === "confirmed_high"
+            ? { red: 1.0, green: 0.894, blue: 0.902 }
+            : { red: 1.0, green: 0.945, blue: 0.949 };
+        calendarLayoutRequests.push({
+            repeatCell: {
+                range: {
+                    sheetId: null,
+                    startRowIndex: r,
+                    endRowIndex: r + 1,
+                    startColumnIndex: c,
+                    endColumnIndex: c + 1,
+                },
+                cell: {
+                    userEnteredFormat: {
+                        backgroundColorStyle: { rgbColor },
+                    },
+                },
+                fields: "userEnteredFormat.backgroundColorStyle",
+            },
+        });
     });
 
     // Apply yellow highlight to the actual TODAY cell (only one cell, overrides white reset).
@@ -1614,12 +1851,12 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
             values: [[
                 "\uc8fc \uc2dc\uc791\uc77c",
                 "\uc8fc \uc885\ub8cc\uc77c",
-                "\ucd1d \uccad\uc18c",
-                "\uc608\uc0c1\uc720\uc785CO",
-                "\uc0b0\uc2dd\ucd5c\uc18c(peak)",
-                "\uc6b4\uc601\ucd5c\uc18c(peak)",
-                "\uad8c\uc7a5(peak)",
-                "\uc608\uc0c1\uc778\uac74\ube44",
+                "\ud655\uc815 \uccad\uc18c",
+                "\ub0a8\uc740 \uc8fc\ub0b4 \ucd94\uac00\uac00\ub2a5 CO",
+                "\ud655\uc815 \ud53c\ud06c\uc77c",
+                "\ud53c\ud06c \ub300\uc751",
+                "\uc8fc\uac04 \ud655\ubcf4\ud480",
+                "\ud655\uc815 \uc778\uac74\ube44",
             ]],
         });
         const lastDataRow = weeklyRow + 2 + Math.max(weekRows.length, 1);
@@ -1652,22 +1889,44 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
                 },
             },
             {
+                // C(확정청소), D(주내추가가능CO): NUMBER
                 repeatCell: {
                     range: {
                         sheetId: layoutSheetId,
                         startRowIndex: weeklyRow + 2,
                         endRowIndex: lastDataRow,
                         startColumnIndex: 2,
+                        endColumnIndex: 4,
+                    },
+                    cell: { userEnteredFormat: { numberFormat: { type: "NUMBER", pattern: "0" } } },
+                    fields: "userEnteredFormat.numberFormat",
+                },
+            },
+            {
+                // E(확정피크일): DATE
+                repeatCell: {
+                    range: {
+                        sheetId: layoutSheetId,
+                        startRowIndex: weeklyRow + 2,
+                        endRowIndex: lastDataRow,
+                        startColumnIndex: 4,
+                        endColumnIndex: 5,
+                    },
+                    cell: { userEnteredFormat: { numberFormat: { type: "DATE", pattern: "yyyy-mm-dd" } } },
+                    fields: "userEnteredFormat.numberFormat",
+                },
+            },
+            {
+                // F(피크대응), G(주간확보풀): NUMBER
+                repeatCell: {
+                    range: {
+                        sheetId: layoutSheetId,
+                        startRowIndex: weeklyRow + 2,
+                        endRowIndex: lastDataRow,
+                        startColumnIndex: 5,
                         endColumnIndex: 7,
                     },
-                    cell: {
-                        userEnteredFormat: {
-                            numberFormat: {
-                                type: "NUMBER",
-                                pattern: "0",
-                            },
-                        },
-                    },
+                    cell: { userEnteredFormat: { numberFormat: { type: "NUMBER", pattern: "0" } } },
                     fields: "userEnteredFormat.numberFormat",
                 },
             },
@@ -1692,6 +1951,45 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
                 },
             }
         );
+
+        // Reset all weekly data row backgrounds to white so stale highlights are cleared.
+        weeklyFormatRequests.push({
+            repeatCell: {
+                range: {
+                    sheetId: layoutSheetId,
+                    startRowIndex: weeklyRow + 2,
+                    endRowIndex: lastDataRow,
+                    startColumnIndex: 0,
+                    endColumnIndex: 8,
+                },
+                cell: { userEnteredFormat: { backgroundColorStyle: { rgbColor: { red: 1, green: 1, blue: 1 } } } },
+                fields: "userEnteredFormat.backgroundColorStyle",
+            },
+        });
+
+        // Highlight the weekly row that contains today with soft yellow (#FEF3C7).
+        const todayWeekRowOffset = weekRows.findIndex((row) => {
+            const ws = String(row[0] || "");
+            const we = String(row[1] || "");
+            return ws && we && ws <= todayKey && we >= todayKey;
+        });
+        if (todayWeekRowOffset >= 0) {
+            // weekRows data starts at 0-indexed API row weeklyRow + 2 (= A1 sheet row weeklyRow + 3).
+            const highlightRowIndex = weeklyRow + 2 + todayWeekRowOffset;
+            weeklyFormatRequests.push({
+                repeatCell: {
+                    range: {
+                        sheetId: layoutSheetId,
+                        startRowIndex: highlightRowIndex,
+                        endRowIndex: highlightRowIndex + 1,
+                        startColumnIndex: 0,
+                        endColumnIndex: 8,
+                    },
+                    cell: { userEnteredFormat: { backgroundColorStyle: { rgbColor: { red: 0.996, green: 0.953, blue: 0.780 } } } },
+                    fields: "userEnteredFormat.backgroundColorStyle",
+                },
+            });
+        }
     }
 
     if (buildingRow >= 0) {
@@ -1734,7 +2032,7 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
             values: [[
                 "\uc6d4",
                 "\ucd1d \ud655\ubcf4 \ud544\uc694",
-                "\uc2dc\uc2a4\ud15c \uace0\uc815\uad8c\uc7a5",
+                "\ucd5c\uc18c \uace0\uc815\uc778\uc6d0",
                 "\uc801\uc6a9 \uace0\uc815\uc778\uc6d0",
                 "\uace0\uc815 \ubd80\uc871",
                 "\ubcf4\ucda9\ud480 \ud544\uc694",
@@ -1767,15 +2065,15 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
                 `${month0} 확정CO`,
                 `${month1} 확정CO`,
                 `${month2} 확정CO`,
-                "\uc77c\ud3c9\uade0 \uc0b0\uc2dd\ucd5c\uc18c",
-                "\uc77c\ud3c9\uade0 \uc6b4\uc601\ucd5c\uc18c",
-                "\uc77c\ud3c9\uade0 \uad8c\uc7a5",
-                "\uc608\uc0c1\uc778\uac74\ube44(3M)",
+                "\uc77c\ud3c9\uade0 \ucd5c\uc18c",
+                "\ud53c\ud06c \ucd5c\uc18c",
+                "\ud655\uc815 \uc778\uac74\ube44(3M)",
+                "\uba54\ubaa8",
             ]],
         });
 
         const byBuilding = new Map(BUILDING_ORDER.map((k) => [k, {
-            month0: 0, month1: 0, month2: 0, mathMin: 0, opMin: 0, rec: 0, cost: 0, days: 0,
+            month0: 0, month1: 0, month2: 0, opMin: 0, peakMin: 0, confirmedCost: 0, days: 0,
         }]));
         model.dailyByBuilding.forEach((row) => {
             const key = row.buildingKey || Object.entries(BUILDING_DISPLAY).find(([, name]) => name === row.building)?.[0];
@@ -1785,10 +2083,9 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
             if (month === month0) bucket.month0 += row.confirmed;
             if (month === month1) bucket.month1 += row.confirmed;
             if (month === month2) bucket.month2 += row.confirmed;
-            bucket.mathMin += row.mathMinHeadcount || 0;
             bucket.opMin += row.operationalMinHeadcount || row.minHeadcount || 0;
-            bucket.rec += row.recommendedHeadcount || 0;
-            bucket.cost += row.costBase || 0;
+            bucket.peakMin = Math.max(bucket.peakMin, row.operationalMinHeadcount || row.minHeadcount || 0);
+            bucket.confirmedCost += row.confirmedCostBase || 0;
             bucket.days += 1;
         });
         const bldRows = BUILDING_ORDER.map((key) => {
@@ -1798,10 +2095,10 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
                 b.month0,
                 b.month1,
                 b.month2,
-                b.days ? Math.round((b.mathMin / b.days) * 10) / 10 : 0,
                 b.days ? Math.round((b.opMin / b.days) * 10) / 10 : 0,
-                b.days ? Math.round((b.rec / b.days) * 10) / 10 : 0,
-                yen(b.cost),
+                b.peakMin,
+                yen(b.confirmedCost),
+                "",
             ];
         });
         updates.push({
@@ -1946,8 +2243,8 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
                         sheetId: layoutSheetId,
                         startRowIndex: bldStart,
                         endRowIndex: bldStart + BUILDING_ORDER.length,
-                        startColumnIndex: 7,
-                        endColumnIndex: 8,
+                        startColumnIndex: 6,
+                        endColumnIndex: 7,
                     },
                     cell: {
                         userEnteredFormat: {
@@ -2036,8 +2333,8 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
                     `${m.allPartTimeEquivalent || 0}\uba85`,
                     m.peakDate || "-",
                     `${m.peakOperational}\uba85`,
-                    top[0] ? `${top[0].date}(op${top[0].operationalMin}/rec${top[0].recommended})` : "-",
-                    top[1] ? `${top[1].date}(op${top[1].operationalMin}/rec${top[1].recommended})` : "-",
+                    top[0] ? `${top[0].date}(\ucd5c\uc18c${top[0].operationalMin})` : "-",
+                    top[1] ? `${top[1].date}(\ucd5c\uc18c${top[1].operationalMin})` : "-",
                 ]],
             });
         });
@@ -2324,7 +2621,7 @@ async function runCleaningWorkforceForecastUpdate() {
     const now = dayjs().tz(TOKYO_TZ);
     const todayKey = now.format("YYYY-MM-DD");
     const forecastStart = now.subtract(1, "month").startOf("month").format("YYYY-MM-DD");
-    const forecastEnd = now.add(3, "month").endOf("month").format("YYYY-MM-DD");
+    const forecastEnd = now.add(2, "month").endOf("month").format("YYYY-MM-DD");
     const historyStart = now.subtract(1, "year").format("YYYY-MM-DD");
 
     const db = initFirestore();
@@ -2340,6 +2637,7 @@ async function runCleaningWorkforceForecastUpdate() {
     console.log(`[forecast] inventory map=${JSON.stringify(inventoryConfig.inventoryByBuilding)}`);
     const reservations = await fetchReservations(db, DEFAULT_COMPANY_ID);
     console.log(`[forecast] reservations loaded: ${reservations.length}`);
+    const roomMap = buildRoomReservationMap(reservations, resolver);
 
     const history = buildHistoryStructures(reservations, resolver, historyStart, todayKey);
     const forecastDates = dateRange(forecastStart, forecastEnd);
@@ -2357,7 +2655,6 @@ async function runCleaningWorkforceForecastUpdate() {
         now.format("YYYY-MM"),
         now.add(1, "month").format("YYYY-MM"),
         now.add(2, "month").format("YYYY-MM"),
-        now.add(3, "month").format("YYYY-MM"),
     ];
 
     // Pre-read sheet so we can capture manual operational inputs before any writes.
@@ -2382,7 +2679,7 @@ async function runCleaningWorkforceForecastUpdate() {
         console.log(`[forecast] ${m.monthKey} peak=${m.peakOperational}명/일 | 시스템고정=${m.systemFixedStaff}명 | 적용고정=${m.appliedFixedStaff}명 | 보충풀=${m.supportPool}명 | 총확보=${m.monthlyMinWorkforce}명 | 주근무=${m.avgPartTimeDaysPerWeek}일 (peak: ${m.peakDate})`);
     });
 
-    await updateSheetWithForecast(sheets, model, monthlyData, { monthsToEnsure: months, manualInputs });
+    await updateSheetWithForecast(sheets, model, monthlyData, { monthsToEnsure: months, manualInputs, roomMap });
     console.log(`[forecast] updated ${SHEET_TITLE} (${forecastStart} ~ ${forecastEnd})`);
 }
 

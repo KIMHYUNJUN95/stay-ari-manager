@@ -24,6 +24,7 @@ const DEFAULT_BUILDING_RULES = {
         minWorkers: 1,
         recommendedWorkers: 1,
         hoursPerWorker: 3.75,
+        maxUnitsPerWorker: 2,
     },
     arakichoB: {
         type: "room",
@@ -35,6 +36,7 @@ const DEFAULT_BUILDING_RULES = {
         minWorkers: 1,
         recommendedWorkers: 1,
         hoursPerWorker: 4.5,
+        maxUnitsPerWorker: 1,
     },
     kabukicho: {
         type: "room",
@@ -43,6 +45,7 @@ const DEFAULT_BUILDING_RULES = {
         minWorkers: 1,
         recommendedWorkers: 1,
         hoursPerWorker: 3,
+        maxUnitsPerWorker: 2,
     },
     takadanobaba: {
         type: "room",
@@ -51,6 +54,7 @@ const DEFAULT_BUILDING_RULES = {
         minWorkers: 1,
         recommendedWorkers: 1,
         hoursPerWorker: 4.2,
+        maxUnitsPerWorker: 1,
     },
     okuboA: {
         type: "okubo",
@@ -64,6 +68,7 @@ const DEFAULT_BUILDING_RULES = {
         hoursPerWorker: 3.5,
         cleaningUnitMultiplier: 2,
         fallbackHoursPerWorker: 7,
+        workersPerPhysicalUnit: 2,
     },
     okuboB: {
         type: "okubo",
@@ -77,6 +82,7 @@ const DEFAULT_BUILDING_RULES = {
         hoursPerWorker: 3.5,
         cleaningUnitMultiplier: 2,
         fallbackHoursPerWorker: 7,
+        workersPerPhysicalUnit: 2,
     },
     okuboC: {
         type: "okubo",
@@ -90,6 +96,7 @@ const DEFAULT_BUILDING_RULES = {
         hoursPerWorker: 3.5,
         cleaningUnitMultiplier: 2,
         fallbackHoursPerWorker: 7,
+        workersPerPhysicalUnit: 2,
     },
 };
 
@@ -312,10 +319,22 @@ function getBuildingScenario(rule = {}, options = {}) {
     };
 }
 
+// Headcount based on practical cleaning capacity rules, not hours.
+// Room buildings: ceil(physicalCheckoutUnits / maxUnitsPerWorker)
+// Okubo: physicalCheckoutUnits * workersPerPhysicalUnit
+function calculateCapacityHeadcount(rule, physicalCheckoutUnits) {
+    const units = Number(physicalCheckoutUnits || 0);
+    if (units <= 0) return 0;
+    if (rule.type === "okubo") {
+        const workersPerUnit = Math.max(1, Number(rule.workersPerPhysicalUnit || rule.minWorkers || 2));
+        return Math.ceil(units * workersPerUnit);
+    }
+    const maxUnitsPerWorker = Math.max(1, Number(rule.maxUnitsPerWorker || 1));
+    return Math.ceil(units / maxUnitsPerWorker);
+}
+
 function enrichCapacityRows(buildingRows = [], options = {}) {
     const buildingRules = options.buildingRules || DEFAULT_BUILDING_RULES;
-    const productiveHoursPerPerson = Number(options.productiveHoursPerPerson || 7);
-    const bufferRate = Number(options.bufferRate == null ? 0.15 : options.bufferRate);
 
     return buildingRows.map((row) => {
         const rule = buildingRules[row.buildingKey] || {};
@@ -327,22 +346,12 @@ function enrichCapacityRows(buildingRows = [], options = {}) {
                 : checkoutUnits
         );
 
+        // Labor cost uses hours: physicalCheckoutUnits * hoursPerWorker * workers
         const estimatedJobHours = physicalCheckoutUnits * scenario.hoursPerWorker;
         const estimatedWorkHours = estimatedJobHours * scenario.workers;
 
-        const mathMinHeadcount = productiveHoursPerPerson > 0
-            ? Math.ceil(estimatedJobHours / productiveHoursPerPerson)
-            : 0;
-
-        const okuboBaselineFloor = (rule.type === "okubo" && physicalCheckoutUnits > 0) ? scenario.workers : 0;
-        const operationalMinHeadcount = Math.max(mathMinHeadcount, okuboBaselineFloor);
-
-        const recommendedByHours = productiveHoursPerPerson > 0
-            ? Math.ceil((estimatedJobHours * (1 + bufferRate)) / productiveHoursPerPerson)
-            : 0;
-        const recommendedHeadcount = physicalCheckoutUnits > 0
-            ? Math.max(recommendedByHours, okuboBaselineFloor)
-            : 0;
+        // Headcount uses capacity rules — not hours.
+        const capacityHeadcount = calculateCapacityHeadcount(rule, physicalCheckoutUnits);
 
         return {
             ...row,
@@ -354,11 +363,11 @@ function enrichCapacityRows(buildingRows = [], options = {}) {
             hoursPerUnit: scenario.hoursPerWorker,
             estimatedJobHours,
             estimatedWorkHours,
-            mathMinHeadcount,
-            operationalMinHeadcount,
-            minHeadcount: operationalMinHeadcount,
-            recommendedHeadcount,
-            bufferRate,
+            capacityHeadcount,
+            mathMinHeadcount: capacityHeadcount,
+            operationalMinHeadcount: capacityHeadcount,
+            minHeadcount: capacityHeadcount,
+            recommendedHeadcount: capacityHeadcount,
         };
     });
 }
@@ -444,7 +453,7 @@ function buildWeeklyCalendarRows(dailyRows = []) {
         bucket.cleaningCountWeekly += Number(row.cleaningCount || 0);
         bucket.settingCountWeekly += Number(row.settingCount || 0);
         bucket.turnoverCountWeekly += Number(row.turnoverCount || 0);
-        bucket.totalWorkHoursWeekly += Number(row.estimatedJobHours || row.estimatedWorkHours || 0);
+        bucket.totalWorkHoursWeekly += Number(row.estimatedWorkHours || row.estimatedJobHours || 0);
         bucket.mathMinHeadcountPeak = Math.max(bucket.mathMinHeadcountPeak, Number(row.mathMinHeadcount || 0));
         bucket.operationalMinHeadcountPeak = Math.max(bucket.operationalMinHeadcountPeak, Number(row.operationalMinHeadcount || row.minHeadcount || 0));
         bucket.minHeadcountPeak = bucket.operationalMinHeadcountPeak;
@@ -468,6 +477,7 @@ module.exports = {
     createBuildingResolver,
     buildCleaningSettingCalendarDay,
     summarizeTasksByBuilding,
+    calculateCapacityHeadcount,
     enrichCapacityRows,
     estimateLaborCost,
     addLaborCostScenarios,
