@@ -4540,19 +4540,23 @@ async function processPriceJob(jobId) {
                     primaryUpdate.coalescedJobIds = coalescedJobIds;
                     primaryUpdate["progress.total"] = mergedRoomUpdates.length;
                 }
-                tx.update(jobRef, primaryUpdate);
-                // secondary jobs: status 재확인 후 absorbed 처리
+                const secondaryQueuedRefs = [];
                 for (const sjId of coalescedJobIds) {
                     const sjRef = db.collection("beds24_price_jobs").doc(sjId);
                     const sjSnap = await tx.get(sjRef);
                     if (sjSnap.exists && sjSnap.data().status === "queued") {
-                        tx.update(sjRef, {
-                            status: "processing",
-                            startedAt: admin.firestore.FieldValue.serverTimestamp(),
-                            coalescedIntoJobId: jobId
-                        });
+                        secondaryQueuedRefs.push(sjRef);
                     }
                 }
+                tx.update(jobRef, primaryUpdate);
+                // secondary jobs: status 재확인 후 absorbed 처리
+                secondaryQueuedRefs.forEach((sjRef) => {
+                    tx.update(sjRef, {
+                        status: "processing",
+                        startedAt: admin.firestore.FieldValue.serverTimestamp(),
+                        coalescedIntoJobId: jobId
+                    });
+                });
                 jobData = data;
             });
         } catch (txErr) {
