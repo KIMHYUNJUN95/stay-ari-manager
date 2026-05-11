@@ -5487,10 +5487,10 @@ async function syncSingleRoomPriceCache(building, roomId, roomName, { reason = "
     if (oldSnap.exists) {
         const oldDates = oldSnap.data()?.dates || {};
         Object.keys(datesObj).forEach(dKey => {
-                        const oldP1 = parseFloat(oldDates[dKey]?.p1) || 0;
+            const oldP1 = parseFloat(oldDates[dKey]?.p1) || 0;
             const newP1 = parseFloat(datesObj[dKey].p1) || 0;
 
-            if (oldP1 !== 0 && newP1 !== 0 && oldP1 !== newP1) {
+            if (oldP1 !== newP1 && (oldP1 > 0 || newP1 > 0)) {
                 datesObj[dKey].lm = {
                     u: "Beds24",
                     t: dayjs().utcOffset(9).format("MM-DD HH:mm"),

@@ -9390,8 +9390,13 @@ function BuildingCalendar() {
                         const latestSourceEntry = calendarBuilding && calendarBuilding !== "전체"
                           ? (latestPriceSourceByRoomDate[`${calendarBuilding}__${roomSourceKey}__${dateStr}`] || null)
                           : (latestAnyBuildingSourceByRoomDate[`${roomSourceKey}__${dateStr}`] || null);
-                        const resolvedLastModSource = latestSourceEntry?.source
-                          || (lastModInfo?.s === 'beds24' ? 'beds24' : (lastModInfo?.s === 'system' ? 'system' : null));
+                        const lastModSourceEntry = (lastModInfo?.s === 'beds24' || lastModInfo?.s === 'system')
+                          ? { source: lastModInfo.s, ts: Number(lastModInfo.ts) || 0 }
+                          : null;
+                        const resolvedSourceEntry = latestSourceEntry && lastModSourceEntry
+                          ? (latestSourceEntry.ts >= lastModSourceEntry.ts ? latestSourceEntry : lastModSourceEntry)
+                          : (latestSourceEntry || lastModSourceEntry);
+                        const resolvedLastModSource = resolvedSourceEntry?.source || null;
                         const hasLastModMarker = !!(lastModInfo || latestSourceEntry);
                         const lastModMarkerColor = resolvedLastModSource === 'beds24'
                           ? "#EF4444"
