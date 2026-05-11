@@ -1,6 +1,6 @@
 // src/components/ReviewsDashboard.jsx
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
-import { collection, query, where, getDocs } from 'firebase/firestore';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { collection, query, where, getDocs, doc, getDoc, limit } from 'firebase/firestore';
 import { db } from '../firebase';
 import { useUser } from '../contexts/UserContext';
 import dayjs from 'dayjs';
@@ -11,7 +11,7 @@ import {
 } from 'recharts';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+// encoding-fixed comment
 
 import { BUILDING_NAMES_EN, ACTIVE_BUILDING_ORDER as BUILDING_ORDER } from '../constants/buildingData';
 
@@ -41,16 +41,34 @@ const BUILDING_COLORS = [
 
 const API_BASE = process.env.REACT_APP_API_BASE_URL || "https://us-central1-my-booking-app-3f0e7.cloudfunctions.net";
 
-// 캘린더와 동일 기준: minStay >= 1 && minStay < 50 = 활성 roomId
+// encoding-fixed comment
 const INACTIVE_MINSTAY_THRESHOLD = 50;
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// encoding-fixed comment
 
 const getBuildingEn = (name) => BUILDING_NAMES_EN[name] || name;
 const getBuildingColor = (name) => BUILDING_COLORS[BUILDING_ORDER.indexOf(name) % BUILDING_COLORS.length] || "#4F46E5";
-// 한국어 '호' 접미사 제거 (예: "201호" → "201", 기존 Firestore 데이터 대응용)
+// encoding-fixed comment
 const normalizeRoomName = (name) => (name ? String(name).replace(/호$/, '').trim() : name);
-
+const DETACHED_BUILDING_SET = new Set(["Okubo A", "Okubo B", "Okubo C", "Sano"]);
+const getRoomNameEn = (name) => {
+  const normalized = normalizeRoomName(name);
+  if (!normalized) return "-";
+  if (/^\d+$/.test(normalized)) return `Room ${normalized}`;
+  return normalized;
+};
+const getRoomLabelForBuilding = (buildingName, roomName, roomId) => {
+  const buildingEn = getBuildingEn(buildingName);
+  if (DETACHED_BUILDING_SET.has(buildingEn)) return buildingEn;
+  const roomLabel = getRoomNameEn(roomName);
+  if (roomLabel && roomLabel !== "-") return roomLabel;
+  return String(roomId || "Unknown");
+};
+const shouldShowRoomLabel = (buildingName, roomName) => {
+  if (!roomName) return false;
+  const buildingEn = getBuildingEn(buildingName);
+  return !DETACHED_BUILDING_SET.has(buildingEn);
+};
 const _AIRBNB_CAT_ALIAS = {
   "check_in": "checkin", "check-in": "checkin", "check in": "checkin",
   "cleanliness_rating": "cleanliness",
@@ -81,7 +99,7 @@ const getScoreBg = (score, max = 10) => {
   return "rgba(239,68,68,0.12)";
 };
 
-const formatScoreAuto = (score, max = 10) => score > 0 ? score.toFixed(max === 5 ? 2 : 1) : "—";
+const formatScoreAuto = (score, max = 10) => score > 0 ? score.toFixed(max === 5 ? 2 : 1) : "--";
 
 const formatDate = (dateStr) => {
   if (!dateStr) return null;
@@ -115,7 +133,7 @@ const getReplyText = (reply) => {
   return String(reply);
 };
 
-// ─── Data Computation ─────────────────────────────────────────────────────────
+// encoding-fixed comment
 
 function computeBuildingStats(reviews) {
   const stats = {};
@@ -164,7 +182,7 @@ function computeBuildingStats(reviews) {
     const bookingCatAvg = {};
     for (const [k, vs] of Object.entries(s.booking.categories)) bookingCatAvg[k] = avg(vs);
     const airbnbCatAvg = {};
-    for (const [k, vs] of Object.entries(s.airbnb.categories)) airbnbCatAvg[k] = avg(vs); // 원본 1-5 유지
+    for (const [k, vs] of Object.entries(s.airbnb.categories)) airbnbCatAvg[k] = avg(vs); // Airbnb categories are normalized to 0-5
 
     const totalCount = s.booking.scores.length + s.airbnb.scores.length;
 
@@ -176,8 +194,8 @@ function computeBuildingStats(reviews) {
       bookingAvg,
       bookingCatAvg,
       airbnbCount: s.airbnb.scores.length,
-      airbnbAvg, // 5점 만점
-      airbnbCatAvg, // 5점 만점
+      airbnbAvg, // 0-5 scale
+      airbnbCatAvg, // 0-5 scale
       totalCount,
       unanswered: s.booking.unanswered
     };
@@ -186,7 +204,7 @@ function computeBuildingStats(reviews) {
 }
 
 function computeTrendData(reviews) {
-  // Booking.com만 날짜 있음
+  // encoding-fixed comment
   const bookingReviews = reviews.filter(r => r.channel === "booking" && r.createdAt);
   const byMonthBuilding = {};
 
@@ -201,7 +219,7 @@ function computeTrendData(reviews) {
   const existingMonths = Object.keys(byMonthBuilding).sort();
   if (existingMonths.length === 0) return [];
 
-  // minMonth~maxMonth 연속 월 배열 — 데이터 없는 월도 row로 포함해 x축 연속성 보장
+  // encoding-fixed comment
   const months = [];
   let cur = dayjs(existingMonths[0], 'YYYY-MM');
   const end = dayjs(existingMonths[existingMonths.length - 1], 'YYYY-MM');
@@ -219,7 +237,7 @@ function computeTrendData(reviews) {
     return row;
   });
 
-  // 건물별 중간 null 구간은 선형 보간해 차트 선이 중간에서 끊겨 보이지 않게 보정
+  // encoding-fixed comment
   for (const building of BUILDING_ORDER) {
     const key = getBuildingEn(building);
     for (let i = 0; i < rows.length; i++) {
@@ -230,7 +248,7 @@ function computeTrendData(reviews) {
       let next = i + 1;
       while (next < rows.length && rows[next][key] === null) next++;
 
-      // 앞뒤 유효값이 있는 "중간 공백"만 보간 (시작/끝 공백은 원값 유지)
+      // encoding-fixed comment
       if (prev >= 0 && next < rows.length) {
         const prevVal = rows[prev][key];
         const nextVal = rows[next][key];
@@ -258,8 +276,8 @@ function computeWeaknesses(buildingStats, threshold = 8.0) {
         });
       }
     }
-    // Airbnb category weaknesses (5점 만점 — threshold의 절반 기준)
-    const airbnbThreshold = threshold / 2; // 8.0 → 4.0
+    // encoding-fixed comment
+const airbnbThreshold = threshold / 2; // 8.0 -> 4.0
     for (const { key, label } of AIRBNB_CATEGORIES) {
       const score = s.airbnbCatAvg[key];
       if (score !== undefined && score < airbnbThreshold) {
@@ -274,10 +292,10 @@ function computeWeaknesses(buildingStats, threshold = 8.0) {
   return weaknesses.sort((a, b) => a.score - b.score);
 }
 
-// activeRoomsByBuilding: 오늘 날짜 기준 활성 roomId 목록 (minStay >= 1 && < 50)
+// encoding-fixed comment
 function computeRoomStats(reviews, activeRoomsByBuilding) {
   const airbnbReviews = reviews.filter(r => r.channel === "airbnb" && r.roomId);
-  // roomId 기준으로 그룹핑 (활성 roomId만 포함)
+  // encoding-fixed comment
   const byBuildingRoomId = {};
 
   for (const [building, rooms] of Object.entries(activeRoomsByBuilding || {})) {
@@ -285,7 +303,7 @@ function computeRoomStats(reviews, activeRoomsByBuilding) {
     if (!byBuildingRoomId[building]) byBuildingRoomId[building] = {};
     for (const [rid, info] of Object.entries(rooms || {})) {
       byBuildingRoomId[building][String(rid)] = {
-        roomName: normalizeRoomName(info?.roomName) || String(rid),
+        roomName: getRoomLabelForBuilding(building, info?.roomName, rid),
         scores: [],
         categories: {}
       };
@@ -296,11 +314,11 @@ function computeRoomStats(reviews, activeRoomsByBuilding) {
     const b = r.building;
     if (!BUILDING_ORDER.includes(b)) continue;
     const rid = String(r.roomId);
-    // 활성 roomId 목록에 없으면 집계 제외
+    // encoding-fixed comment
     if (activeRoomsByBuilding && !activeRoomsByBuilding[b]?.[rid]) continue;
     if (!byBuildingRoomId[b]) byBuildingRoomId[b] = {};
-    if (!byBuildingRoomId[b][rid]) byBuildingRoomId[b][rid] = { roomName: normalizeRoomName(r.roomName) || "Unknown", scores: [], categories: {} };
-    const reviewRoomName = normalizeRoomName(r.roomName);
+    if (!byBuildingRoomId[b][rid]) byBuildingRoomId[b][rid] = { roomName: getRoomLabelForBuilding(b, r.roomName, rid), scores: [], categories: {} };
+    const reviewRoomName = getRoomLabelForBuilding(b, r.roomName, rid);
     if (reviewRoomName && byBuildingRoomId[b][rid].roomName === rid) byBuildingRoomId[b][rid].roomName = reviewRoomName;
     const airbnbScore = r.rawScore || (r.score > 0 ? r.score / 2 : 0);
     if (airbnbScore > 0) byBuildingRoomId[b][rid].scores.push(airbnbScore);
@@ -316,14 +334,14 @@ function computeRoomStats(reviews, activeRoomsByBuilding) {
     }
   }
 
-  // ARAKICHO_A_DUAL_ROOM_IDS 강제추가 로직 제거:
-  // 비활성 roomId까지 0점 카드로 노출되는 원인이었음.
-  // 활성 roomId 필터(위)가 이를 대체함.
+  // encoding-fixed comment
+  // encoding-fixed comment
+  // encoding-fixed comment
 
   const result = {};
   for (const [building, roomIds] of Object.entries(byBuildingRoomId)) {
     result[building] = {};
-    // roomName별 roomId 목록 (같은 방이름에 여러 roomId → 표시명에 roomId 병기)
+    // encoding-fixed comment
     const nameToIds = {};
     for (const [rid, data] of Object.entries(roomIds)) {
       if (!nameToIds[data.roomName]) nameToIds[data.roomName] = [];
@@ -341,7 +359,7 @@ function computeRoomStats(reviews, activeRoomsByBuilding) {
   return result;
 }
 
-// ─── Date Picker ─────────────────────────────────────────────────────────────
+// encoding-fixed comment
 
 const EN_MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 const EN_DAYS = ["Su","Mo","Tu","We","Th","Fr","Sa"];
@@ -473,7 +491,7 @@ function DatePickerButton({ value, onChange, placeholder = "Select date" }) {
   );
 }
 
-// ─── Sub-components ───────────────────────────────────────────────────────────
+// encoding-fixed comment
 
 function ScoreBadge({ score, max = 10, size = "md" }) {
   const color = getScoreColor(score, max);
@@ -564,7 +582,7 @@ function TabButton({ id, label, active, onClick, badge }) {
   );
 }
 
-// ─── Overview Tab ─────────────────────────────────────────────────────────────
+// encoding-fixed comment
 
 function OverviewTab({ buildingStats, reviews, channel }) {
   const isBooking = channel === "booking";
@@ -575,7 +593,7 @@ function OverviewTab({ buildingStats, reviews, channel }) {
     : avg(reviews.filter(r => r.rawScore > 0 || r.score > 0).map(r => r.rawScore || r.score / 2));
   const unansweredTotal = isBooking ? reviews.filter(r => !r.hasReply).length : 0;
 
-  // 점수별 분포
+  // encoding-fixed comment
   const highCount = reviews.filter(r => {
     const s = isBooking ? r.score : (r.rawScore || r.score / 2);
     return s >= (isBooking ? 9 : 4.5);
@@ -586,18 +604,18 @@ function OverviewTab({ buildingStats, reviews, channel }) {
   }).length;
 
   const summaryCards = isBooking ? [
-    { label: "Total Reviews", value: totalReviews, icon: "📝", color: "#003580", bg: "rgba(0,53,128,0.08)" },
-    { label: "Average Score", value: overallAvg > 0 ? overallAvg.toFixed(1) : "—", suffix: "/ 10", icon: "⭐", color: "#003580", bg: "rgba(0,53,128,0.08)" },
+    { label: "Total Reviews", value: totalReviews, icon: "📊", color: "#003580", bg: "rgba(0,53,128,0.08)" },
+    { label: "Average Score", value: overallAvg > 0 ? overallAvg.toFixed(1) : "--", suffix: "/ 10", icon: "⭐", color: "#003580", bg: "rgba(0,53,128,0.08)" },
     { label: "Excellent (9+)", value: highCount, icon: "🏆", color: "#10B981", bg: "rgba(16,185,129,0.08)" },
     { label: "Unanswered", value: unansweredTotal, icon: "💬", color: unansweredTotal > 0 ? "#EF4444" : "#10B981", bg: unansweredTotal > 0 ? "rgba(239,68,68,0.08)" : "rgba(16,185,129,0.08)" }
   ] : [
-    { label: "Total Reviews", value: totalReviews, icon: "📝", color: "#FF385C", bg: "rgba(255,56,92,0.08)" },
-    { label: "Average Score", value: overallAvg > 0 ? overallAvg.toFixed(2) : "—", suffix: "/ 5", icon: "⭐", color: "#FF385C", bg: "rgba(255,56,92,0.08)" },
+    { label: "Total Reviews", value: totalReviews, icon: "📊", color: "#FF385C", bg: "rgba(255,56,92,0.08)" },
+    { label: "Average Score", value: overallAvg > 0 ? overallAvg.toFixed(2) : "--", suffix: "/ 5", icon: "⭐", color: "#FF385C", bg: "rgba(255,56,92,0.08)" },
     { label: "5-Star Reviews", value: highCount, icon: "🏆", color: "#10B981", bg: "rgba(16,185,129,0.08)" },
     { label: "Below 3.5", value: lowCount, icon: "⚠️", color: lowCount > 0 ? "#EF4444" : "#10B981", bg: lowCount > 0 ? "rgba(239,68,68,0.08)" : "rgba(16,185,129,0.08)" }
   ];
 
-  const sortedBuildings = BUILDING_ORDER.filter(b => buildingStats[b]);
+  const sortedBuildings = BUILDING_ORDER;
 
   return (
     <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
@@ -628,48 +646,64 @@ function OverviewTab({ buildingStats, reviews, channel }) {
 
       {/* Building Cards Grid */}
       <h3 style={{ fontSize: 15, fontWeight: 700, color: "#1E293B", marginBottom: 16, letterSpacing: "-0.3px" }}>
-        {isBooking ? "Booking.com" : "Airbnb"} — Rating by Property
+        {isBooking ? "Booking.com" : "Airbnb"} · Rating by Property
       </h3>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 16 }}>
         {sortedBuildings.map((building, i) => {
-          const s = buildingStats[building];
+          const s = buildingStats[building] || {
+            buildingEn: getBuildingEn(building),
+            color: getBuildingColor(building),
+            bookingCount: 0, bookingAvg: 0, bookingCatAvg: {},
+            airbnbCount: 0, airbnbAvg: 0, airbnbCatAvg: {},
+            unanswered: 0
+          };
           const count = isBooking ? s.bookingCount : s.airbnbCount;
           const scoreAvg = isBooking ? s.bookingAvg : s.airbnbAvg;
           const catAvg = isBooking ? s.bookingCatAvg : s.airbnbCatAvg;
           const categories = isBooking ? BOOKING_CATEGORIES : AIRBNB_CATEGORIES;
-          if (count === 0) return null;
+          const isEmpty = count === 0;
 
           return (
             <motion.div key={building}
               initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.35, delay: i * 0.05 }}
               style={{
-                background: "white", borderRadius: 16, padding: "20px 22px",
-                boxShadow: "0 1px 3px rgba(0,0,0,0.06), 0 4px 12px rgba(0,0,0,0.04)",
-                border: "1px solid #F1F5F9", overflow: "hidden", position: "relative"
+                background: isEmpty ? "#FAFBFC" : "white", borderRadius: 16, padding: "20px 22px",
+                boxShadow: "0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.03)",
+                border: `1px solid ${isEmpty ? "#EEF0F4" : "#F1F5F9"}`, overflow: "hidden", position: "relative"
               }}>
               {/* Color accent bar */}
-              <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: `linear-gradient(90deg, ${s.color}, ${s.color}80)`, borderRadius: "16px 16px 0 0" }} />
+              <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: `linear-gradient(90deg, ${s.color}${isEmpty ? "50" : ""}, ${s.color}${isEmpty ? "20" : "80"})`, borderRadius: "16px 16px 0 0" }} />
 
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
                 <div>
-                  <div style={{ fontSize: 15, fontWeight: 700, color: "#1E293B", marginBottom: 2 }}>{s.buildingEn}</div>
-                  <div style={{ fontSize: 12, color: "#94A3B8" }}>{count} reviews</div>
+                  <div style={{ fontSize: 15, fontWeight: 700, color: isEmpty ? "#94A3B8" : "#1E293B", marginBottom: 2 }}>{s.buildingEn}</div>
+                  <div style={{ fontSize: 12, color: "#94A3B8" }}>{isEmpty ? "No reviews yet" : `${count} reviews`}</div>
                 </div>
-                <ScoreBadge score={scoreAvg} max={maxScore} size="lg" />
+                {isEmpty ? (
+                  <span style={{
+                    display: "inline-flex", alignItems: "center", justifyContent: "center",
+                    background: "#F1F5F9", color: "#94A3B8", border: "1.5px solid #E2E8F0",
+                    borderRadius: 8, fontWeight: 700, fontSize: 13, padding: "4px 10px", letterSpacing: "-0.3px"
+                  }}>—</span>
+                ) : (
+                  <ScoreBadge score={scoreAvg} max={maxScore} size="lg" />
+                )}
               </div>
 
-              {/* Category bars */}
-              <div style={{ marginBottom: isBooking && s.unanswered > 0 ? 12 : 0 }}>
-                {categories.map(({ key, label }) => {
-                  const val = catAvg[key];
-                  if (val === undefined || val === null) return null;
-                  return <CategoryBar key={key} label={label} score={val} max={maxScore} />;
-                })}
-              </div>
+              {/* Category bars - hidden when no reviews */}
+              {!isEmpty && (
+                <div style={{ marginBottom: isBooking && s.unanswered > 0 ? 12 : 0 }}>
+                  {categories.map(({ key, label }) => {
+                    const val = catAvg[key];
+                    if (val === undefined || val === null) return null;
+                    return <CategoryBar key={key} label={label} score={val} max={maxScore} />;
+                  })}
+                </div>
+              )}
 
-              {/* Unanswered badge (Booking only) */}
-              {isBooking && s.unanswered > 0 && (
+              {/* Unanswered badge (Booking only, reviews > 0) */}
+              {!isEmpty && isBooking && s.unanswered > 0 && (
                 <div style={{
                   display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 10px",
                   background: "rgba(239,68,68,0.08)", borderRadius: 8, border: "1px solid rgba(239,68,68,0.2)"
@@ -687,7 +721,7 @@ function OverviewTab({ buildingStats, reviews, channel }) {
   );
 }
 
-// ─── Trends Tab ───────────────────────────────────────────────────────────────
+// encoding-fixed comment
 
 function TrendsTab({ trendData, buildingStats }) {
   const [selectedBuildings, setSelectedBuildings] = useState([]);
@@ -800,7 +834,7 @@ function TrendsTab({ trendData, buildingStats }) {
   );
 }
 
-// ─── Insights Tab ─────────────────────────────────────────────────────────────
+// encoding-fixed comment
 
 function InsightsTab({ weaknesses, buildingStats, channel }) {
   const radarChannel = channel || "booking";
@@ -833,7 +867,7 @@ function InsightsTab({ weaknesses, buildingStats, channel }) {
         <div style={{ background: "white", borderRadius: 16, padding: "24px", boxShadow: "0 1px 3px rgba(0,0,0,0.06), 0 4px 12px rgba(0,0,0,0.04)", border: "1px solid #F1F5F9" }}>
           <div style={{ marginBottom: 16 }}>
             <h3 style={{ fontSize: 14, fontWeight: 700, color: "#1E293B", letterSpacing: "-0.3px" }}>
-              {radarChannel === "booking" ? "Booking.com" : "Airbnb"} — Category Radar
+              {radarChannel === "booking" ? "Booking.com" : "Airbnb"} · Category Radar
             </h3>
           </div>
           <ResponsiveContainer width="100%" height={260}>
@@ -846,7 +880,7 @@ function InsightsTab({ weaknesses, buildingStats, channel }) {
                   stroke={getBuildingColor(b)} fill={getBuildingColor(b)} fillOpacity={0.08} strokeWidth={2} />
               ))}
               <Legend />
-              <Tooltip contentStyle={{ borderRadius: 10, border: "1px solid #E2E8F0", fontSize: 12 }} formatter={(v) => v ? v.toFixed(2) : "—"} />
+              <Tooltip contentStyle={{ borderRadius: 10, border: "1px solid #E2E8F0", fontSize: 12 }} formatter={(v) => v ? v.toFixed(2) : "--"} />
             </RadarChart>
           </ResponsiveContainer>
         </div>
@@ -884,7 +918,7 @@ function InsightsTab({ weaknesses, buildingStats, channel }) {
 
         {weaknesses.length === 0 ? (
           <div style={{ textAlign: "center", padding: "32px", color: "#10B981" }}>
-            <div style={{ fontSize: 32, marginBottom: 8 }}>🎉</div>
+            <div style={{ fontSize: 32, marginBottom: 8 }}>✅</div>
             <div style={{ fontWeight: 700, marginBottom: 4 }}>Excellent performance!</div>
             <div style={{ fontSize: 12, color: "#94A3B8" }}>All categories are above the 8.0 threshold.</div>
           </div>
@@ -924,23 +958,171 @@ function InsightsTab({ weaknesses, buildingStats, channel }) {
   );
 }
 
-// ─── Reviews Tab ──────────────────────────────────────────────────────────────
+// encoding-fixed comment
 
-function ReviewsTab({ reviews, channel: parentChannel, dateSearchReversed, hasDateFilter }) {
+function ReviewDetailInfoRow({ label, value }) {
+  if (value === null || value === undefined || value === "") return null;
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: 10, padding: "8px 0", borderBottom: "1px solid #F1F5F9" }}>
+      <div style={{ fontSize: 12, fontWeight: 600, color: "#64748B" }}>{label}</div>
+      <div style={{ fontSize: 13, color: "#1E293B", fontWeight: 500 }}>{value}</div>
+    </div>
+  );
+}
+
+function ReviewReservationModal({ isOpen, onClose, review, reservation, loading }) {
+  if (!isOpen || !review) return null;
+
+  const displayGuest = reservation?.guestName || (review.channel === "airbnb" ? (review.linkedGuestName || review.reviewerName) : review.reviewerName) || "Unknown Guest";
+  const displayBuilding = reservation?.building || review.building || "-";
+  const rawRoomName = reservation?.room || review.linkedRoom || review.roomName || "";
+  const hasRoomLabel = shouldShowRoomLabel(displayBuilding, rawRoomName);
+  const displayRoom = hasRoomLabel ? getRoomNameEn(rawRoomName) : "";
+  const displayArrival = reservation?.arrival || review.linkedArrival || "-";
+  const displayDeparture = reservation?.departure || review.linkedDeparture || "-";
+  const displayPlatform = reservation?.platform || (review.channel === "booking" ? "Booking.com" : "Airbnb");
+  const displayReference = reservation?.apiReference || review.reservationId || "-";
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        onClick={onClose}
+        style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.48)", backdropFilter: "blur(3px)", zIndex: 10000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+      >
+        <motion.div
+          initial={{ opacity: 0, y: 14, scale: 0.98 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: 10, scale: 0.98 }}
+          transition={{ duration: 0.2 }}
+          onClick={(e) => e.stopPropagation()}
+          style={{ width: "100%", maxWidth: 560, background: "white", borderRadius: 16, border: "1px solid #E2E8F0", boxShadow: "0 18px 50px rgba(15,23,42,0.24)", overflow: "hidden" }}
+        >
+          <div style={{ padding: "16px 20px", borderBottom: "1px solid #F1F5F9", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <PlatformBadge channel={review.channel} />
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 800, color: "#0F172A", letterSpacing: "-0.2px" }}>{displayGuest}</div>
+                <div style={{ fontSize: 12, color: "#64748B" }}>
+                  {hasRoomLabel ? `${getBuildingEn(displayBuilding)} · ${displayRoom}` : getBuildingEn(displayBuilding)}
+                </div>
+              </div>
+            </div>
+            <button onClick={onClose} style={{ border: "none", background: "transparent", cursor: "pointer", color: "#64748B", fontSize: 18, lineHeight: 1 }}>×</button>
+          </div>
+
+          <div style={{ padding: "14px 20px 18px" }}>
+            {loading ? (
+              <div style={{ fontSize: 13, color: "#64748B", padding: "18px 0" }}>Loading reservation details...</div>
+            ) : (
+              <>
+                <ReviewDetailInfoRow label="Guest" value={displayGuest} />
+                <ReviewDetailInfoRow label="Platform" value={displayPlatform} />
+                <ReviewDetailInfoRow label="Building / Room" value={hasRoomLabel ? `${getBuildingEn(displayBuilding)} / ${displayRoom}` : getBuildingEn(displayBuilding)} />
+                <ReviewDetailInfoRow label="Check-in" value={displayArrival} />
+                <ReviewDetailInfoRow label="Check-out" value={displayDeparture} />
+                <ReviewDetailInfoRow label="Booking Ref." value={displayReference} />
+                <ReviewDetailInfoRow label="Email" value={reservation?.guestEmail || ""} />
+                <ReviewDetailInfoRow label="Phone" value={reservation?.guestPhone || ""} />
+                <ReviewDetailInfoRow label="Guests" value={reservation ? `${reservation.numAdult || 0} adults, ${reservation.numChild || 0} children` : ""} />
+              </>
+            )}
+
+            {review?.content?.text && (
+              <div style={{ marginTop: 12, background: "#F8FAFC", border: "1px solid #E2E8F0", borderRadius: 10, padding: "10px 12px" }}>
+                <div style={{ fontSize: 11, color: "#64748B", fontWeight: 700, marginBottom: 4 }}>Review</div>
+                <div style={{ fontSize: 12, color: "#334155", lineHeight: 1.5 }}>{review.content.text}</div>
+              </div>
+            )}
+          </div>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
+function ReviewsTab({ reviews, channel: parentChannel, dateSearchReversed, hasDateFilter, companyId }) {
   const channel = parentChannel || "all";
   const [building, setBuilding] = useState("all");
   const [replyFilter, setReplyFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState("newest");
   const [page, setPage] = useState(0);
+  const [selectedReview, setSelectedReview] = useState(null);
+  const [selectedReservation, setSelectedReservation] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const detailRequestRef = useRef(0);
   const PAGE_SIZE = 15;
 
-  // 기간 검색 방향 변경 시 정렬 자동 반영
+  const closeReviewModal = useCallback(() => {
+    detailRequestRef.current += 1;
+    setSelectedReview(null);
+    setSelectedReservation(null);
+    setDetailLoading(false);
+  }, []);
+
+  const loadReservationForReview = useCallback(async (review) => {
+    if (!review || !companyId) return null;
+
+    if (review.channel === "booking" && review.reservationId) {
+      try {
+        const snap = await getDoc(doc(db, "reservations", String(review.reservationId)));
+        if (snap.exists()) {
+          const data = snap.data();
+          if (data.companyId === companyId) return { id: snap.id, ...data };
+        }
+      } catch (e) {
+        console.warn("[ReviewsDashboard] booking reservation lookup failed:", e.message);
+      }
+    }
+
+    if (review.reservationId) {
+      try {
+        const constraints = [
+          where("companyId", "==", companyId),
+          where("apiReference", "==", String(review.reservationId)),
+          limit(1)
+        ];
+        if (review.building) constraints.splice(1, 0, where("building", "==", review.building));
+        const snap = await getDocs(query(collection(db, "reservations"), ...constraints));
+        if (!snap.empty) {
+          const d = snap.docs[0];
+          return { id: d.id, ...d.data() };
+        }
+      } catch (e) {
+        console.warn("[ReviewsDashboard] reservation lookup by reference failed:", e.message);
+      }
+    }
+
+    return null;
+  }, [companyId]);
+
+  const handleReviewCardClick = useCallback(async (review) => {
+    const requestId = detailRequestRef.current + 1;
+    detailRequestRef.current = requestId;
+    setSelectedReview(review);
+    setDetailLoading(true);
+    setSelectedReservation(null);
+    try {
+      const reservation = await loadReservationForReview(review);
+      if (detailRequestRef.current === requestId) {
+        setSelectedReservation(reservation);
+      }
+    } finally {
+      if (detailRequestRef.current === requestId) {
+        setDetailLoading(false);
+      }
+    }
+  }, [loadReservationForReview]);
+
+  // encoding-fixed comment
   useEffect(() => {
     if (hasDateFilter) setSortBy(dateSearchReversed ? "newest" : "oldest");
   }, [dateSearchReversed, hasDateFilter]);
 
-  // reviews 변경 시 page 리셋
+  // encoding-fixed comment
   useEffect(() => { setPage(0); }, [reviews]);
 
   const buildings = ["all", ...BUILDING_ORDER.filter(b => reviews.some(r => r.building === b))];
@@ -1008,32 +1190,35 @@ function ReviewsTab({ reviews, channel: parentChannel, dateSearchReversed, hasDa
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         {paginated.length === 0 ? (
           <div style={{ textAlign: "center", padding: "60px", color: "#94A3B8", background: "white", borderRadius: 16, border: "1px solid #F1F5F9" }}>
-            <div style={{ fontSize: 32, marginBottom: 8 }}>🔍</div>
+            <div style={{ fontSize: 32, marginBottom: 8 }}>📝</div>
             <div style={{ fontWeight: 600, color: "#64748B" }}>No reviews found</div>
           </div>
         ) : paginated.map((r, i) => (
           <motion.div key={r.id || r.reviewId || `review-${i}`}
             initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.2, delay: i * 0.03 }}
+            whileHover={{ y: -1 }}
+            onClick={() => handleReviewCardClick(r)}
             style={{
               background: "white", borderRadius: 14, padding: "16px 20px",
-              boxShadow: "0 1px 3px rgba(0,0,0,0.05)", border: "1px solid #F1F5F9"
+              boxShadow: "0 1px 3px rgba(0,0,0,0.05)", border: "1px solid #F1F5F9", cursor: "pointer"
             }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                 <PlatformBadge channel={r.channel} />
                 <span style={{ fontSize: 12, fontWeight: 600, color: "#4F46E5" }}>
-                  {getBuildingEn(r.building)}{r.roomName ? ` · ${r.roomName}` : ""}
+                  {getBuildingEn(r.building)}{shouldShowRoomLabel(r.building, r.roomName) ? ` · ${getRoomNameEn(r.roomName)}` : ""}
                 </span>
                 {r.channel === "booking" && r.linkedRoom && (
                   <span style={{ fontSize: 12, color: "#64748B", fontWeight: 500 }}>
                     {r.linkedRoom}
-                    {r.linkedArrival && r.linkedDeparture ? ` · ${r.linkedArrival} ~ ${r.linkedDeparture}` : ""}
+                    {r.linkedArrival && r.linkedDeparture ? `  ·  ${r.linkedArrival} ~ ${r.linkedDeparture}` : ""}
                   </span>
                 )}
-                {r.reviewerName && (
+                {(r.channel === "airbnb" ? (r.linkedGuestName || r.reviewerName) : r.reviewerName) && (
                   <span style={{ fontSize: 12, fontWeight: 600, color: "#374151" }}>
-                    {r.reviewerName}{r.reviewerCountry ? ` (${r.reviewerCountry.toUpperCase()})` : ""}
+                    {r.channel === "airbnb" ? (r.linkedGuestName || r.reviewerName) : r.reviewerName}
+                    {r.reviewerCountry ? ` (${r.reviewerCountry.toUpperCase()})` : ""}
                   </span>
                 )}
                 {r.createdAt && (
@@ -1104,11 +1289,19 @@ function ReviewsTab({ reviews, channel: parentChannel, dateSearchReversed, hasDa
           </button>
         </div>
       )}
+
+      <ReviewReservationModal
+        isOpen={!!selectedReview}
+        onClose={closeReviewModal}
+        review={selectedReview}
+        reservation={selectedReservation}
+        loading={detailLoading}
+      />
     </motion.div>
   );
 }
 
-// ─── Rooms Tab ────────────────────────────────────────────────────────────────
+// encoding-fixed comment
 
 function RoomsTab({ roomStats, buildingStats, roomsLoading }) {
   const availableBuildings = BUILDING_ORDER.filter(b => roomStats[b] && Object.keys(roomStats[b]).length > 0);
@@ -1120,7 +1313,7 @@ function RoomsTab({ roomStats, buildingStats, roomsLoading }) {
     }
   }, [availableBuildings.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // 활성 roomId 로딩 중: 비활성 리스팅이 잠깐 보이지 않도록 로딩 상태 표시
+  // encoding-fixed comment
   if (roomsLoading) {
     return (
       <div style={{ textAlign: "center", padding: "80px", color: "#94A3B8" }}>
@@ -1132,7 +1325,7 @@ function RoomsTab({ roomStats, buildingStats, roomsLoading }) {
   if (availableBuildings.length === 0) {
     return (
       <div style={{ textAlign: "center", padding: "80px", color: "#94A3B8" }}>
-        <div style={{ fontSize: 40, marginBottom: 12 }}>🏠</div>
+        <div style={{ fontSize: 40, marginBottom: 12 }}>📭</div>
         <div style={{ fontSize: 16, fontWeight: 600, color: "#64748B", marginBottom: 6 }}>No room-level data yet</div>
         <div style={{ fontSize: 13 }}>Airbnb room reviews will appear here after syncing.</div>
       </div>
@@ -1175,16 +1368,16 @@ function RoomsTab({ roomStats, buildingStats, roomsLoading }) {
           {/* Bar chart */}
           <div style={{ background: "white", borderRadius: 16, padding: "24px", marginBottom: 20, boxShadow: "0 1px 3px rgba(0,0,0,0.06), 0 4px 12px rgba(0,0,0,0.04)", border: "1px solid #F1F5F9" }}>
             <h3 style={{ fontSize: 14, fontWeight: 700, color: "#1E293B", marginBottom: 4, letterSpacing: "-0.3px" }}>
-              Room Ratings — {getBuildingEn(selectedBuilding)}
+              Room Ratings · {getBuildingEn(selectedBuilding)}
             </h3>
-            <p style={{ fontSize: 12, color: "#94A3B8", marginBottom: 20 }}>Airbnb average score per room (0–5)</p>
-            <ResponsiveContainer width="100%" height={240}>
-              <BarChart data={barData} layout="vertical">
+            <p style={{ fontSize: 12, color: "#94A3B8", marginBottom: 20 }}>Airbnb average score per room (0-5)</p>
+            <ResponsiveContainer width="100%" height={Math.max(120, barData.length * 44)}>
+              <BarChart data={barData} layout="vertical" barCategoryGap="30%">
                 <CartesianGrid strokeDasharray="3 3" stroke="#F1F5F9" horizontal={false} />
                 <XAxis type="number" domain={[3, 5]} tick={{ fontSize: 11, fill: "#94A3B8" }} />
                 <YAxis type="category" dataKey="room" tick={{ fontSize: 12, fill: "#374151", fontWeight: 500 }} width={52} />
                 <Tooltip formatter={(v, n) => [v == null ? "N/A" : v, "Avg Score"]} contentStyle={{ borderRadius: 10, border: "1px solid #E2E8F0", fontSize: 12 }} />
-                <Bar dataKey="avg" fill={getBuildingColor(selectedBuilding)} radius={[0, 6, 6, 0]} />
+                <Bar dataKey="avg" fill={getBuildingColor(selectedBuilding)} radius={[0, 6, 6, 0]} maxBarSize={32} />
               </BarChart>
             </ResponsiveContainer>
           </div>
@@ -1234,7 +1427,7 @@ function RoomsTab({ roomStats, buildingStats, roomsLoading }) {
   );
 }
 
-// ─── Unanswered Tab ───────────────────────────────────────────────────────────
+// encoding-fixed comment
 
 function UnansweredTab({ reviews }) {
   const unanswered = useMemo(() =>
@@ -1273,7 +1466,7 @@ function UnansweredTab({ reviews }) {
           </div>
         </div>
         <div style={{ background: "white", borderRadius: 14, padding: "16px 22px", boxShadow: "0 1px 3px rgba(0,0,0,0.06)", border: "1px solid #F1F5F9", display: "flex", alignItems: "center", gap: 14 }}>
-          <div style={{ width: 44, height: 44, borderRadius: 12, background: "rgba(79,70,229,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>🏨</div>
+          <div style={{ width: 44, height: 44, borderRadius: 12, background: "rgba(79,70,229,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>🏠</div>
           <div>
             <div style={{ fontSize: 28, fontWeight: 800, color: "#4F46E5", letterSpacing: "-1px" }}>{Object.keys(byBuilding).length}</div>
             <div style={{ fontSize: 12, color: "#94A3B8" }}>Properties affected</div>
@@ -1283,7 +1476,7 @@ function UnansweredTab({ reviews }) {
           <div style={{ width: 44, height: 44, borderRadius: 12, background: "rgba(245,158,11,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>⭐</div>
           <div>
             <div style={{ fontSize: 28, fontWeight: 800, color: "#F59E0B", letterSpacing: "-1px" }}>
-              {unanswered.length ? (unanswered.reduce((s, r) => s + r.score, 0) / unanswered.length).toFixed(1) : "—"}
+              {unanswered.length ? (unanswered.reduce((s, r) => s + r.score, 0) / unanswered.length).toFixed(1) : "--"}
             </div>
             <div style={{ fontSize: 12, color: "#94A3B8" }}>Avg score (unanswered)</div>
           </div>
@@ -1307,12 +1500,16 @@ function UnansweredTab({ reviews }) {
                   {!r.content?.positive && !r.content?.negative && <p style={{ fontSize: 12, color: "#94A3B8", fontStyle: "italic", margin: 0 }}>No written review</p>}
                 </div>
                 <div style={{ textAlign: "right", flexShrink: 0 }}>
-                  {r.reviewerName && <div style={{ fontSize: 11, color: "#64748B", fontWeight: 600 }}>{r.reviewerName}</div>}
+                  {(r.channel === "airbnb" ? (r.linkedGuestName || r.reviewerName) : r.reviewerName) && (
+                    <div style={{ fontSize: 11, color: "#64748B", fontWeight: 600 }}>
+                      {r.channel === "airbnb" ? (r.linkedGuestName || r.reviewerName) : r.reviewerName}
+                    </div>
+                  )}
                   {r.createdAt && <div style={{ fontSize: 11, color: "#94A3B8" }}>{formatDate(r.createdAt)}</div>}
                   {r.url && (
                     <a href={r.url} target="_blank" rel="noopener noreferrer"
                       style={{ fontSize: 11, color: "#4F46E5", textDecoration: "none", fontWeight: 600 }}>
-                      Reply ↗
+                      Reply →
                     </a>
                   )}
                 </div>
@@ -1325,7 +1522,7 @@ function UnansweredTab({ reviews }) {
   );
 }
 
-// ─── Channel Selector ─────────────────────────────────────────────────────────
+// encoding-fixed comment
 
 function ChannelSelector({ channel, onChange, bookingCount, airbnbCount }) {
   const channels = [
@@ -1360,9 +1557,9 @@ function ChannelSelector({ channel, onChange, bookingCount, airbnbCount }) {
   );
 }
 
-// ─── Main Component ───────────────────────────────────────────────────────────
+// encoding-fixed comment
 
-// ─── Review Sync Modal ────────────────────────────────────────────────────────
+// encoding-fixed comment
 
 const SYNC_YEARS = Array.from({ length: new Date().getFullYear() - 2020 + 3 }, (_, i) => 2021 + i);
 const SYNC_MONTHS = Array.from({ length: 12 }, (_, i) => i + 1);
@@ -1384,7 +1581,7 @@ function ReviewSyncDateDropdown({ label, value, onChange }) {
         </select>
         <select value={month} onChange={e => update(year, Number(e.target.value), day)}
           style={{ flex: 1, padding: "9px 6px", border: "1.5px solid #E2E8F0", borderRadius: 9, fontSize: 13, color: "#1E293B", background: "#F8FAFC", outline: "none", cursor: "pointer" }}>
-          {SYNC_MONTHS.map(m => <option key={m} value={m}>{String(m).padStart(2,'0')} · {MONTH_SHORT[m-1]}</option>)}
+          {SYNC_MONTHS.map(m => <option key={m} value={m}>{String(m).padStart(2,'0')}  ·  {MONTH_SHORT[m-1]}</option>)}
         </select>
         <select value={day} onChange={e => update(year, month, Number(e.target.value))}
           style={{ flex: 1, padding: "9px 6px", border: "1.5px solid #E2E8F0", borderRadius: 9, fontSize: 13, color: "#1E293B", background: "#F8FAFC", outline: "none", cursor: "pointer" }}>
@@ -1439,7 +1636,7 @@ function ReviewSyncModal({ isOpen, onClose, onDone, companyId }) {
           {/* Header */}
           <div style={{ background: "linear-gradient(135deg, #1E293B 0%, #334155 100%)", padding: "24px 28px 20px", position: "relative" }}>
             <p style={{ fontSize: 19, fontWeight: 700, color: "#fff", margin: "0 0 3px", letterSpacing: "-0.3px" }}>Sync Reviews</p>
-            <p style={{ fontSize: 12, color: "rgba(255,255,255,0.6)", margin: 0 }}>Select date range — Beds24 → Firestore</p>
+            <p style={{ fontSize: 12, color: "rgba(255,255,255,0.6)", margin: 0 }}>Select date range · Beds24 → Firestore</p>
             <button onClick={handleClose}
               style={{ position: "absolute", top: 18, right: 18, background: "rgba(255,255,255,0.12)", border: "none", borderRadius: "50%", width: 30, height: 30, color: "#fff", fontSize: 17, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>×</button>
           </div>
@@ -1450,8 +1647,8 @@ function ReviewSyncModal({ isOpen, onClose, onDone, companyId }) {
             <ReviewSyncDateDropdown label="End Date" value={toDate} onChange={setToDate} />
 
             <div style={{ background: "#F0FDF4", border: "1px solid #BBF7D0", borderRadius: 10, padding: "11px 14px", fontSize: 12, color: "#166534", lineHeight: 1.6 }}>
-              ✅ Booking.com & Airbnb reviews will be fetched<br />
-              ✅ Only recent 3 months are retained (older reviews are auto-pruned)
+              Booking.com & Airbnb reviews will be fetched<br />
+              Only recent 3 months are retained (older reviews are auto-pruned)
             </div>
 
             {syncing && (
@@ -1463,7 +1660,7 @@ function ReviewSyncModal({ isOpen, onClose, onDone, companyId }) {
             {result !== null && (
               <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}
                 style={{ background: "#F0FDF4", border: "1px solid #86EFAC", borderRadius: 12, padding: 14 }}>
-                <div style={{ fontSize: 13, fontWeight: 700, color: "#166534", marginBottom: 4 }}>✅ Sync Complete</div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: "#166534", marginBottom: 4 }}>✓ Sync Complete</div>
                 <div style={{ fontSize: 13, color: "#166534", display: "flex", justifyContent: "space-between" }}>
                   <span>Reviews synced</span><strong>{result}</strong>
                 </div>
@@ -1472,13 +1669,13 @@ function ReviewSyncModal({ isOpen, onClose, onDone, companyId }) {
 
             {error && (
               <div style={{ background: "#FFF7ED", border: "1px solid #FED7AA", borderRadius: 10, padding: "11px 14px", fontSize: 12, color: "#9A3412" }}>
-                ❌ {error}
+                {error}
               </div>
             )}
 
             <button onClick={handleSync} disabled={syncing}
               style={{ width: "100%", padding: 13, background: syncing ? "#94A3B8" : "linear-gradient(135deg, #4F46E5 0%, #6366F1 100%)", color: "#fff", border: "none", borderRadius: 12, fontSize: 14, fontWeight: 600, cursor: syncing ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, boxShadow: syncing ? "none" : "0 4px 14px rgba(79,70,229,0.3)", transition: "all 0.2s", marginTop: 4 }}>
-              {syncing ? <><span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>⟳</span> Syncing...</> : <>↻ Start Sync</>}
+              {syncing ? <><span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>⏳</span> Syncing...</> : <>Start Sync</>}
             </button>
           </div>
         </motion.div>
@@ -1501,11 +1698,11 @@ export default function ReviewsDashboard() {
   const [dateTo, setDateTo] = useState("");
   const [appliedFrom, setAppliedFrom] = useState("");
   const [appliedTo, setAppliedTo] = useState("");
-  // 오늘 기준 활성 roomId 목록 (null=로딩 전, object=완료)
+  // encoding-fixed comment
   const [activeRoomsByBuilding, setActiveRoomsByBuilding] = useState(null);
   const [activeRoomsLoading, setActiveRoomsLoading] = useState(false);
 
-  // 채널 변경 시 탭 리셋
+  // encoding-fixed comment
   const handleChannelChange = (ch) => {
     setActiveChannel(ch);
     setActiveTab("overview");
@@ -1551,7 +1748,7 @@ export default function ReviewsDashboard() {
 
   useEffect(() => { loadReviews(); }, [loadReviews]);
 
-  // 리뷰 로드 완료 후 오늘 날짜 기준 활성 roomId Set 구성 (캘린더와 동일 기준)
+  // encoding-fixed comment
   useEffect(() => {
     if (!companyId || loading) return;
     let cancelled = false;
@@ -1631,7 +1828,7 @@ export default function ReviewsDashboard() {
       }
     } catch (err) {
       if (err.name === "AbortError") {
-        setSyncMsg("⏳ Sync is taking long — refreshing data...");
+        setSyncMsg("⏳ Sync is taking long · refreshing data...");
       } else {
         setSyncMsg(`❌ ${err.message}`);
       }
@@ -1642,7 +1839,7 @@ export default function ReviewsDashboard() {
     }
   };
 
-  // 기간 검색 방향: from > to이면 역순 (최신→과거)
+  // encoding-fixed comment
   const dateSearchReversed = useMemo(() => {
     if (appliedFrom && appliedTo) return appliedFrom > appliedTo;
     return false;
@@ -1650,7 +1847,7 @@ export default function ReviewsDashboard() {
 
   const hasDateFilter = !!(appliedFrom || appliedTo);
 
-  // 날짜 범위 필터링된 전체 리뷰
+  // encoding-fixed comment
   const dateFilteredReviews = useMemo(() => {
     if (!appliedFrom && !appliedTo) return reviews;
     const minDate = appliedFrom && appliedTo ? (appliedFrom < appliedTo ? appliedFrom : appliedTo) : (appliedFrom || appliedTo);
@@ -1674,23 +1871,23 @@ export default function ReviewsDashboard() {
     setAppliedTo("");
   };
 
-  // 채널별 필터된 리뷰
+  // encoding-fixed comment
   const channelReviews = useMemo(() => dateFilteredReviews.filter(r => r.channel === activeChannel), [dateFilteredReviews, activeChannel]);
   const bookingCount = dateFilteredReviews.filter(r => r.channel === "booking").length;
   const airbnbCount = dateFilteredReviews.filter(r => r.channel === "airbnb").length;
 
-  // Computed data (채널별, 날짜 필터 적용)
+  // encoding-fixed comment
   const buildingStats = useMemo(() => computeBuildingStats(dateFilteredReviews), [dateFilteredReviews]);
   const trendData = useMemo(() => computeTrendData(dateFilteredReviews), [dateFilteredReviews]);
   const weaknesses = useMemo(() => computeWeaknesses(buildingStats), [buildingStats]);
-  // activeRoomsByBuilding이 null(로딩 중)이면 null 반환 — RoomsTab에서 로딩 상태로 처리
+  // encoding-fixed comment
   const roomStats = useMemo(
     () => activeRoomsByBuilding !== null ? computeRoomStats(dateFilteredReviews, activeRoomsByBuilding) : null,
     [dateFilteredReviews, activeRoomsByBuilding]
   );
   const unansweredCount = dateFilteredReviews.filter(r => r.channel === "booking" && !r.hasReply).length;
 
-  // 채널별 탭 구성
+  // encoding-fixed comment
   const BOOKING_TABS = [
     { id: "overview", label: "Overview" },
     { id: "trends", label: "Trends" },
@@ -1720,8 +1917,8 @@ export default function ReviewsDashboard() {
           <p style={{ fontSize: 13, color: "#94A3B8", marginTop: 4 }}>
             {reviews.length > 0
               ? `${reviews.length} total reviews`
-              : "No reviews cached yet — click Sync to load data"}
-            {lastSynced && ` · Last synced ${lastSynced.toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`}
+              : "No reviews cached yet · click Sync to load data"}
+            {lastSynced && `  ·  Last synced ${lastSynced.toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`}
           </p>
         </div>
         <button onClick={() => setSyncModalOpen(true)}
@@ -1741,7 +1938,7 @@ export default function ReviewsDashboard() {
       <AnimatePresence>
         {syncMsg && (
           <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
-            style={{ background: syncMsg.startsWith("✅") ? "rgba(16,185,129,0.1)" : "rgba(239,68,68,0.1)", border: `1px solid ${syncMsg.startsWith("✅") ? "rgba(16,185,129,0.3)" : "rgba(239,68,68,0.3)"}`, borderRadius: 10, padding: "10px 16px", marginBottom: 16, fontSize: 13, fontWeight: 600, color: syncMsg.startsWith("✅") ? "#059669" : "#DC2626" }}>
+            style={{ background: syncMsg.toLowerCase().includes("failed") || syncMsg.startsWith("❌") ? "rgba(239,68,68,0.1)" : "rgba(16,185,129,0.1)", border: `1px solid ${syncMsg.toLowerCase().includes("failed") || syncMsg.startsWith("❌") ? "rgba(239,68,68,0.3)" : "rgba(16,185,129,0.3)"}`, borderRadius: 10, padding: "10px 16px", marginBottom: 16, fontSize: 13, fontWeight: 600, color: syncMsg.toLowerCase().includes("failed") || syncMsg.startsWith("❌") ? "#DC2626" : "#059669" }}>
             {syncMsg}
           </motion.div>
         )}
@@ -1789,8 +1986,8 @@ export default function ReviewsDashboard() {
             </button>
             <span style={{ fontSize: 12, color: "#94A3B8" }}>
               {dateFilteredReviews.length} reviews found
-              {dateSearchReversed && " · newest first"}
-              {!dateSearchReversed && appliedFrom && appliedTo && " · oldest first"}
+              {dateSearchReversed && "  ·  newest first"}
+              {!dateSearchReversed && appliedFrom && appliedTo && "  ·  oldest first"}
             </span>
           </>
         )}
@@ -1823,7 +2020,7 @@ export default function ReviewsDashboard() {
             {activeTab === "overview" && <OverviewTab buildingStats={buildingStats} reviews={channelReviews} channel={activeChannel} />}
             {activeTab === "trends" && activeChannel === "booking" && <TrendsTab trendData={trendData} buildingStats={buildingStats} />}
             {activeTab === "insights" && <InsightsTab weaknesses={weaknesses.filter(w => (activeChannel === "booking" ? w.channel === "Booking.com" : w.channel === "Airbnb"))} buildingStats={buildingStats} channel={activeChannel} />}
-            {activeTab === "reviews" && <ReviewsTab reviews={channelReviews} channel={activeChannel} dateSearchReversed={dateSearchReversed} hasDateFilter={hasDateFilter} />}
+            {activeTab === "reviews" && <ReviewsTab reviews={channelReviews} channel={activeChannel} dateSearchReversed={dateSearchReversed} hasDateFilter={hasDateFilter} companyId={companyId} />}
             {activeTab === "rooms" && activeChannel === "airbnb" && (
               <RoomsTab
                 roomStats={roomStats || {}}
@@ -1852,3 +2049,4 @@ export default function ReviewsDashboard() {
     </div>
   );
 }
+

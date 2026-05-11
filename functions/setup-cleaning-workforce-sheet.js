@@ -133,12 +133,13 @@ function buildCalendarMonth(monthStart, todayKey) {
 function buildSheetModel() {
     const now = dayjs().tz(TOKYO_TZ);
     const todayKey = now.format("YYYY-MM-DD");
-    const months = [0, 1, 2].map((offset) => buildCalendarMonth(now.add(offset, "month"), todayKey));
+    const monthOffsets = [-1, 0, 1, 2];
+    const months = monthOffsets.map((offset) => buildCalendarMonth(now.add(offset, "month"), todayKey));
     const values = [];
     const monthMeta = [];
 
     values.push(["\uccad\uc18c \uc778\ub825 \uc608\uce21 \uc2dc\uc2a4\ud15c"]);
-    values.push(["\uccb4\ud06c\uc544\uc6c3 \uae30\uc900 | \ubbf8\ub798 3\uac1c\uc6d4 | \ud655\uc815 \uc608\uc57d+\uc608\uc0c1 \uc720\uc785 | \uc21c\uc218 \uc778\uac74\ube44\ub9cc \uacc4\uc0b0 | \ub2e4\uc774\ucfc4\ucd08/\uc0ac\ub178 \uc81c\uc678"]);
+    values.push(["\uccb4\ud06c\uc544\uc6c3 \uae30\uc900 | \uacfc\uac70 1\uac1c\uc6d4+\ud604\uc7ac\uc6d4+\ubbf8\ub798 2\uac1c\uc6d4 | \ud655\uc815 \uc608\uc57d+\uc608\uc0c1 \uc720\uc785 | \uc21c\uc218 \uc778\uac74\ube44\ub9cc \uacc4\uc0b0 | \ub2e4\uc774\ucfc4\ucd08/\uc0ac\ub178 \uc81c\uc678"]);
     values.push(["\uc548\ub0b4", "\uac01 \ub0a0\uc9dc \uce78\uc5d0 \uccad\uc18c, \uc14b\ud305, \ucd5c\uc18c/\uad8c\uc7a5 \uc778\uc6d0, \uc608\uc0c1 \uc778\uac74\ube44 \ud45c\uc2dc", "", "", "", "", "", ""]);
     values.push([]);
 
@@ -195,7 +196,7 @@ function buildSheetModel() {
         "\uba54\ubaa8",
         "", "", "", "",
     ]);
-    [0, 1, 2].forEach((offset) => {
+    monthOffsets.forEach((offset) => {
         const monthKey = now.add(offset, "month").format("YYYY-MM");
         values.push([monthKey, "", "", "", "", "", "", ""]);
     });

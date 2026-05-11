@@ -16,6 +16,8 @@ const { computeRevenueDashboardData } = require("./modules/revenueDashboardData"
 const { getMonthlyRevenueChartUrl, getBuildingRevenueChartUrl } = require("./modules/chartImage");
 const { sendSameDayBookingAlert } = require("./modules/sameDayBookingAlert");
 const { markHomeDashboardSummaryDirty, refreshHomeDashboardSummary, processDirtyHomeDashboardSummaries } = require("./modules/homeDashboardSummary");
+const { createAttendanceAppClient } = require("./modules/attendanceAppClient");
+const { runCleaningWorkforceForecastUpdate } = require("./update-cleaning-workforce-forecast");
 const { sendCancelAlert } = require("./modules/cancelAlert"); // cancelAlert.js 수정 시 Functions 재배포
 
 if (!admin.apps.length) {
@@ -2962,6 +2964,247 @@ async function enrichBookingReviewsWithReservationContext(companyId, batchItems)
     console.log(`[enrichReviews] 매칭 성공: ${matched}건, 실패(스킵): ${skipped}건`);
 }
 
+function normalizeApiReference(ref) {
+    return String(ref || "").toLowerCase().replace(/[\s\-]/g, "");
+}
+
+async function enrichAirbnbReviewsWithReservationContext(companyId, batchItems) {
+    // building + reservationId 모두 유효한 항목만 대상
+    const targets = batchItems.filter(item =>
+        item.data.channel === "airbnb" &&
+        item.data.reservationId &&
+        item.data.building
+    );
+    console.log(`[enrichAirbnbReviews] 대상 airbnb 리뷰: ${targets.length}건`);
+    if (!targets.length) return;
+
+    // 인덱스 구축: 1차(apiReference in) + 2차 폴백(building+date-window)
+    const allIds = [...new Set(targets.map(item => String(item.data.reservationId)))];
+    const reservationIndex = {};        // `${building}__${normApiRef}` → d[]
+    const reservationIndexByApiRef = {}; // `${normApiRef}` → d[]
+    const seenDocIds = new Set();       // 1차/2차 중복 방지
+    const ID_CHUNK = 10;
+    let phase1CandidatesFetched = 0, phase2FallbackFetched = 0;
+
+    // 공통 인덱스 등록 헬퍼 (doc.id 기준 dedupe)
+    const addToIndex = (doc) => {
+        if (seenDocIds.has(doc.id)) return;
+        seenDocIds.add(doc.id);
+        const d = doc.data();
+        if (!d.apiReference || !d.building) return;
+        const normApiKey = normalizeApiReference(d.apiReference);
+        const compKey = `${d.building}__${normApiKey}`;
+        if (!reservationIndex[compKey]) reservationIndex[compKey] = [];
+        reservationIndex[compKey].push(d);
+        if (!reservationIndexByApiRef[normApiKey]) reservationIndexByApiRef[normApiKey] = [];
+        reservationIndexByApiRef[normApiKey].push(d);
+    };
+
+    // 1차 조회: apiReference in 원본 reservationId (Firestore 정확 매칭)
+    for (let i = 0; i < allIds.length; i += ID_CHUNK) {
+        const chunk = allIds.slice(i, i + ID_CHUNK);
+        try {
+            const snap = await db.collection("reservations")
+                .where("companyId", "==", companyId)
+                .where("apiReference", "in", chunk)
+                .get();
+            snap.docs.forEach(doc => { addToIndex(doc); phase1CandidatesFetched++; });
+        } catch (e) {
+            console.warn(`[enrichAirbnbReviews] 1차 조회 실패 (chunk ${i}):`, e.message);
+        }
+    }
+
+    // 2차 조회(폴백): 1차에서 정규화 키로도 못 찾은 타깃 → building + arrival 범위로 후보 확장
+    // Firestore는 normalize 비교 불가이므로, 코드 레벨 normalizeApiReference 비교로 흡수
+    const unmatchedNormIds = new Set(
+        allIds
+            .map(id => normalizeApiReference(id))
+            .filter(normId => !reservationIndexByApiRef[normId])
+    );
+    if (unmatchedNormIds.size > 0) {
+        const phase2Groups = {};
+        for (const item of targets) {
+            if (!unmatchedNormIds.has(normalizeApiReference(String(item.data.reservationId)))) continue;
+            const b = String(item.data.building);
+            const rawDate = item.data.createdAt;
+            if (!rawDate) continue;
+            const reviewDate = dayjs(String(rawDate).replace(" ", "T")).format("YYYY-MM-DD");
+            if (reviewDate === "Invalid Date") continue;
+            if (!phase2Groups[b]) phase2Groups[b] = { minDate: reviewDate, maxDate: reviewDate };
+            if (reviewDate < phase2Groups[b].minDate) phase2Groups[b].minDate = reviewDate;
+            if (reviewDate > phase2Groups[b].maxDate) phase2Groups[b].maxDate = reviewDate;
+        }
+        for (const [b, range] of Object.entries(phase2Groups)) {
+            const fetchFrom = dayjs(range.minDate).subtract(7, "day").format("YYYY-MM-DD");
+            const fetchTo = dayjs(range.maxDate).add(21, "day").format("YYYY-MM-DD");
+            try {
+                const snap = await db.collection("reservations")
+                    .where("companyId", "==", companyId)
+                    .where("building", "==", b)
+                    .where("arrival", ">=", fetchFrom)
+                    .where("arrival", "<=", fetchTo)
+                    .get();
+                snap.docs.forEach(doc => { addToIndex(doc); phase2FallbackFetched++; });
+            } catch (e) {
+                console.warn(`[enrichAirbnbReviews] 2차 조회 실패 (${b}):`, e.message);
+            }
+        }
+    }
+    const dedupedReservationCount = seenDocIds.size;
+
+    let matchedPrimary = 0, matchedFallbackUnique = 0, matchedFallbackDateWindow = 0;
+    let skippedAmbiguous = 0, skippedNoCandidate = 0, collision = 0;
+    const updates = [];
+    const matchedIds = new Set();
+
+    const pushUpdate = (itemId, res) => {
+        updates.push({
+            id: itemId,
+            fields: {
+                linkedGuestName: res.guestName || null,
+                reviewerName: res.guestName || null,
+                linkedRoom: res.room || null,
+                linkedArrival: res.arrival || null,
+                linkedDeparture: res.departure || null,
+                linkedBuilding: res.building || null,
+                linkedAt: admin.firestore.FieldValue.serverTimestamp()
+            }
+        });
+        matchedIds.add(itemId);
+    };
+
+    // Phase 1: building + apiReference 복합키 매칭 (정규화 키 조회)
+    for (const item of targets) {
+        const building = String(item.data.building);
+        const compKey = `${building}__${normalizeApiReference(item.data.reservationId)}`;
+        const candidates = reservationIndex[compKey];
+        if (!candidates || candidates.length === 0) continue;
+        let res = candidates[0];
+        if (candidates.length > 1) {
+            collision++;
+            res = candidates.reduce((best, cur) => {
+                if (!best.arrival) return cur;
+                if (!cur.arrival) return best;
+                return cur.arrival > best.arrival ? cur : best;
+            }, candidates[0]);
+        }
+        pushUpdate(item.id, res);
+        matchedPrimary++;
+    }
+
+    // Phase 2: apiReference 단독 유니크 매칭 — 정규화 키 조회 (정확히 1건일 때만)
+    for (const item of targets) {
+        if (matchedIds.has(item.id)) continue;
+        const fallback = reservationIndexByApiRef[normalizeApiReference(item.data.reservationId)] || [];
+        if (fallback.length === 1) {
+            pushUpdate(item.id, fallback[0]);
+            matchedFallbackUnique++;
+        }
+    }
+
+    // Phase 3: date-window 폴백 (arrival ±7일 fetch → arrival <= reviewDate <= departure+14일 필터)
+    const unmatchedTargets = targets.filter(item => !matchedIds.has(item.id));
+    if (unmatchedTargets.length > 0) {
+        // 건물별 그룹핑 + reviewDate 범위 계산
+        const buildingGroups = {};
+        for (const item of unmatchedTargets) {
+            const rawDate = item.data.createdAt;
+            if (!rawDate) continue;
+            const reviewDate = dayjs(String(rawDate).replace(" ", "T")).format("YYYY-MM-DD");
+            if (reviewDate === "Invalid Date") continue;
+            const b = String(item.data.building);
+            if (!buildingGroups[b]) buildingGroups[b] = { items: [], minDate: reviewDate, maxDate: reviewDate };
+            buildingGroups[b].items.push({ item, reviewDate });
+            if (reviewDate < buildingGroups[b].minDate) buildingGroups[b].minDate = reviewDate;
+            if (reviewDate > buildingGroups[b].maxDate) buildingGroups[b].maxDate = reviewDate;
+        }
+
+        // 건물별 reservations fetch (arrival 범위로 쿼리, 나머지 메모리 필터)
+        const buildingReservations = {};
+        for (const [b, group] of Object.entries(buildingGroups)) {
+            const fetchFrom = dayjs(group.minDate).subtract(7, "day").format("YYYY-MM-DD");
+            const fetchTo = dayjs(group.maxDate).add(21, "day").format("YYYY-MM-DD");
+            try {
+                const snap = await db.collection("reservations")
+                    .where("companyId", "==", companyId)
+                    .where("building", "==", b)
+                    .where("arrival", ">=", fetchFrom)
+                    .where("arrival", "<=", fetchTo)
+                    .get();
+                buildingReservations[b] = snap.docs
+                    .map(d => d.data())
+                    .filter(d => d.arrival && d.departure && d.guestName);
+            } catch (e) {
+                console.warn(`[enrichAirbnbReviews] date-window 조회 실패 (${b}):`, e.message);
+                buildingReservations[b] = [];
+            }
+        }
+
+        for (const [b, group] of Object.entries(buildingGroups)) {
+            const allRes = buildingReservations[b] || [];
+            for (const { item, reviewDate } of group.items) {
+                if (matchedIds.has(item.id)) continue;
+                const resId = String(item.data.reservationId || "");
+                const normResId = normalizeApiReference(resId);
+
+                // 조건: arrival <= reviewDate <= departure + 14일
+                const candidates = allRes.filter(r => {
+                    const dep14 = dayjs(r.departure).add(14, "day").format("YYYY-MM-DD");
+                    return r.arrival <= reviewDate && dep14 >= reviewDate;
+                });
+
+                if (candidates.length === 0) { skippedNoCandidate++; continue; }
+
+                if (candidates.length === 1) {
+                    pushUpdate(item.id, candidates[0]);
+                    matchedFallbackDateWindow++;
+                    continue;
+                }
+
+                // 다중 후보 — 우선순위 1: apiReference 정규화 일치
+                const normMatches = candidates.filter(r =>
+                    r.apiReference && normalizeApiReference(r.apiReference) === normResId
+                );
+                if (normMatches.length === 1) {
+                    pushUpdate(item.id, normMatches[0]);
+                    matchedFallbackDateWindow++;
+                    continue;
+                }
+                if (normMatches.length > 1) { skippedAmbiguous++; continue; }
+
+                // 우선순위 2: reviewDate에 arrival이 가장 가까운 것 (2일 이상 우위여야 확신)
+                const sorted = [...candidates].sort((a, c) => {
+                    const da = Math.abs(dayjs(a.arrival).diff(dayjs(reviewDate), "day"));
+                    const dc = Math.abs(dayjs(c.arrival).diff(dayjs(reviewDate), "day"));
+                    return da - dc;
+                });
+                const d1 = Math.abs(dayjs(sorted[0].arrival).diff(dayjs(reviewDate), "day"));
+                const d2 = Math.abs(dayjs(sorted[1].arrival).diff(dayjs(reviewDate), "day"));
+                if (d2 - d1 > 2) {
+                    pushUpdate(item.id, sorted[0]);
+                    matchedFallbackDateWindow++;
+                } else {
+                    skippedAmbiguous++;
+                }
+            }
+        }
+    }
+
+    // batch write
+    const WRITE_CHUNK = 400;
+    for (let i = 0; i < updates.length; i += WRITE_CHUNK) {
+        const chunk = updates.slice(i, i + WRITE_CHUNK);
+        const wb = db.batch();
+        for (const u of chunk) {
+            wb.update(db.collection("reviews").doc(u.id), u.fields);
+        }
+        await wb.commit();
+    }
+    const totalMatched = matchedPrimary + matchedFallbackUnique + matchedFallbackDateWindow;
+    const unmatchedFinal = targets.length - totalMatched;
+    console.log(`[enrichAirbnbReviews] fetched(raw=${phase1CandidatesFetched} fallback=${phase2FallbackFetched} deduped=${dedupedReservationCount}) matched(primary=${matchedPrimary} unique=${matchedFallbackUnique} date=${matchedFallbackDateWindow}) unmatched=${unmatchedFinal}`);
+}
+
 async function syncAllReviews(companyId, fromDate = null, options = {}) {
     const { insertOnly = false, toDate = null } = options;
     const tokyoNow = dayjs().utcOffset(9);
@@ -3212,11 +3455,16 @@ async function syncAllReviews(companyId, fromDate = null, options = {}) {
             }
             await wb.commit();
         }
-        // 예약 컨텍스트 보강 (booking 리뷰만, 오류 시 전체 실패 방지)
+        // 예약 컨텍스트 보강 (오류 시 전체 실패 방지)
         try {
             await enrichBookingReviewsWithReservationContext(companyId, batch);
         } catch (e) {
-            console.warn("[syncReviews] enrichment 실패:", e.message);
+            console.warn("[syncReviews] booking enrichment 실패:", e.message);
+        }
+        try {
+            await enrichAirbnbReviewsWithReservationContext(companyId, batch);
+        } catch (e) {
+            console.warn("[syncReviews] airbnb enrichment 실패:", e.message);
         }
         return batch.length;
     }
@@ -3384,7 +3632,7 @@ const BUILDING_ROOMS = {
         { roomId: "383978", name: "302호" }, { roomId: "601548", name: "302호" },
         { roomId: "440617", name: "401호" }, { roomId: "515300", name: "401호" },
         { roomId: "383974", name: "402호" }, { roomId: "601549", name: "402호" },
-        { roomId: "383975", name: "501호" }, { roomId: "502229", name: "501호" },
+        { roomId: "502229", name: "501호" }, { roomId: "383975", name: "501호" },
         { roomId: "383976", name: "502호" }, { roomId: "601550", name: "502호" },
         { roomId: "537451", name: "602호" }, { roomId: "601551", name: "602호" },
         { roomId: "383973", name: "701호" }, { roomId: "601552", name: "701호" },
@@ -3500,17 +3748,41 @@ const {
 // → setRoomPrices는 Firestore bed24_price_jobs에 job을 적재만 하고,
 //    scheduledPriceJobWorker가 1분 간격으로 job 1개씩 직렬 처리.
 // ==========================================
+const ARAKICHO_A_501_DUAL_ROOM_IDS = ["502229", "383975"];
+
+function normalizeRoomIdList(roomIds = []) {
+    if (Array.isArray(roomIds)) return roomIds.map((rid) => String(rid));
+    if (roomIds == null || roomIds === "") return [];
+    return [String(roomIds)];
+}
+
+function shouldMergeArakichoA501PriceRoomIds({ building, roomName, roomIds = [] }) {
+    const roomIdSet = new Set(normalizeRoomIdList(roomIds));
+    return (building === "아라키초A" && roomName === "501호")
+        || ARAKICHO_A_501_DUAL_ROOM_IDS.some((rid) => roomIdSet.has(rid));
+}
+
+function mergeArakichoA501PriceRoomIds(roomIds = []) {
+    return [...new Set([...normalizeRoomIdList(roomIds), ...ARAKICHO_A_501_DUAL_ROOM_IDS])];
+}
+
 exports.setRoomPrices = onRequest({ cors: true, timeoutSeconds: 30 }, async (req, res) => {
     try {
         const { companyId, roomId, roomIds, dates, building, worker, workerEmail, roomUpdates } = req.body;
         if (!companyId) return res.status(400).json({ success: false, error: "Missing companyId" });
 
+        let effectiveBuilding = building || null;
         const normalizedRoomUpdates = [];
         if (Array.isArray(roomUpdates) && roomUpdates.length > 0) {
             roomUpdates.forEach((roomUpdate) => {
                 const updateDates = roomUpdate?.dates || {};
-                const updateRoomIds = roomUpdate?.roomIds || (roomUpdate?.roomId ? [roomUpdate.roomId] : []);
+                let updateRoomIds = normalizeRoomIdList(roomUpdate?.roomIds || (roomUpdate?.roomId ? [roomUpdate.roomId] : []));
                 if (updateRoomIds.length === 0 || Object.keys(updateDates).length === 0) return;
+                if (shouldMergeArakichoA501PriceRoomIds({ building: effectiveBuilding, roomName: roomUpdate?.roomName, roomIds: updateRoomIds })) {
+                    updateRoomIds = mergeArakichoA501PriceRoomIds(updateRoomIds);
+                    if (!effectiveBuilding) effectiveBuilding = "아라키초A";
+                    console.log(`[setRoomPrices] 아라키초A 501호 듀얼 roomId 병합: ${updateRoomIds.join(", ")}`);
+                }
                 const calendarUpdates = buildBeds24CalendarUpdatesFromDates(updateDates);
                 updateRoomIds.forEach((rid) => {
                     normalizedRoomUpdates.push({
@@ -3522,9 +3794,14 @@ exports.setRoomPrices = onRequest({ cors: true, timeoutSeconds: 30 }, async (req
                 });
             });
         } else {
-            const inputRoomIds = roomIds || (roomId ? [roomId] : []);
+            let inputRoomIds = normalizeRoomIdList(roomIds || (roomId ? [roomId] : []));
             if (inputRoomIds.length === 0 || !dates) {
                 return res.status(400).json({ error: "Missing roomId/roomIds or dates" });
+            }
+            if (shouldMergeArakichoA501PriceRoomIds({ building: effectiveBuilding, roomIds: inputRoomIds })) {
+                inputRoomIds = mergeArakichoA501PriceRoomIds(inputRoomIds);
+                if (!effectiveBuilding) effectiveBuilding = "아라키초A";
+                console.log(`[setRoomPrices] 아라키초A 501호 듀얼 roomId 병합: ${inputRoomIds.join(", ")}`);
             }
             const calendarUpdates = buildBeds24CalendarUpdatesFromDates(dates);
             inputRoomIds.forEach((rid) => {
@@ -3546,7 +3823,7 @@ exports.setRoomPrices = onRequest({ cors: true, timeoutSeconds: 30 }, async (req
         // Firestore에 price job 생성 — 즉시 Beds24 호출 없음
         const jobRef = await db.collection("beds24_price_jobs").add({
             companyId,
-            building: building || null,
+            building: effectiveBuilding,
             roomIds: activeRoomIds,
             dates: dates || null,
             calendarUpdates: null,
@@ -4915,6 +5192,9 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, 
                 if (activeRoomIds.length === 0) return null;
                 if (building === "가부키초" && rn === "803호" && activeRoomIds.includes("648398")) {
                     return "648398";
+                }
+                if (building === "아라키초A" && rn === "501호" && activeRoomIds.includes("502229")) {
+                    return "502229";
                 }
                 return activeRoomIds[0];
             };
@@ -6776,4 +7056,159 @@ exports.syncReviewsManual = onRequest({ cors: true, timeoutSeconds: 540, memory:
         console.error("syncReviewsManual:", e);
         res.status(500).json({ success: false, error: e.message });
     }
+});
+
+function getRequestParam(req, key, fallback = null) {
+    return (req.body && req.body[key] != null)
+        ? req.body[key]
+        : (req.query && req.query[key] != null ? req.query[key] : fallback);
+}
+
+function sanitizeDocId(value) {
+    return String(value || "").replace(/[\/#?[\]]/g, "_");
+}
+
+async function commitAttendanceAppRows(collectionName, rows, buildDocId, companyId) {
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    let batch = db.batch();
+    let pending = 0;
+    let written = 0;
+
+    for (const row of rows) {
+        const docId = sanitizeDocId(buildDocId(row));
+        if (!docId) continue;
+        const ref = db.collection(collectionName).doc(docId);
+        batch.set(ref, {
+            ...row,
+            companyId,
+            source: "attendance_app",
+            updatedAt: now,
+        }, { merge: true });
+        pending += 1;
+        written += 1;
+
+        if (pending >= 450) {
+            await batch.commit();
+            batch = db.batch();
+            pending = 0;
+        }
+    }
+
+    if (pending > 0) await batch.commit();
+    return written;
+}
+
+function getAttendanceDateRange(req) {
+    const fromDate = String(getRequestParam(req, "fromDate", "") || "");
+    const toDate = String(getRequestParam(req, "toDate", "") || "");
+    if (!fromDate || !toDate) {
+        throw new Error("fromDate and toDate are required");
+    }
+
+    const days = dayjs(toDate).diff(dayjs(fromDate), "day");
+    if (days < 0) throw new Error("toDate must be after fromDate");
+    if (days > 93) throw new Error("Date range must be 93 days or less");
+
+    return { fromDate, toDate };
+}
+
+exports.testAttendanceAppConnection = onRequest({ cors: true, timeoutSeconds: 60 }, async (req, res) => {
+    try {
+        const client = createAttendanceAppClient();
+        const employees = await client.listEmployees({ page: 1, size: 5 });
+        res.json({
+            success: true,
+            checked: "employees",
+            count: employees.length,
+            sample: employees.slice(0, 5).map((item) => ({
+                employeeId: item.employeeId,
+                name: item.name,
+                role: item.role,
+                employmentType: item.employmentType,
+                hourlyWage: item.hourlyWage,
+            })),
+        });
+    } catch (e) {
+        console.error("testAttendanceAppConnection:", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+exports.syncAttendanceAppEmployees = onRequest({ cors: true, timeoutSeconds: 180, memory: "512MiB" }, async (req, res) => {
+    try {
+        const companyId = String(getRequestParam(req, "companyId", DEFAULT_COMPANY_ID));
+        const client = createAttendanceAppClient();
+        const employees = await client.listEmployees({ size: 500 });
+        const written = await commitAttendanceAppRows(
+            "attendance_app_employees",
+            employees,
+            (row) => `${companyId}_${row.employeeId}`,
+            companyId
+        );
+
+        res.json({ success: true, companyId, fetched: employees.length, written });
+    } catch (e) {
+        console.error("syncAttendanceAppEmployees:", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+exports.syncAttendanceAppAttendanceRecords = onRequest({ cors: true, timeoutSeconds: 300, memory: "512MiB" }, async (req, res) => {
+    try {
+        const companyId = String(getRequestParam(req, "companyId", DEFAULT_COMPANY_ID));
+        const employeeId = getRequestParam(req, "employeeId", null);
+        const { fromDate, toDate } = getAttendanceDateRange(req);
+        const client = createAttendanceAppClient();
+        const records = await client.listAttendanceRecords({
+            fromDate,
+            toDate,
+            ...(employeeId ? { employeeId } : {}),
+            size: 500,
+        });
+        const written = await commitAttendanceAppRows(
+            "attendance_app_attendance_records",
+            records,
+            (row) => `${companyId}_${row.workDate}_${row.employeeId}`,
+            companyId
+        );
+
+        res.json({ success: true, companyId, fromDate, toDate, fetched: records.length, written });
+    } catch (e) {
+        console.error("syncAttendanceAppAttendanceRecords:", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+exports.syncAttendanceAppPayrollSummaries = onRequest({ cors: true, timeoutSeconds: 300, memory: "512MiB" }, async (req, res) => {
+    try {
+        const companyId = String(getRequestParam(req, "companyId", DEFAULT_COMPANY_ID));
+        const yearMonth = String(getRequestParam(req, "yearMonth", dayjs().tz("Asia/Tokyo").format("YYYY-MM")));
+        const employeeId = getRequestParam(req, "employeeId", null);
+        const client = createAttendanceAppClient();
+        const summaries = await client.listPayrollSummaries({
+            yearMonth,
+            ...(employeeId ? { employeeId } : {}),
+            size: 500,
+        });
+        const written = await commitAttendanceAppRows(
+            "attendance_app_payroll_summaries",
+            summaries,
+            (row) => `${companyId}_${row.yearMonth}_${row.employeeId}`,
+            companyId
+        );
+
+        res.json({ success: true, companyId, yearMonth, fetched: summaries.length, written });
+    } catch (e) {
+        console.error("syncAttendanceAppPayrollSummaries:", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+exports.scheduledCleaningWorkforceForecast = onSchedule({
+    schedule: "0 8 * * *",
+    timeZone: "Asia/Tokyo",
+    timeoutSeconds: 540,
+    memory: "1GiB",
+}, async () => {
+    await runCleaningWorkforceForecastUpdate();
 });

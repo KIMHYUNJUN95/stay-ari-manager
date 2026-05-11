@@ -31,7 +31,7 @@ const BUILDING_ROOMS = {
     { roomId: "383978", name: "302호" }, { roomId: "601548", name: "302호" },
     { roomId: "440617", name: "401호" }, { roomId: "515300", name: "401호" },
     { roomId: "383974", name: "402호" }, { roomId: "601549", name: "402호" },
-    { roomId: "383975", name: "501호" }, { roomId: "502229", name: "501호" },
+    { roomId: "502229", name: "501호" }, { roomId: "383975", name: "501호" },
     { roomId: "383976", name: "502호" }, { roomId: "601550", name: "502호" },
     { roomId: "537451", name: "602호" }, { roomId: "601551", name: "602호" },
     { roomId: "383973", name: "701호" }, { roomId: "601552", name: "701호" },
@@ -80,7 +80,8 @@ const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || "https://us-central1-
 // 비활성 계정 minStay 기준값 (50 이상 = 비활성 판단)
 const INACTIVE_MINSTAY_THRESHOLD = 50;
 const PREFERRED_DUAL_ROOM_IDS = {
-  "가부키초__803호": "648398"
+  "가부키초__803호": "648398",
+  "아라키초A__501호": "502229"
 };
 const PRICE_INTERVENTION_LIMIT = 400;
 const CALENDAR_NUMERIC_FONT_FAMILY = '"Bahnschrift", "DIN Alternate", "Inter", "Aptos", "Segoe UI", sans-serif';
@@ -339,7 +340,13 @@ function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose,
           activeInfos.forEach(info => activeRoomIds.add(info.roomId));
         });
         const roomInfos = BUILDING_ROOMS[building]?.filter(r => r.name === roomName) || [];
-        const finalRoomIds = activeRoomIds.size > 0 ? Array.from(activeRoomIds) : roomInfos.map(info => info.roomId);
+        let finalRoomIds = activeRoomIds.size > 0 ? Array.from(activeRoomIds) : roomInfos.map(info => info.roomId);
+        // 아라키초A 501호 듀얼 roomId 동시 업데이트 보장
+        if (building === "아라키초A" && roomName === "501호") {
+          const dual501Ids = ["502229", "383975"];
+          const merged = new Set([...finalRoomIds, ...dual501Ids]);
+          finalRoomIds = Array.from(merged);
+        }
 
         return {
           roomName,
