@@ -1,4 +1,4 @@
-/**
+﻿/**
  * update-cleaning-workforce-forecast.js
  *
  * Fills "청소인력예측" sheet with real forecast values from Firestore reservations.
@@ -59,6 +59,7 @@ const MAX_STAY_NIGHTS = 10;
 // Mixed workforce: some weekday-only, some weekend-only, some 2-3 days/week.
 // 3 days/week is a conservative planning average. Raises pool size by ~2.3x vs peak.
 const AVG_WORK_DAYS_PER_WEEK = 3;
+const MIN_FIXED_STAFF_FLOOR = 4;
 const FORECAST_PROFILE = String(process.env.FORECAST_PROFILE || "base").toLowerCase();
 
 const BUILDING_ORDER = ["arakichoA", "arakichoB", "kabukicho", "takadanobaba", "okuboA", "okuboB", "okuboC"];
@@ -784,8 +785,8 @@ function countWeeklyShortStayAvailableCheckouts(roomMap, weekStart, weekEnd, tod
 }
 
 /**
- * Builds one row per calendar week with confirmed-only operational metrics.
- * Columns: weekStart, weekEnd, 확정청소, 주내추가가능CO, 확정피크일, 피크대응, 주간확보풀, 확정인건비
+ * Builds one row per calendar week with confirmed coverage and checkout-possible standby metrics.
+ * Columns: weekStart, weekEnd, confirmedCleaning, checkoutPossible, peakDate, confirmedPeakNeed, standbyNeed, confirmedCost
  */
 function buildWeeklySummaryRowsFromDaily(dailyMap, roomMap = new Map(), todayKey = "") {
     const daily = dailyMap instanceof Map ? dailyMap : new Map(Object.entries(dailyMap || {}));
@@ -808,36 +809,41 @@ function buildWeeklySummaryRowsFromDaily(dailyMap, roomMap = new Map(), todayKey
         const effectiveStart = isPastWeek ? null : (todayKey && todayKey > weekStart ? todayKey : weekStart);
         const effectiveEnd = isPastWeek ? null : weekEnd;
 
-        let confirmedCleaning = 0;
         let confirmedCost = 0;
-        let confirmedNeedPeak = 0;
-        let confirmedPeakDate = "";
-        let confirmedNeedSum = 0;
+        let confirmedCleaning = 0;
+        let checkoutPossibleCount = 0;
+        let confirmedPeakNeed = 0;
+        let standbyPeakNeed = 0;
+        let peakDate = "";
 
         if (effectiveStart && effectiveEnd) {
             dateRange(effectiveStart, effectiveEnd).forEach((d) => {
                 const s = daily.get(d) || {};
-                const need = safeInt(s.operationalMinHeadcount);
-                confirmedCleaning += safeInt(s.confirmed);
+                const confirmedNeed = safeInt(s.confirmedHeadcount);
+                const checkoutPossibleNeed = safeInt(s.checkoutPossibleHeadcount);
+                const standbyNeed = Math.max(0, checkoutPossibleNeed - confirmedNeed);
                 confirmedCost += safeInt(s.confirmedCostBase);
-                confirmedNeedSum += need;
-                if (need > confirmedNeedPeak) { confirmedNeedPeak = need; confirmedPeakDate = d; }
+                confirmedCleaning += safeInt(s.confirmed);
+                checkoutPossibleCount += safeInt(s.checkoutPossible);
+                if (confirmedNeed > confirmedPeakNeed) {
+                    confirmedPeakNeed = confirmedNeed;
+                    if (!peakDate) peakDate = d;
+                }
+                if (standbyNeed > standbyPeakNeed) {
+                    standbyPeakNeed = standbyNeed;
+                    peakDate = d;
+                }
             });
         }
-
-        const weeklyPool = confirmedNeedSum > 0
-            ? Math.ceil(confirmedNeedSum / Math.max(1, AVG_WORK_DAYS_PER_WEEK))
-            : 0;
-        const weeklyAvailableCO = countWeeklyShortStayAvailableCheckouts(roomMap, weekStart, weekEnd, todayKey);
 
         return [
             weekStart,
             weekEnd,
             confirmedCleaning,
-            weeklyAvailableCO,
-            confirmedPeakDate || "-",
-            confirmedNeedPeak,
-            weeklyPool,
+            checkoutPossibleCount,
+            peakDate || "-",
+            confirmedPeakNeed,
+            standbyPeakNeed,
             yen(confirmedCost),
         ];
     });
@@ -1024,7 +1030,7 @@ function estimateVacantCheckins({
     return expectedCheckins;
 }
 
-function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKey, history, inventoryByBuilding }) {
+function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKey, history, inventoryByBuilding, roomMap = new Map() }) {
     const daily = new Map();
     const dailyByBuilding = [];
     const forecastStart = forecastDates[0];
@@ -1035,6 +1041,42 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
 
     const confirmedDeparture = new Map();
     const confirmedOccupied = new Map();
+    const roomSlotsByBuilding = new Map(BUILDING_ORDER.map((key) => [key, []]));
+    roomMap.forEach((_, roomKey) => {
+        const [buildingKey] = String(roomKey || "").split("__");
+        if (!roomSlotsByBuilding.has(buildingKey)) return;
+        roomSlotsByBuilding.get(buildingKey).push(roomKey);
+    });
+    BUILDING_ORDER.forEach((buildingKey) => {
+        const slots = roomSlotsByBuilding.get(buildingKey) || [];
+        const inventory = Math.max(0, safeInt(inventoryByBuilding?.[buildingKey] || 0));
+        const deduped = [...new Set(slots)];
+        for (let i = deduped.length; i < inventory; i += 1) {
+            deduped.push(`${buildingKey}__virtual_${i + 1}`);
+        }
+        roomSlotsByBuilding.set(buildingKey, deduped);
+    });
+    const occupiedRoomDates = new Set();
+    const roomDateKey = (roomKey, dateKey) => `${roomKey}__${dateKey}`;
+    const markStayOccupied = (occupiedSet, roomKey, checkinDate, checkoutDate) => {
+        let cursor = dayjs.tz(checkinDate, TOKYO_TZ);
+        const checkout = dayjs.tz(checkoutDate, TOKYO_TZ);
+        while (cursor.isBefore(checkout)) {
+            const stayDate = cursor.format("YYYY-MM-DD");
+            if (stayDate >= simStart && stayDate <= simEnd) {
+                occupiedSet.add(roomDateKey(roomKey, stayDate));
+            }
+            cursor = cursor.add(1, "day");
+        }
+    };
+    const isRoomFreeForStay = (occupiedSet, roomKey, checkinDate, nights) => {
+        for (let offset = 0; offset < nights; offset += 1) {
+            const stayDate = dayjs.tz(checkinDate, TOKYO_TZ).add(offset, "day").format("YYYY-MM-DD");
+            if (stayDate > simEnd) break;
+            if (occupiedSet.has(roomDateKey(roomKey, stayDate))) return false;
+        }
+        return true;
+    };
     BUILDING_ORDER.forEach((bKey) => {
         simDates.forEach((d) => confirmedOccupied.set(`${d}__${bKey}`, 0));
     });
@@ -1057,13 +1099,35 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
             }
             cursor = cursor.add(1, "day");
         }
+
+        const roomName = String(r.room || "").trim();
+        const slots = roomSlotsByBuilding.get(bKey) || [];
+        let roomKey = roomName ? `${bKey}__${roomName}` : "";
+        if (roomKey && !slots.includes(roomKey)) {
+            slots.push(roomKey);
+            roomSlotsByBuilding.set(bKey, slots);
+        }
+        if (!roomKey && slots.length) {
+            roomKey = slots.find((rk) => isRoomFreeForStay(occupiedRoomDates, rk, r.arrival, Math.max(1, dayjs.tz(r.departure, TOKYO_TZ).diff(dayjs.tz(r.arrival, TOKYO_TZ), "day")))) || slots[0];
+        }
+        if (roomKey) markStayOccupied(occupiedRoomDates, roomKey, r.arrival, r.departure);
     });
 
     const projectedOccupied = new Map();
     const projectedDeparture = new Map();
+    const availableCheckinsByDateBuilding = new Map();
     BUILDING_ORDER.forEach((bKey) => {
         simDates.forEach((d) => projectedOccupied.set(`${d}__${bKey}`, 0));
     });
+    const canRoomCheckoutOnDate = (roomKey, departureDate) => {
+        if (departureDate <= todayKey) return false;
+        for (let nights = 1; nights <= MAX_STAY_NIGHTS; nights += 1) {
+            const checkinDate = dayjs.tz(departureDate, TOKYO_TZ).subtract(nights, "day").format("YYYY-MM-DD");
+            if (checkinDate < forecastStart) continue;
+            if (isRoomFreeForStay(occupiedRoomDates, roomKey, checkinDate, nights)) return true;
+        }
+        return false;
+    };
 
     // Day-by-day fluid simulation:
     // vacant rooms can receive potential check-ins, and those generate future check-outs.
@@ -1074,6 +1138,7 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
             const occConfirmed = confirmedOccupied.get(`${dateKey}__${buildingKey}`) || 0;
             const occProjected = projectedOccupied.get(`${dateKey}__${buildingKey}`) || 0;
             const vacantRooms = Math.max(0, inventory - occConfirmed - occProjected);
+            availableCheckinsByDateBuilding.set(`${dateKey}__${buildingKey}`, Math.max(0, Math.floor(vacantRooms)));
             const potentialCheckins = estimateVacantCheckins({
                 buildingKey,
                 targetDateKey: dateKey,
@@ -1106,15 +1171,21 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
                     }
                     cursor = cursor.add(1, "day");
                 }
-            });
+                });
         });
     });
 
     forecastDates.forEach((dateKey) => {
         const buildingRows = BUILDING_ORDER.map((buildingKey) => {
+            const inventory = Number(inventoryByBuilding?.[buildingKey] || 0);
             const confirmed = safeInt(confirmedDeparture.get(`${dateKey}__${buildingKey}`) || 0);
             const projectedRaw = Number(projectedDeparture.get(`${dateKey}__${buildingKey}`) || 0);
             const projected = Math.max(0, Math.ceil(projectedRaw));
+            const checkoutPossible = (roomSlotsByBuilding.get(buildingKey) || []).reduce((sum, roomKey) => (
+                sum + (canRoomCheckoutOnDate(roomKey, dateKey) ? 1 : 0)
+            ), 0);
+            const checkoutPossibleHeadcount = calculateCapacityHeadcount(DEFAULT_BUILDING_RULES[buildingKey] || {}, checkoutPossible);
+            const availableCheckins = safeInt(availableCheckinsByDateBuilding.get(`${dateKey}__${buildingKey}`) || 0);
             const rule = DEFAULT_BUILDING_RULES[buildingKey] || {};
             const cleaningUnitMultiplier = Math.max(1, Number(rule.cleaningUnitMultiplier || 1));
             const physicalTotal = confirmed + projected;
@@ -1134,6 +1205,9 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
                 physicalConfirmedCO: confirmed,
                 physicalProjectedCO: projected,
                 physicalCheckoutUnits: physicalTotal,
+                checkoutPossible,
+                checkoutPossibleHeadcount,
+                availableCheckins,
             };
         });
 
@@ -1153,6 +1227,9 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
             acc.confirmed += safeInt(row.confirmedCO);
             acc.projected += safeInt(row.projectedCO);
             acc.cleaning += safeInt(row.totalCO);
+            acc.checkoutPossible += safeInt(row.checkoutPossible);
+            acc.checkoutPossibleHeadcount += safeInt(row.checkoutPossibleHeadcount);
+            acc.availableCheckins += safeInt(row.availableCheckins);
             acc.turnover += safeInt(row.turnoverCount);
             acc.totalJobHours += Number(row.estimatedJobHours || 0);
             acc.confirmedHeadcount += confirmedHeadcount;
@@ -1173,6 +1250,9 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
             confirmed: 0,
             projected: 0,
             cleaning: 0,
+            checkoutPossible: 0,
+            checkoutPossibleHeadcount: 0,
+            availableCheckins: 0,
             turnover: 0,
             totalJobHours: 0,
             confirmedHeadcount: 0,
@@ -1197,6 +1277,9 @@ function aggregateDailyForecast({ reservations, forecastDates, resolver, todayKe
                 buildingKey: row.buildingKey,
                 confirmed: safeInt(row.confirmedCO),
                 projected: safeInt(row.projectedCO),
+                checkoutPossible: safeInt(row.checkoutPossible),
+                checkoutPossibleHeadcount: safeInt(row.checkoutPossibleHeadcount),
+                availableCheckins: safeInt(row.availableCheckins),
                 setting: 0,
                 estimatedJobHours: Number(row.estimatedJobHours || 0),
                 confirmedHeadcount,
@@ -1336,33 +1419,29 @@ function getMonthPeakDayCountDisplay(monthDates, daily) {
     const monthPeakStats = getMonthPeakStats(monthDates, daily);
     const peakDayCount = monthDates.reduce((count, d) => {
         const signal = getDayPeakSignal(daily.get(d) || {}, monthPeakStats);
-        return signal.type ? count + 1 : count;
+        return (signal.type === "confirmed_high" || signal.type === "confirmed_warning") ? count + 1 : count;
     }, 0);
     return `${peakDayCount}\uac74`;
 }
 
-function buildCalendarCell(dateKey, stats, isToday, peakSignal = { type: "", label: "" }) {
+function buildCalendarCell(dateKey, stats, isToday) {
     const d = dayjs.tz(dateKey, TOKYO_TZ);
     const confirmed = safeInt(stats.confirmed);
-    const projected = safeInt(stats.projected);
-    const confirmedNeed = safeInt(stats.confirmedHeadcount);
-    const reserveNeed = safeInt(stats.operationalMinHeadcount);
-    const lines = [
+    const checkoutPossible = safeInt(stats.checkoutPossible);
+    const availableCheckins = safeInt(stats.availableCheckins);
+    const minStaff = safeInt(stats.operationalMinHeadcount);
+    return [
         `${d.format("M/D ddd")}${isToday ? "  TODAY" : ""}`,
-        `\ud655\uc815 ${confirmed}\uac74`,
-        `\uc608\uc0c1 ${projected}\uac74`,
-        `\ud655\uc815\ud544\uc694 ${confirmedNeed}\uba85`,
-        `\ub300\ube44\ud544\uc694 ${reserveNeed}\uba85`,
+        `확정 ${confirmed}건`,
+        `체크아웃 가능 ${checkoutPossible}건`,
+        `체크인가능건수 ${availableCheckins}건`,
+        `최소인원 ${minStaff}명`,
         yen(stats.confirmedCostBase),
-    ];
-    if (peakSignal.label) {
-        lines.push(peakSignal.label);
-    }
-    return lines.join("\n");
+    ].join("\n");
 }
 
-function buildCalendarCellRichText(dateKey, stats, isToday, peakSignal = { type: "", label: "" }) {
-    const text = buildCalendarCell(dateKey, stats, isToday, peakSignal);
+function buildCalendarCellRichText(dateKey, stats, isToday) {
+    const text = buildCalendarCell(dateKey, stats, isToday);
     const lines = text.split("\n");
     let cursor = 0;
     const starts = lines.map((line) => {
@@ -1370,27 +1449,17 @@ function buildCalendarCellRichText(dateKey, stats, isToday, peakSignal = { type:
         cursor += line.length + 1;
         return start;
     });
-
-    // Line indices: 0=date, 1=확정(amber), 2=예상(blue), 3=확정필요, 4=대비필요, 5=cost, 6=peak(optional)
-    const runs = [
-        // Line 0: date — dark navy, bold
-        { startIndex: starts[0], format: { bold: true, foregroundColorStyle: { rgbColor: { red: 0.07, green: 0.13, blue: 0.27 } } } },
-        // Line 1: 확정 — amber (#B45309)
-        { startIndex: starts[1], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.706, green: 0.325, blue: 0.035 } } } },
-        // Line 2: 예상 — blue (#2563EB)
-        { startIndex: starts[2], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.145, green: 0.388, blue: 0.922 } } } },
-        // Line 3: 확정필요 — dark slate
-        { startIndex: starts[3], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.1, green: 0.1, blue: 0.1 } } } },
-        // Line 4: 대비필요 — dark navy
-        { startIndex: starts[4], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.118, green: 0.227, blue: 0.541 } } } },
-        // Line 5: cost — green (#047857)
-        { startIndex: starts[5], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.016, green: 0.471, blue: 0.341 } } } },
-    ];
-    // Line 6 (optional): peak risk — red (#DC2626), bold
-    if (lines.length > 6 && lines[6]) {
-        runs.push({ startIndex: starts[6], format: { bold: true, foregroundColorStyle: { rgbColor: { red: 0.863, green: 0.149, blue: 0.149 } } } });
-    }
-    return { text, textFormatRuns: runs };
+    return {
+        text,
+        textFormatRuns: [
+            { startIndex: starts[0], format: { bold: true,  foregroundColorStyle: { rgbColor: { red: 0.07,  green: 0.13,  blue: 0.27  } } } },
+            { startIndex: starts[1], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.706, green: 0.325, blue: 0.035 } } } },
+            { startIndex: starts[2], format: { bold: true,  foregroundColorStyle: { rgbColor: { red: 0.31,  green: 0.275, blue: 0.898 } } } },
+            { startIndex: starts[3], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.145, green: 0.388, blue: 0.922 } } } },
+            { startIndex: starts[4], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.1,   green: 0.1,   blue: 0.1   } } } },
+            { startIndex: starts[5], format: { bold: false, foregroundColorStyle: { rgbColor: { red: 0.42,  green: 0.45,  blue: 0.50  } } } },
+        ],
+    };
 }
 
 function computeMonthlyMinimumWorkforce(daily, months, manualInputs = new Map()) {
@@ -1405,6 +1474,7 @@ function computeMonthlyMinimumWorkforce(daily, months, manualInputs = new Map())
                 peakDate: null,
                 peakOperational: 0,
                 shortageRiskDates: [],
+                confirmedNeedAvg: 0,
                 systemFixedStaff: 0,
                 appliedFixedStaff: 0,
                 fixedShortage: 0,
@@ -1416,12 +1486,12 @@ function computeMonthlyMinimumWorkforce(daily, months, manualInputs = new Map())
 
         let peakOperational = 0;
         let peakDate = null;
-        let baselineOperational = Infinity;
+        let confirmedHeadcountSum = 0;
         const dayEntries = monthDates.map((d) => {
             const s = daily.get(d) || {};
             const opMin = s.operationalMinHeadcount || 0;
             if (opMin > peakOperational) { peakOperational = opMin; peakDate = d; }
-            if (opMin > 0 && opMin < baselineOperational) baselineOperational = opMin;
+            confirmedHeadcountSum += (s.confirmedHeadcount || 0);
             return {
                 date: d,
                 mathMin: s.mathMinHeadcount || 0,
@@ -1431,10 +1501,10 @@ function computeMonthlyMinimumWorkforce(daily, months, manualInputs = new Map())
                 projected: s.projected || 0,
             };
         });
-        if (!Number.isFinite(baselineOperational)) baselineOperational = 0;
 
+        const confirmedNeedAvg = monthDates.length > 0 ? confirmedHeadcountSum / monthDates.length : 0;
         const manual = manualInputs.get(monthKey) || {};
-        const systemFixedStaff = baselineOperational;
+        const systemFixedStaff = Math.max(Math.ceil(confirmedNeedAvg), MIN_FIXED_STAFF_FLOOR);
         const appliedFixedStaff = manual.confirmed_fixed_staff != null
             ? manual.confirmed_fixed_staff
             : systemFixedStaff;
@@ -1485,6 +1555,7 @@ function computeMonthlyMinimumWorkforce(daily, months, manualInputs = new Map())
             peakDate,
             peakOperational,
             shortageRiskDates,
+            confirmedNeedAvg,
             systemFixedStaff,
             appliedFixedStaff,
             fixedShortage,
@@ -1732,14 +1803,14 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
                 const day = Number(dm[2]);
                 const dateKey = dayjs.tz(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`, TOKYO_TZ).format("YYYY-MM-DD");
                 const stats = model.daily.get(dateKey) || {
-                    cleaning: 0, confirmedHeadcount: 0, minHeadcount: 0, operationalMinHeadcount: 0, recommendedHeadcount: 0, costBase: 0, confirmedCostBase: 0, confirmed: 0, projected: 0,
+                    cleaning: 0, checkoutPossible: 0, availableCheckins: 0, confirmedHeadcount: 0, minHeadcount: 0, operationalMinHeadcount: 0, recommendedHeadcount: 0, costBase: 0, confirmedCostBase: 0, confirmed: 0, projected: 0,
                 };
                 if (dateKey === todayKey) todayCellPosition = { r, c };
                 const dayPeakSignal = getDayPeakSignal(stats, monthPeakStats);
                 if (dayPeakSignal.type) {
                     peakCellPositions.push({ r, c, type: dayPeakSignal.type });
                 }
-                const richCell = buildCalendarCellRichText(dateKey, stats, dateKey === todayKey, dayPeakSignal);
+                const richCell = buildCalendarCellRichText(dateKey, stats, dateKey === todayKey);
                 updates.push({
                     range: `${SHEET_TITLE}!${colToA1(c)}${r + 1}`,
                     values: [[richCell.text]],
@@ -1849,14 +1920,14 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
         updates.push({
             range: `${SHEET_TITLE}!A${weeklyRow + 2}:H${weeklyRow + 2}`,
             values: [[
-                "\uc8fc \uc2dc\uc791\uc77c",
-                "\uc8fc \uc885\ub8cc\uc77c",
-                "\ud655\uc815 \uccad\uc18c",
-                "\ub0a8\uc740 \uc8fc\ub0b4 \ucd94\uac00\uac00\ub2a5 CO",
-                "\ud655\uc815 \ud53c\ud06c\uc77c",
-                "\ud53c\ud06c \ub300\uc751",
-                "\uc8fc\uac04 \ud655\ubcf4\ud480",
-                "\ud655\uc815 \uc778\uac74\ube44",
+                "주 시작일",
+                "주 종료일",
+                "확정 청소",
+                "체크아웃 가능",
+                "피크일",
+                "최소필요인원",
+                "대기 필요인원",
+                "확정 인건비",
             ]],
         });
         const lastDataRow = weeklyRow + 2 + Math.max(weekRows.length, 1);
@@ -1889,7 +1960,7 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
                 },
             },
             {
-                // C(확정청소), D(주내추가가능CO): NUMBER
+                // C(확정 청소), D(체크아웃 가능): NUMBER
                 repeatCell: {
                     range: {
                         sheetId: layoutSheetId,
@@ -1903,7 +1974,7 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
                 },
             },
             {
-                // E(확정피크일): DATE
+                // E(피크일): DATE
                 repeatCell: {
                     range: {
                         sheetId: layoutSheetId,
@@ -1917,7 +1988,7 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
                 },
             },
             {
-                // F(피크대응), G(주간확보풀): NUMBER
+                // F(최소필요인원), G(대기 필요인원): NUMBER
                 repeatCell: {
                     range: {
                         sheetId: layoutSheetId,
@@ -2648,6 +2719,7 @@ async function runCleaningWorkforceForecastUpdate() {
         todayKey,
         history,
         inventoryByBuilding: inventoryConfig.inventoryByBuilding,
+        roomMap,
     });
 
     const months = [
@@ -2676,7 +2748,7 @@ async function runCleaningWorkforceForecastUpdate() {
     const monthlyData = computeMonthlyMinimumWorkforce(model.daily, months, manualInputs);
     monthlyData.forEach((m) => {
         if (!m) return;
-        console.log(`[forecast] ${m.monthKey} peak=${m.peakOperational}명/일 | 시스템고정=${m.systemFixedStaff}명 | 적용고정=${m.appliedFixedStaff}명 | 보충풀=${m.supportPool}명 | 총확보=${m.monthlyMinWorkforce}명 | 주근무=${m.avgPartTimeDaysPerWeek}일 (peak: ${m.peakDate})`);
+        console.log(`[forecast] ${m.monthKey} peak=${m.peakOperational}명/일 | 확정평균=${m.confirmedNeedAvg?.toFixed(1)}명 | 시스템고정=${m.systemFixedStaff}명 | 적용고정=${m.appliedFixedStaff}명 | 보충풀=${m.supportPool}명 | 총확보=${m.monthlyMinWorkforce}명 | 주근무=${m.avgPartTimeDaysPerWeek}일 (peak: ${m.peakDate})`);
     });
 
     await updateSheetWithForecast(sheets, model, monthlyData, { monthsToEnsure: months, manualInputs, roomMap });

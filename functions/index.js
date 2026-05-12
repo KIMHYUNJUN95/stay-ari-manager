@@ -1,5 +1,6 @@
 const { onRequest } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { onDocumentWritten } = require("firebase-functions/v2/firestore");
 const axios = require("axios");
 const admin = require("firebase-admin");
 const dayjs = require("dayjs");
@@ -46,6 +47,24 @@ let beds24TokenExpiry = 0;
 
 // Firestore 토큰 문서 경로
 const TOKEN_DOC_PATH = "beds24_config/token";
+const RESERVATION_FORECAST_IMPACT_FIELDS = [
+    "arrival",
+    "departure",
+    "status",
+    "room",
+    "roomId",
+    "building",
+    "companyId",
+];
+
+function hasReservationForecastImpactChange(before, after) {
+    if (!before || !after) return true;
+    return RESERVATION_FORECAST_IMPACT_FIELDS.some((field) => {
+        const prev = before[field] ?? null;
+        const next = after[field] ?? null;
+        return prev !== next;
+    });
+}
 
 // API V2 Access Token 발급/갱신 함수 (Firestore 캐싱)
 async function getBeds24Token() {
@@ -7214,5 +7233,23 @@ exports.scheduledCleaningWorkforceForecast = onSchedule({
     timeoutSeconds: 540,
     memory: "1GiB",
 }, async () => {
+    await runCleaningWorkforceForecastUpdate();
+});
+
+exports.syncCleaningWorkforceForecastOnReservationWrite = onDocumentWritten({
+    document: "reservations/{reservationId}",
+    timeoutSeconds: 540,
+    memory: "1GiB",
+}, async (event) => {
+    const before = event.data?.before?.exists ? event.data.before.data() : null;
+    const after = event.data?.after?.exists ? event.data.after.data() : null;
+
+    if (!hasReservationForecastImpactChange(before, after)) return;
+
+    const targetCompanyId = (after && after.companyId) || (before && before.companyId) || DEFAULT_COMPANY_ID;
+    if (targetCompanyId !== DEFAULT_COMPANY_ID) return;
+
+    const reservationId = event.params?.reservationId || "-";
+    console.log(`[forecast-trigger] reservation write detected: ${reservationId}`);
     await runCleaningWorkforceForecastUpdate();
 });

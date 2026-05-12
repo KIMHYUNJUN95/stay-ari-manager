@@ -85,6 +85,42 @@ const PREFERRED_DUAL_ROOM_IDS = {
 };
 const PRICE_INTERVENTION_LIMIT = 400;
 const CALENDAR_NUMERIC_FONT_FAMILY = '"Bahnschrift", "DIN Alternate", "Inter", "Aptos", "Segoe UI", sans-serif';
+const EMPTY_CELL_STATE = { hasReservation: false, hasBlockingReservation: false, isFullyOccupied: false, isGap: false };
+
+function buildReservationSignature(list) {
+  return list
+    .map((r) => [
+      r.id || "",
+      r.bookId || "",
+      r.building || "",
+      r.room || "",
+      r.roomId || "",
+      r.arrival || "",
+      r.departure || "",
+      r.status || "",
+      r.platform || "",
+      r.referer || "",
+      r.channel || "",
+      r.guestName || "",
+      r.isExternalInventoryBlock ? "1" : "0",
+      r.isInventoryOverrideBlock ? "1" : "0",
+      r.lastEventAt || "",
+      r.updatedAt?.seconds ?? r.updatedAt ?? "",
+      r.totalPrice ?? "",
+      r.price ?? "",
+      r.netRevenue ?? "",
+      r.commission ?? "",
+      r.currency || "",
+      r.payout ?? "",
+      r.cleaningFee ?? "",
+      r.accommodationFare ?? "",
+      r.modifiedAt?.seconds ?? r.modifiedAt ?? "",
+      r.createdAt?.seconds ?? r.createdAt ?? ""
+    ].join("\x1F"))
+    .sort()
+    .join("\x1E");
+}
+const EMPTY_PRICE_CELL = { displayRoomInfos: [], allRoomInfosForDate: [], airbnbPrice: 0, bookingPrice: 0, minStay: 0, hasError: false, errorMsg: "", lastModInfo: null, isPendingPriceCell: false };
 
 function pickPreferredRoomInfo(buildingName, roomName, roomInfos) {
   const preferredRoomId = PREFERRED_DUAL_ROOM_IDS[`${buildingName}__${roomName}`];
@@ -2593,45 +2629,26 @@ function calculateBuildingMetricsForRange(targetReservations, targetRooms, range
 
   const rangeEndExclusive = rangeEnd.add(1, "day");
   const rangeDays = rangeEnd.diff(rangeStart, "day") + 1;
-  let occupiedSlot = 0;
-
-  uniqueRoomNames.forEach(roomName => {
-    const roomRes = targetReservations.filter(r => r.room === roomName && r.status === "confirmed");
-    const occupiedSet = new Set();
-
-    roomRes.forEach(r => {
-      if (!r.arrival || !r.departure) return;
-      const arrivalDate = dayjs(r.arrival).startOf("day");
-      const departureDate = dayjs(r.departure).startOf("day");
-      if (!arrivalDate.isValid() || !departureDate.isValid()) return;
-
-      const effectiveStart = arrivalDate.isAfter(rangeStart) ? arrivalDate : rangeStart;
-      const effectiveEnd = departureDate.isBefore(rangeEndExclusive) ? departureDate : rangeEndExclusive;
-      if (!effectiveEnd.isAfter(effectiveStart)) return;
-
-      for (let d = effectiveStart; d.isBefore(effectiveEnd); d = d.add(1, "day")) {
-        occupiedSet.add(d.format("YYYY-MM-DD"));
-      }
-    });
-
-    occupiedSlot += occupiedSet.size;
-  });
-
-  const totalSlot = uniqueRoomNames.length * rangeDays;
-  const occupancyRate = totalSlot > 0 ? (occupiedSlot / totalSlot) * 100 : 0;
-  const vacantNights = Math.max(0, totalSlot - occupiedSlot);
-
-  let totalRevenue = 0;
   const todayStr = dayjs().format("YYYY-MM-DD");
+
+  // 객실별 occupiedSet + 오늘 재실 + totalRevenue를 단일 순회로 수집
+  const occupiedSetByRoom = {};
+  uniqueRoomNames.forEach(name => { occupiedSetByRoom[name] = new Set(); });
+
+  const uniqueRoomNameSet = new Set(uniqueRoomNames);
   const roomNamesWithReservationToday = new Set();
-  targetReservations.forEach(r => {
-    if (r.status === "confirmed" && r.arrival <= todayStr && r.departure > todayStr) {
-      roomNamesWithReservationToday.add(r.room);
-    }
-  });
+  let totalRevenue = 0;
 
   targetReservations.forEach(r => {
     if (r.status !== "confirmed" || !r.arrival || !r.departure) return;
+
+    const inRoomCatalog = uniqueRoomNameSet.has(r.room);
+
+    // 오늘 재실: 객실 카탈로그 소속인 경우만 emptyRoomsToday에 영향
+    if (inRoomCatalog && r.arrival <= todayStr && r.departure > todayStr) {
+      roomNamesWithReservationToday.add(r.room);
+    }
+
     const arrivalDate = dayjs(r.arrival).startOf("day");
     const departureDate = dayjs(r.departure).startOf("day");
     if (!arrivalDate.isValid() || !departureDate.isValid()) return;
@@ -2640,6 +2657,17 @@ function calculateBuildingMetricsForRange(targetReservations, targetRooms, range
     const effectiveEnd = departureDate.isBefore(rangeEndExclusive) ? departureDate : rangeEndExclusive;
     if (!effectiveEnd.isAfter(effectiveStart)) return;
 
+    // 객실별 점유 날짜 누적: 카탈로그 소속 객실만 occupiedDays에 반영
+    if (inRoomCatalog) {
+      const roomSet = occupiedSetByRoom[r.room];
+      if (roomSet) {
+        for (let d = effectiveStart; d.isBefore(effectiveEnd); d = d.add(1, "day")) {
+          roomSet.add(d.format("YYYY-MM-DD"));
+        }
+      }
+    }
+
+    // 수익: 카탈로그 소속 여부 무관하게 모든 확정 예약 포함 (이전 동작 유지)
     const visibleNights = effectiveEnd.diff(effectiveStart, "day");
     const totalReservationNights = Math.max(1, departureDate.diff(arrivalDate, "day"));
     const val = parseFloat(r.totalPrice) || parseFloat(r.price) || parseFloat(r.netRevenue) || 0;
@@ -2647,6 +2675,13 @@ function calculateBuildingMetricsForRange(targetReservations, targetRooms, range
       totalRevenue += (val / totalReservationNights) * visibleNights;
     }
   });
+
+  let occupiedSlot = 0;
+  uniqueRoomNames.forEach(name => { occupiedSlot += occupiedSetByRoom[name].size; });
+
+  const totalSlot = uniqueRoomNames.length * rangeDays;
+  const occupancyRate = totalSlot > 0 ? (occupiedSlot / totalSlot) * 100 : 0;
+  const vacantNights = Math.max(0, totalSlot - occupiedSlot);
 
   return {
     occupancyRate,
@@ -2902,6 +2937,7 @@ function BuildingCalendar() {
   const priceFetchRequestIdRef = useRef(0);
   const fetchPricesRef = useRef(null);
   const isMountedRef = useRef(true); // unmount 후 상태 오염 방지
+  const lastReservationSignatureRef = useRef("");
   const [lastPriceSyncByBuilding, setLastPriceSyncByBuilding] = useState({}); // 건물별 마지막 동기화 시각
   const selectedCellKeySetRef = useRef(new Set());
   const [viewMode, setViewMode] = useState("monthly"); // "monthly" | "rolling"
@@ -3050,6 +3086,64 @@ function BuildingCalendar() {
     setSelectedCells(prev => prev.filter(c => !(c.room === roomName && c.date === dateStr)));
   }, [getSelectedCellKey]);
 
+  const pendingSelectionOpsRef = useRef([]);
+  const selectionFlushFrameRef = useRef(null);
+
+  const clearQueuedCellSelection = useCallback(() => {
+    if (selectionFlushFrameRef.current !== null) {
+      cancelAnimationFrame(selectionFlushFrameRef.current);
+      selectionFlushFrameRef.current = null;
+    }
+    pendingSelectionOpsRef.current = [];
+  }, []);
+
+  const clearCellSelection = useCallback(() => {
+    clearQueuedCellSelection();
+    selectedCellKeySetRef.current = new Set();
+    setSelectedCells([]);
+  }, [clearQueuedCellSelection]);
+
+  const queueCellSelection = useCallback((roomName, dateStr, action) => {
+    const cellKey = getSelectedCellKey(roomName, dateStr);
+    if (action === 'select') {
+      if (selectedCellKeySetRef.current.has(cellKey)) return;
+      selectedCellKeySetRef.current.add(cellKey);
+    } else {
+      if (!selectedCellKeySetRef.current.has(cellKey)) return;
+      selectedCellKeySetRef.current.delete(cellKey);
+    }
+    pendingSelectionOpsRef.current.push({ room: roomName, date: dateStr, action });
+    if (selectionFlushFrameRef.current !== null) return;
+    selectionFlushFrameRef.current = requestAnimationFrame(() => {
+      selectionFlushFrameRef.current = null;
+      const ops = pendingSelectionOpsRef.current;
+      pendingSelectionOpsRef.current = [];
+      if (!ops.length) return;
+      // 같은 프레임 내 동일 셀의 중복 액션 → 마지막 액션만 유효
+      const latestOpByKey = new Map();
+      ops.forEach(({ room: r, date: d, action: a }) => {
+        latestOpByKey.set(getSelectedCellKey(r, d), { room: r, date: d, action: a });
+      });
+
+      setSelectedCells(prev => {
+        const removeKeys = new Set();
+        const additionByKey = new Map();
+        latestOpByKey.forEach((op, key) => {
+          if (op.action === 'select') {
+            additionByKey.set(key, { room: op.room, date: op.date });
+          } else {
+            removeKeys.add(key);
+          }
+        });
+        const base = prev.filter(c => {
+          const k = getSelectedCellKey(c.room, c.date);
+          return !removeKeys.has(k) && !additionByKey.has(k);
+        });
+        return additionByKey.size > 0 ? [...base, ...additionByKey.values()] : base;
+      });
+    });
+  }, [getSelectedCellKey]);
+
   const clearPendingPriceJob = useCallback((jobId) => {
     setPendingPriceJobs(prev => {
       if (!prev[jobId]) return prev;
@@ -3070,6 +3164,32 @@ function BuildingCalendar() {
     });
   }, [companyId]);
 
+  const refreshCompletedPriceJob = useCallback((jobId, building, attempt = 0) => {
+    if (!building || !fetchPricesRef.current) {
+      clearPendingPriceJob(jobId);
+      return;
+    }
+
+    fetchPricesRef.current(true, building, (didApplyFreshPriceData) => {
+      if (didApplyFreshPriceData) {
+        clearPendingPriceJob(jobId);
+        return;
+      }
+
+      if (!pendingPriceJobsRef.current[jobId]) return;
+      if (attempt >= 4) {
+        console.warn("[PriceJob] Fresh price data was not available after retries; clearing pending state.", jobId);
+        clearPendingPriceJob(jobId);
+        return;
+      }
+
+      setTimeout(() => {
+        if (!pendingPriceJobsRef.current[jobId]) return;
+        refreshCompletedPriceJob(jobId, building, attempt + 1);
+      }, 3000);
+    });
+  }, [clearPendingPriceJob]);
+
   const handlePendingPriceJobUpdate = useCallback((jobId, data = {}) => {
     const existingJob = pendingPriceJobsRef.current[jobId];
     if (!existingJob) return;
@@ -3089,22 +3209,30 @@ function BuildingCalendar() {
       return;
     }
 
-    if (nextStatus === "completed" || nextStatus === "failed" || nextStatus === "partial_failed") {
-      clearPendingPriceJob(jobId);
-      if (nextStatus === "completed") {
-        setPriceJobToast({ status: "success", message: `Price update completed. (${existingJob.roomCount} rooms)` });
-      } else if (nextStatus === "partial_failed") {
+    if (nextStatus === "completed") {
+      setPriceJobToast({ status: "success", message: `Price update completed. (${existingJob.roomCount} rooms)` });
+      if (existingJob.building && fetchPricesRef.current) {
+        // completed는 fresh priceData가 실제 반영된 뒤 pending 제거. noCache/fetch 실패면 짧게 재시도한다.
+        refreshCompletedPriceJob(jobId, existingJob.building);
+      } else {
+        clearPendingPriceJob(jobId);
+      }
+      return;
+    }
+
+    if (nextStatus === "failed" || nextStatus === "partial_failed") {
+      if (nextStatus === "partial_failed") {
         const failList = (data.failedRoomIds || []).join(", ");
         setPriceJobToast({ status: "partial", message: failList ? `Partially completed. Failed roomId: ${failList}` : "Partially completed. Please review the affected rooms." });
       } else {
         setPriceJobToast({ status: "error", message: `Price update failed: ${data.error || "Unknown error"}` });
       }
-      if (existingJob.building) {
-        fetchPricesRef.current && fetchPricesRef.current(true, existingJob.building);
+      clearPendingPriceJob(jobId);
+      if (existingJob.building && fetchPricesRef.current) {
+        fetchPricesRef.current(true, existingJob.building);
       }
       return;
     }
-
     const nextFailedRoomIds = data.failedRoomIds || existingJob.failedRoomIds || [];
     const nextError = data.error || existingJob.error || null;
     const sameFailedRoomIds = JSON.stringify(existingJob.failedRoomIds || []) === JSON.stringify(nextFailedRoomIds || []);
@@ -3123,7 +3251,7 @@ function BuildingCalendar() {
           }
         })
       : prev);
-  }, [clearPendingPriceJob]);
+  }, [clearPendingPriceJob, refreshCompletedPriceJob]);
 
   useEffect(() => {
     return () => {
@@ -3133,6 +3261,11 @@ function BuildingCalendar() {
         } catch (_) {}
       });
       priceJobListenersRef.current = {};
+      if (selectionFlushFrameRef.current !== null) {
+        cancelAnimationFrame(selectionFlushFrameRef.current);
+        selectionFlushFrameRef.current = null;
+        pendingSelectionOpsRef.current = [];
+      }
     };
   }, []);
 
@@ -3319,7 +3452,7 @@ function BuildingCalendar() {
   const pendingPriceCellMap = useMemo(() => {
     const cellMap = {};
     pendingPriceJobList
-      .filter((job) => job.building === selectedBuilding)
+      .filter((job) => job.building === calendarBuilding)
       .sort((a, b) => (a.createdAtMs || 0) - (b.createdAtMs || 0))
       .forEach((job) => {
         Object.entries(job.pendingCells || {}).forEach(([cellKey, cellData]) => {
@@ -3327,7 +3460,7 @@ function BuildingCalendar() {
         });
       });
     return cellMap;
-  }, [pendingPriceJobList, selectedBuilding]);
+  }, [pendingPriceJobList, calendarBuilding]);
 
   // 뷰 모드에 따른 표시할 날짜 계산
   const displayDays = useMemo(() => {
@@ -3737,7 +3870,7 @@ function BuildingCalendar() {
       setSelectedReservation(null);
     }
     setSelectedRoom(null);
-    setSelectedCells([]); // 초기화
+    clearCellSelection(); // 초기화
     setSelectionStart(null); // 드래그 선택 중이었다면 초기화
     setHoveredDay(null);
     setHoveredRoom(null);
@@ -3766,7 +3899,7 @@ function BuildingCalendar() {
       // gap edit 모드 진입 시 예약 상세 모달 닫기
       setSelectedReservation(null);
     }
-    setSelectedCells([]);
+    clearCellSelection();
     setSelectedRoom(null);
     setSelectionStart(null);
     setHoveredDay(null);
@@ -3794,11 +3927,11 @@ function BuildingCalendar() {
   const toggleVacantOnlyMode = useCallback(() => {
     setVacantOnlyMode((prev) => !prev);
     setSelectedRoom(null);
-    setSelectedCells([]);
+    clearCellSelection();
     setSelectionStart(null);
     setHoveredDay(null);
     setHoveredRoom(null);
-  }, []);
+  }, [clearCellSelection]);
 
   // 객실 선택 토글
   const toggleRoomSelection = (room) => {
@@ -3975,7 +4108,7 @@ function BuildingCalendar() {
       // 같은 날짜 두 번째 클릭 = 0박이면 선택 취소하고 정리
       if (checkIn.isSame(checkOut, 'day')) {
         setSelectionStart(null);
-        setSelectedCells([]);
+        clearCellSelection();
         setHoveredDay(null);
         setHoveredRoom(null);
         return;
@@ -4025,7 +4158,7 @@ function BuildingCalendar() {
   };
 
   // 가격 데이터 조회 (Firestore 캐시에서 가져옴 - API 직접 호출 안함)
-  const fetchPrices = useCallback(async (forceRefresh = false, buildingOverride = null) => {
+  const fetchPrices = useCallback(async (forceRefresh = false, buildingOverride = null, onSettled = null) => {
     const targetBuilding = buildingOverride || selectedBuildingRef.current;
     if (!targetBuilding || targetBuilding === "전체") return; // 전체 보기에서는 가격 조회 안함
     const requestDateFrom = gapCoverageDays[0]?.dateStr || null;
@@ -4057,6 +4190,7 @@ function BuildingCalendar() {
     pricesLoadingRef.current = true;
     setPricesLoading(true);
     const fetchBuilding = targetBuilding;
+    let didApplyFreshPriceData = false;
     try {
       // Firestore 캐시에서 가져옴 (Beds24 API 호출 안함)
       const response = await fetch(`${API_BASE_URL}/getCachedPrices`, {
@@ -4084,6 +4218,7 @@ function BuildingCalendar() {
           ...prev,
           [fetchBuilding]: data.lastSync ? new Date(data.lastSync) : new Date()
         }));
+        didApplyFreshPriceData = true;
       } else if (data.noCache) {
         // noCache는 에러가 아님 — pricesError 올리지 않음
         console.warn("Price cache unavailable, waiting for sync...");
@@ -4111,9 +4246,9 @@ function BuildingCalendar() {
         if (priceFetchControllerRef.current === controller) {
           priceFetchControllerRef.current = null;
         }
+        // pending 상태 제거는 새 가격이 실제로 적용된 경우에만 실행
+        if (onSettled) onSettled(didApplyFreshPriceData);
       }
-
-      // pending 작업이 있으면 즉시 실행
     }
   }, [companyId, gapCoverageDays, hasVisiblePriceCoverage, updatePriceCache]);
 
@@ -4147,8 +4282,8 @@ function BuildingCalendar() {
       setGapEditMode(false);
     }
     setSelectedRoom(null);
-    setSelectedCells([]);
-  }, [selectedBuilding]);
+    clearCellSelection();
+  }, [selectedBuilding, clearCellSelection]);
 
   // 블록 데이터 조회 함수
   const fetchBlockData = useCallback(async () => {
@@ -4391,10 +4526,12 @@ function BuildingCalendar() {
     }
 
     setLoading(true);
+    lastReservationSignatureRef.current = ""; // 구독 재시작 시 stale signature 초기화
 
     let retryCount = 0;
     let retryTimerId = null;
     let q2FallbackTimerId = null;
+    let applyFilterFrameId = null;
     // Q1/Q2 동시 에러 시 retry가 중복 예약되지 않도록 guard
     let isRetryScheduled = false;
 
@@ -4421,8 +4558,23 @@ function BuildingCalendar() {
           if (!r.arrival || !r.departure) return false;
           return r.arrival <= extendedRangeEnd && r.departure >= extendedRangeStart;
         });
+        const sig = buildReservationSignature(filtered);
+        if (sig === lastReservationSignatureRef.current) {
+          setLoading(false);
+          return;
+        }
+        lastReservationSignatureRef.current = sig;
         setReservations(filtered);
         setLoading(false);
+      };
+
+      // q1/q2/qLong 동시 snapshot 이벤트를 1 rAF 로 묶어 setReservations 호출 횟수 감소
+      const scheduleApplyFilter = () => {
+        if (applyFilterFrameId !== null) return;
+        applyFilterFrameId = requestAnimationFrame(() => {
+          applyFilterFrameId = null;
+          applyFilter();
+        });
       };
 
       // 에러 시 지수 백오프 재구독 — isRetryScheduled로 Q1/Q2 동시 에러도 1회만 처리
@@ -4472,7 +4624,7 @@ function BuildingCalendar() {
               }
             });
             qLongDocs = nextLongMap;
-            applyFilter();
+            scheduleApplyFilter();
           }).catch((err) => onError(err));
         } else {
           onError(error);
@@ -4492,7 +4644,7 @@ function BuildingCalendar() {
         q2Docs = snap.docs
           .map((d) => ({ id: d.id, ...d.data() }))
           .filter((r) => r.arrival && r.arrival >= extendedRangeStart && r.arrival <= extendedRangeEnd);
-        applyFilter();
+        scheduleApplyFilter();
       };
 
       const scheduleQ2FallbackRefresh = () => {
@@ -4552,19 +4704,19 @@ function BuildingCalendar() {
 
       const unsub1 = onSnapshot(q1, (snap) => {
         q1Docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        applyFilter();
+        scheduleApplyFilter();
       }, onError);
 
       const unsub2 = onSnapshot(q2, (snap) => {
         q2Docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        applyFilter();
+        scheduleApplyFilter();
       }, onQ2Error);
 
       const unsubLong = onSnapshot(qLong, (snap) => {
         const newMap = new Map();
         snap.docs.forEach(d => newMap.set(d.id, { id: d.id, ...d.data() }));
         qLongDocs = newMap;
-        applyFilter();
+        scheduleApplyFilter();
       }, onQLongError);
 
       reservationUnsubRef.current = () => {
@@ -4582,6 +4734,10 @@ function BuildingCalendar() {
       if (reservationUnsubRef.current) {
         try { reservationUnsubRef.current(); } catch (_) {}
         reservationUnsubRef.current = null;
+      }
+      if (applyFilterFrameId !== null) {
+        cancelAnimationFrame(applyFilterFrameId);
+        applyFilterFrameId = null;
       }
     };
   // fetchReservations는 에러 최종 fallback 전용 — portfolioAnalysisRange 변경이 이 effect를 불필요하게 트리거하지 않도록 의존성 제외
@@ -5190,6 +5346,89 @@ function BuildingCalendar() {
     return set;
   }, [rooms, roomAllReservationsMap, stableDisplayDays, gapInfoByCellKey, selectedBuilding]);
 
+  const calendarCellStateMap = useMemo(() => {
+    const map = {};
+    visibleRooms.forEach((room) => {
+      const roomReservations = roomReservationsMap[room] || [];
+      stableDisplayDays.forEach((dayInfo) => {
+        const { dateStr } = dayInfo;
+        const cellKey = getSelectedCellKey(room, dateStr);
+        const hasReservation = roomReservations.some(r => dateStr >= r.arrival && dateStr < r.departure);
+        const hasBlockingReservation = roomReservations.some(r =>
+          dateStr >= r.arrival &&
+          dateStr < r.departure &&
+          r.status !== "cancelled" &&
+          r.status !== "blackout" &&
+          !r.isExternalInventoryBlock &&
+          !r.isInventoryOverrideBlock
+        );
+        const isFullyOccupied = hasReservation;
+        const isGap = !isFullyOccupied && gapCellSet.has(`${room}__${dateStr}`);
+        map[cellKey] = { hasReservation, hasBlockingReservation, isFullyOccupied, isGap };
+      });
+    });
+    return map;
+  }, [visibleRooms, stableDisplayDays, roomReservationsMap, gapCellSet, getSelectedCellKey]);
+
+  const calendarPriceCellMap = useMemo(() => {
+    const map = {};
+    visibleRooms.forEach((room) => {
+      const allRoomInfosForDate = roomCatalogByName[room] || [];
+      stableDisplayDays.forEach((dayInfo) => {
+        const { dateStr } = dayInfo;
+        const dateKey = dateStr.replace(/-/g, "");
+        const cellKey = getSelectedCellKey(room, dateStr);
+        const displayRoomInfos = getDisplayUnitInfosForDate(room, dateStr);
+        const mergedChannelPrices = getMergedRoomChannelPrices({
+          primaryUnitInfos: displayRoomInfos,
+          fallbackUnitInfos: allRoomInfosForDate,
+          roomPrices,
+          dateKey
+        });
+        let airbnbPrice = mergedChannelPrices.airbnbPrice;
+        let bookingPrice = mergedChannelPrices.bookingPrice;
+        let minStay = 0;
+        let hasError = mergedChannelPrices.hasError;
+        let errorMsg = mergedChannelPrices.errorMsg;
+        let lastModInfo = null;
+
+        displayRoomInfos.forEach(info => {
+          const roomPriceData = roomPrices[info.roomId];
+          if (roomPriceData?.dates?.error && !hasError) {
+            hasError = true;
+            errorMsg = roomPriceData.dates.error;
+          }
+          const priceInfo = roomPriceData?.dates?.[dateKey];
+          if (priceInfo) {
+            const ms = parseInt(priceInfo.m, 10);
+            if (Number.isFinite(ms) && ms >= 1 && ms < INACTIVE_MINSTAY_THRESHOLD && (minStay === 0 || ms < minStay)) minStay = ms;
+            if (priceInfo.lm) {
+              lastModInfo = pickNewerLm(priceInfo.lm, lastModInfo);
+            }
+          }
+        });
+
+        if (!lastModInfo) {
+          for (const info of allRoomInfosForDate) {
+            const lm = roomPrices?.[info.roomId]?.dates?.[dateKey]?.lm;
+            if (lm) {
+              lastModInfo = pickNewerLm(lm, lastModInfo);
+            }
+          }
+        }
+
+        const pendingPriceCell = pendingPriceCellMap[cellKey];
+        const isPendingPriceCell = !!pendingPriceCell;
+        if (isPendingPriceCell && pendingPriceCell.airbnbPrice > 0) {
+          airbnbPrice = pendingPriceCell.airbnbPrice;
+        }
+
+        map[cellKey] = { displayRoomInfos, allRoomInfosForDate, airbnbPrice, bookingPrice, minStay, hasError, errorMsg, lastModInfo, isPendingPriceCell };
+      });
+    });
+    return map;
+  }, [visibleRooms, stableDisplayDays, roomCatalogByName, roomPrices, pendingPriceCellMap, getSelectedCellKey, getDisplayUnitInfosForDate]);
+
   // [Single View] 건물 통계 데이터 계산
   const analysis = useMemo(() => {
     const roomObjects = rooms.map(r => ({ name: r }));
@@ -5197,28 +5436,58 @@ function BuildingCalendar() {
   }, [calendarReservations, rooms, daysInMonth, year, month]);
 
   // [전체 뷰] 건물별 타입별 분석 데이터 (아래 렌더에서 직접 계산 방식)
+  const shouldComputePortfolioMetrics = selectedBuilding === "전체" && !priceMode;
+
   const allBuildingMetrics = useMemo(() => {
-    if (selectedBuilding !== '전체') return null;
+    if (!shouldComputePortfolioMetrics) return null;
+
+    // 예약을 건물/객실 기준으로 한 번만 인덱싱 (반복 filter 제거)
+    const reservationsByBuilding = {};
+    const reservationsByBuildingRoom = {};
+    calendarReservations.forEach((r) => {
+      const b = r.building;
+      if (!b) return;
+      if (!reservationsByBuilding[b]) reservationsByBuilding[b] = [];
+      reservationsByBuilding[b].push(r);
+      if (r.room) {
+        const k = `${b}__${r.room}`;
+        if (!reservationsByBuildingRoom[k]) reservationsByBuildingRoom[k] = [];
+        reservationsByBuildingRoom[k].push(r);
+      }
+    });
+
     const result = {};
     ACTIVE_BUILDING_ORDER.forEach(bName => {
-      const bReservations = calendarReservations.filter(r => r.building === bName);
+      const bReservations = reservationsByBuilding[bName] || [];
       const bRooms = BUILDING_ROOMS[bName] || [];
+
+      // 객실 ID를 이름별로 한 번만 그룹핑
+      const roomInfosByName = {};
+      bRooms.forEach((info) => {
+        if (!info.name) return;
+        if (!roomInfosByName[info.name]) roomInfosByName[info.name] = [];
+        roomInfosByName[info.name].push(info);
+      });
+
       result[bName] = {
         metrics: calculateBuildingMetricsForRange(bReservations, bRooms, portfolioAnalysisRange.startDate, portfolioAnalysisRange.endDate),
         roomMetrics: {}
       };
       const uniqueRoomNames = [...new Set(bRooms.map(r => r.name))];
       uniqueRoomNames.forEach(roomName => {
-        const rReservations = bReservations.filter(r => r.room === roomName);
-        const roomInfosForName = bRooms.filter(r => r.name === roomName);
+        const rReservations = reservationsByBuildingRoom[`${bName}__${roomName}`] || [];
+        const roomInfosForName = roomInfosByName[roomName] || [];
         result[bName].roomMetrics[roomName] = calculateBuildingMetricsForRange(rReservations, roomInfosForName, portfolioAnalysisRange.startDate, portfolioAnalysisRange.endDate);
       });
     });
     return result;
-  }, [calendarReservations, selectedBuilding, portfolioAnalysisRange.startDate, portfolioAnalysisRange.endDate]);
+  }, [shouldComputePortfolioMetrics, calendarReservations, portfolioAnalysisRange.startDate, portfolioAnalysisRange.endDate]);
 
   // ✅ min/maxPrice 계산은 별도로 처리 (API 데이터 기반)
+  const shouldComputeSingleBuildingAnalytics = selectedBuilding !== "전체";
+
   const priceStats = useMemo(() => {
+    if (!shouldComputeSingleBuildingAnalytics) return { minPrice: 0, maxPrice: 0 };
     let minPrice = Infinity;
     let maxPrice = 0;
     if (calendarBuilding && calendarBuilding !== '전체') {
@@ -5247,12 +5516,12 @@ function BuildingCalendar() {
       }
     }
     return { minPrice: minPrice === Infinity ? 0 : minPrice, maxPrice };
-  }, [calendarBuilding, roomReservationsMap, rooms, stableDisplayDays, roomPrices, getActiveUnitInfosForDate]);
+  }, [shouldComputeSingleBuildingAnalytics, calendarBuilding, roomReservationsMap, rooms, stableDisplayDays, roomPrices, getActiveUnitInfosForDate]);
 
   // analysis 객실에 min/max 업데이트 (Single View 전용 편의)
   const singleAnalysis = { ...analysis, ...priceStats };
   const weekdayWeekendRateSummary = useMemo(() => {
-    if (!calendarBuilding || calendarBuilding === "전체" || stableDisplayDays.length === 0) {
+    if (!shouldComputeSingleBuildingAnalytics || !calendarBuilding || calendarBuilding === "전체" || stableDisplayDays.length === 0) {
       return {
         weekdayAvg: 0,
         weekendAvg: 0,
@@ -5297,7 +5566,7 @@ function BuildingCalendar() {
       weekdayCells,
       weekendCells
     };
-  }, [calendarBuilding, stableDisplayDays, rooms, getActiveUnitInfosForDate, roomPrices]);
+  }, [shouldComputeSingleBuildingAnalytics, calendarBuilding, stableDisplayDays, rooms, getActiveUnitInfosForDate, roomPrices]);
   const displayedAvgPrice = useMemo(() => {
     const totalCells = weekdayWeekendRateSummary.weekdayCells + weekdayWeekendRateSummary.weekendCells;
     if (totalCells <= 0) return 0;
@@ -5308,6 +5577,7 @@ function BuildingCalendar() {
   }, [weekdayWeekendRateSummary]);
   const displayedVsBookedGap = displayedAvgPrice - (singleAnalysis?.avgPrice || 0);
   const priceInsightSummary = useMemo(() => {
+    if (!showPriceInsightModal) return { byBuilding: {} };
     const BUCKET_UNIT = 1000;
     const MIN_EXPOSURE = 4;
     const todayStr = dayjs().format("YYYY-MM-DD");
@@ -5391,7 +5661,7 @@ function BuildingCalendar() {
     });
 
     return { byBuilding };
-  }, [stableDisplayDays, reservations, roomPrices]);
+  }, [showPriceInsightModal, stableDisplayDays, reservations, roomPrices]);
   const commissionSummary = useMemo(() => {
     if (!calendarBuilding || calendarBuilding === "전체") return { airbnb: 0, booking: 0, total: 0 };
     const buildingReservations = calendarReservations.filter((reservation) => reservation.building === calendarBuilding);
@@ -5403,7 +5673,7 @@ function BuildingCalendar() {
     return calculateArrivalCountSummary(buildingReservations, stableDisplayDays);
   }, [calendarBuilding, calendarReservations, stableDisplayDays]);
   const futureVacancySummary = useMemo(() => {
-    if (!calendarBuilding || calendarBuilding === "전체") return { vacantRoomNights: 0, totalRoomNights: 0, days: 0, avgVacantRooms: 0 };
+    if (!shouldComputeSingleBuildingAnalytics || !calendarBuilding || calendarBuilding === "전체") return { vacantRoomNights: 0, totalRoomNights: 0, days: 0, avgVacantRooms: 0 };
 
     const todayStr = dayjs().format("YYYY-MM-DD");
     const futureDays = stableDisplayDays.filter((dayInfo) => dayInfo.dateStr >= todayStr);
@@ -5432,7 +5702,7 @@ function BuildingCalendar() {
       days: futureDays.length,
       avgVacantRooms: futureDays.length > 0 ? vacantRoomNights / futureDays.length : 0
     };
-  }, [calendarBuilding, stableDisplayDays, roomReservationsMap, rooms]);
+  }, [shouldComputeSingleBuildingAnalytics, calendarBuilding, stableDisplayDays, roomReservationsMap, rooms]);
 
 
 
@@ -5459,6 +5729,33 @@ function BuildingCalendar() {
     });
     return { laneByKey, maxByRoom };
   }, [showCancelled, roomReservationsMapVisual]);
+
+  const reservationOverlapMetaMap = useMemo(() => {
+    const map = {};
+    Object.entries(roomReservationsMap).forEach(([room, reservations]) => {
+      const nonCancelled = reservations.filter(r => r.status !== 'cancelled');
+      // Sort once per room — overlapGroup retains this order, no re-sort needed
+      const sorted = [...nonCancelled].sort((a, b) =>
+        a.arrival < b.arrival ? -1 : a.arrival > b.arrival ? 1 :
+        (a.bookId || a.id || '') < (b.bookId || b.id || '') ? -1 : 1
+      );
+      sorted.forEach(reservation => {
+        const overlapGroup = [];
+        for (const r of sorted) {
+          // Early exit: sorted by arrival, so once r.arrival >= reservation.departure no more overlaps
+          if (r.arrival >= reservation.departure) break;
+          if (r.departure > reservation.arrival) overlapGroup.push(r);
+        }
+        const totalCount = overlapGroup.length;
+        const overlapIndex = overlapGroup.findIndex(r =>
+          (r.bookId || r.id) === (reservation.bookId || reservation.id)
+        );
+        const key = `${room}\x1F${reservation.bookId || reservation.id || `${reservation.arrival}\x1F${reservation.departure}\x1F${reservation.status || ""}`}`;
+        map[key] = { totalCount, barIndex: overlapIndex >= 0 ? overlapIndex : 0 };
+      });
+    });
+    return map;
+  }, [roomReservationsMap]);
 
   // 예약 바 렌더
   const renderReservationBar = (reservation) => {
@@ -5552,20 +5849,10 @@ function BuildingCalendar() {
       barIndex = cancelledBarLaneMap.laneByKey[laneKey] ?? 0;
       totalCount = cancelledBarLaneMap.maxByRoom[reservation.room] || 1;
     } else {
-      const overlapGroup = (roomReservationsMap[reservation.room] || []).filter(r =>
-        r.status !== 'cancelled' &&
-        r.arrival < reservation.departure &&
-        r.departure > reservation.arrival
-      );
-      overlapGroup.sort((a, b) =>
-        a.arrival < b.arrival ? -1 : a.arrival > b.arrival ? 1 :
-        (a.bookId || a.id || '') < (b.bookId || b.id || '') ? -1 : 1
-      );
-      totalCount = overlapGroup.length;
-      const overlapIndex = overlapGroup.findIndex(r =>
-        (r.bookId || r.id) === (reservation.bookId || reservation.id)
-      );
-      barIndex = overlapIndex >= 0 ? overlapIndex : 0;
+      const overlapMetaKey = `${reservation.room}\x1F${reservation.bookId || reservation.id || `${reservation.arrival}\x1F${reservation.departure}\x1F${reservation.status || ""}`}`;
+      const overlapMeta = reservationOverlapMetaMap[overlapMetaKey] || { totalCount: 1, barIndex: 0 };
+      totalCount = overlapMeta.totalCount;
+      barIndex = overlapMeta.barIndex;
     }
     const cancelledRoomMax = isCancelled && showCancelled
       ? (cancelledBarLaneMap.maxByRoom[reservation.room] || 1)
@@ -6176,7 +6463,7 @@ function BuildingCalendar() {
             roomPrices={roomPrices}
             onClose={() => setShowPriceModal(false)}
             onSave={() => {
-              setSelectedCells([]);
+              clearCellSelection();
               setSelectedRoom(null);
               updatePriceCache(prev => {
                 const newCache = { ...prev };
@@ -6186,7 +6473,7 @@ function BuildingCalendar() {
               fetchPrices(true, calendarBuilding);
             }}
             onJobQueued={({ jobId, roomCount, pendingCells = [] }) => {
-              setSelectedCells([]);
+              clearCellSelection();
               setSelectedRoom(null);
               const pendingCellsByKey = {};
               pendingCells.forEach((cell) => {
@@ -6225,7 +6512,7 @@ function BuildingCalendar() {
             priceCache={priceCache}
             onClose={() => {
               setShowManualBookingModal(false);
-              setSelectedCells([]);
+              clearCellSelection();
               setSelectedRoom(null);
               setSelectionStart(null);
               setHoveredDay(null);
@@ -6233,7 +6520,7 @@ function BuildingCalendar() {
             }}
             onSave={() => {
               setShowManualBookingModal(false);
-              setSelectedCells([]);
+              clearCellSelection();
               setSelectedRoom(null);
               setSelectionStart(null);
               setHoveredDay(null);
@@ -6583,7 +6870,7 @@ function BuildingCalendar() {
                       // 모달 닫기 및 초기화
                       setShowGapEditModal(false);
                       setGapEditMode(false);
-                      setSelectedCells([]);
+                      clearCellSelection();
                       setSelectedRoom(null);
 
                       // ✅ 4단계: 최신 서버에서 최종 가격 새로고침 (Beds24 실제 상태 반영)
@@ -7042,7 +7329,7 @@ function BuildingCalendar() {
                   if (isAllPropertiesView) {
                     setPriceMode(false);
                     setGapEditMode(false);
-                    setSelectedCells([]);
+                    clearCellSelection();
                     setSelectedRoom(null);
                   }
                   setSelectedBuilding(building);
@@ -7474,7 +7761,7 @@ function BuildingCalendar() {
                               key={`portfolio-price-${building}`}
                               onClick={() => {
                                 setPortfolioPriceBuilding(building);
-                                setSelectedCells([]);
+                                clearCellSelection();
                                 setSelectedRoom(null);
                               }}
                               style={{
@@ -7579,11 +7866,11 @@ function BuildingCalendar() {
                       onClick={() => {
                         if (!gapEditMode) {
                           setGapEditMode(true);
-                          setSelectedCells([]);
+                          clearCellSelection();
                           setSelectedRoom(null);
                         } else {
                           setGapEditMode(false);
-                          setSelectedCells([]);
+                          clearCellSelection();
                           setSelectedRoom(null);
                         }
                       }}
@@ -7854,7 +8141,7 @@ function BuildingCalendar() {
                       {/* Clear Selection */}
                       <button
                         disabled={selectedCells.length === 0}
-                        onClick={() => { setSelectedCells([]); setSelectedRoom(null); }}
+                        onClick={() => { clearCellSelection(); setSelectedRoom(null); }}
                         style={{
                           padding: "8px 12px", borderRadius: "8px",
                           border: "1px solid #E5E7EB", background: "white",
@@ -7936,7 +8223,7 @@ function BuildingCalendar() {
 
                   <div style={{ display: "flex", gap: "10px" }}>
                     <button
-                      onClick={() => { setSelectedCells([]); setSelectedRoom(null); setBulkSelectMsg(''); }}
+                      onClick={() => { clearCellSelection(); setSelectedRoom(null); setBulkSelectMsg(''); }}
                       style={{
                         padding: "10px 18px",
                         borderRadius: "10px",
@@ -8035,7 +8322,7 @@ function BuildingCalendar() {
                     } else {
                       setSelectedBuilding(building);
                     }
-                    setSelectedCells([]);
+                    clearCellSelection();
                     setSelectedRoom(null);
                   }}
                   style={{
@@ -8394,7 +8681,7 @@ function BuildingCalendar() {
             </button>
             {priceMode && (
               <button
-                onClick={() => { setSelectedCells([]); setSelectedRoom(null); }}
+                onClick={() => { clearCellSelection(); setSelectedRoom(null); }}
                 disabled={selectedCells.length === 0}
                 style={{
                   padding: isCalendarFullscreen ? "7px 14px" : "10px 18px",
@@ -8630,7 +8917,7 @@ function BuildingCalendar() {
                 </button>
                 <button
                   disabled={selectedCells.length === 0}
-                  onClick={() => { setSelectedCells([]); setSelectedRoom(null); }}
+                  onClick={() => { clearCellSelection(); setSelectedRoom(null); }}
                   style={{
                     padding: "7px 12px",
                     borderRadius: "8px",
@@ -9267,22 +9554,9 @@ function BuildingCalendar() {
                         // 셀 범위 선택: 해당 셀이 selectedCells에 있는지 확인
                         const isSelected = selectedCellKeySet.has(cellKey);
 
-                        // ✅ room 이름 기준 예약 (생성/수정된 ID 관계없이 방 ID 예약 모두 포함)
-                        const roomReservations = roomReservationsMap[room] || [];
-                        const hasReservation = roomReservations.some(r =>
-                          dateStr >= r.arrival && dateStr < r.departure
-                        );
-                        const hasBlockingReservation = roomReservations.some(r =>
-                          dateStr >= r.arrival &&
-                          dateStr < r.departure &&
-                          r.status !== "cancelled" &&
-                          r.status !== "blackout" &&
-                          !r.isExternalInventoryBlock &&
-                          !r.isInventoryOverrideBlock
-                        );
-                        const isFullyOccupied = hasReservation;
-
-                        const isGap = !isFullyOccupied && gapCellSet.has(`${room}__${dateStr}`);
+                        // ✅ room 이름 기준 예약 — memoized per-cell state (calendarCellStateMap)
+                        const { hasReservation, hasBlockingReservation, isFullyOccupied, isGap } =
+                          calendarCellStateMap[cellKey] || EMPTY_CELL_STATE;
 
                         // 과거 날짜인지 확인
                         const todayDate = new Date();
@@ -9296,56 +9570,9 @@ function BuildingCalendar() {
 
                         const dateKey = dateStr.replace(/-/g, "");
 
-                        // 해당 방의 모든 ID 정보를 가져와서 가격 업데이트 (2개 이상은 경고 표시)
-                        // display-only fallback: active room 설정 실패 시 해당 날짜의 실제 가격 데이터가
-                        // 있는 roomId 기준 사용. 없으면 전체 roomInfos. 뭘 선택하든 roomInfos 기준 처리.
-                        const displayRoomInfos = getDisplayUnitInfosForDate(room, dateStr);
-                        const allRoomInfosForDate = roomCatalogByName[room] || [];
-                        const pendingPriceCell = pendingPriceCellMap[cellKey];
-                        const isPendingPriceCell = !!pendingPriceCell;
-                        const mergedChannelPrices = getMergedRoomChannelPrices({
-                          primaryUnitInfos: displayRoomInfos,
-                          fallbackUnitInfos: allRoomInfosForDate,
-                          roomPrices,
-                          dateKey
-                        });
-                        let airbnbPrice = mergedChannelPrices.airbnbPrice;
-                        let bookingPrice = mergedChannelPrices.bookingPrice;
-                        let minStay = 0;  // 0은 "아직 가격 없음" 의미
-                        let hasError = mergedChannelPrices.hasError;
-                        let errorMsg = mergedChannelPrices.errorMsg;
-                        let lastModInfo = null;
-
-                        displayRoomInfos.forEach(info => {
-                          const roomPriceData = roomPrices[info.roomId];
-                          if (roomPriceData?.dates?.error && !hasError) {
-                            hasError = true;
-                            errorMsg = roomPriceData.dates.error;
-                          }
-
-                          const priceInfo = roomPriceData?.dates?.[dateKey];
-                          if (priceInfo) {
-                            const ms = parseInt(priceInfo.m, 10); // 문자열/NaN이면 무시하고 1박 기준으로 처리하지 않음
-                            if (Number.isFinite(ms) && ms >= 1 && ms < INACTIVE_MINSTAY_THRESHOLD && (minStay === 0 || ms < minStay)) minStay = ms;
-                            // 최신 lm 선택: ts(epoch ms) 우선, legacy는 t 문자열 fallback (pickNewerLm)
-                            if (priceInfo.lm) {
-                              lastModInfo = pickNewerLm(priceInfo.lm, lastModInfo);
-                            }
-                          }
-                        });
-
-                        if (!lastModInfo) {
-                          for (const info of allRoomInfosForDate) {
-                            const lm = roomPrices?.[info.roomId]?.dates?.[dateKey]?.lm;
-                            if (lm) {
-                              lastModInfo = pickNewerLm(lm, lastModInfo);
-                            }
-                          }
-                        }
-
-                        if (isPendingPriceCell && pendingPriceCell.airbnbPrice > 0) {
-                          airbnbPrice = pendingPriceCell.airbnbPrice;
-                        }
+                        // 가격/minStay/lastModInfo — memoized per-cell (calendarPriceCellMap)
+                        const priceCell = calendarPriceCellMap[cellKey] || EMPTY_PRICE_CELL;
+                        const { displayRoomInfos, allRoomInfosForDate, airbnbPrice, bookingPrice, minStay, hasError, errorMsg, lastModInfo, isPendingPriceCell } = priceCell;
 
                         // API 호출 시 발생한 오류 처리
                         if (hasError && airbnbPrice === 0 && bookingPrice === 0) {
@@ -9483,8 +9710,8 @@ function BuildingCalendar() {
 
                                 // 드래그 중이면 선택/해제 처리 (priceMode 또는 gapEditMode)
                                 if (isDragging && (priceMode || gapEditMode) && dragAction) {
-                                  // 셀 범위로 추가/제거
-                                    applyCellSelection(room, dateStr, dragAction);
+                                  // 드래그 고빈도 경로: rAF 배치로 state 업데이트 횟수 감소
+                                    queueCellSelection(room, dateStr, dragAction);
                                 }
                               }
                               if (!showBeds24DetailView && canSelect && !isSelected && !isInQuickSelectionRange && !isSelectionStart && !isDragging) {
