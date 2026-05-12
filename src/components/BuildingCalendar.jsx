@@ -3088,6 +3088,8 @@ function BuildingCalendar() {
 
   const pendingSelectionOpsRef = useRef([]);
   const selectionFlushFrameRef = useRef(null);
+  // clearCellSelection 호출마다 증가 — rAF flush 시 세대가 다르면 stale flush로 간주하고 무시
+  const selectionGenerationRef = useRef(0);
 
   const clearQueuedCellSelection = useCallback(() => {
     if (selectionFlushFrameRef.current !== null) {
@@ -3099,6 +3101,7 @@ function BuildingCalendar() {
 
   const clearCellSelection = useCallback(() => {
     clearQueuedCellSelection();
+    selectionGenerationRef.current += 1; // 세대 증가 → 진행 중인 rAF flush 무효화
     selectedCellKeySetRef.current = new Set();
     setSelectedCells([]);
   }, [clearQueuedCellSelection]);
@@ -3114,8 +3117,11 @@ function BuildingCalendar() {
     }
     pendingSelectionOpsRef.current.push({ room: roomName, date: dateStr, action });
     if (selectionFlushFrameRef.current !== null) return;
+    const generation = selectionGenerationRef.current;
     selectionFlushFrameRef.current = requestAnimationFrame(() => {
       selectionFlushFrameRef.current = null;
+      // clearCellSelection이 호출되어 세대가 바뀌었으면 이 flush는 stale — 무시
+      if (selectionGenerationRef.current !== generation) return;
       const ops = pendingSelectionOpsRef.current;
       pendingSelectionOpsRef.current = [];
       if (!ops.length) return;
@@ -4246,8 +4252,8 @@ function BuildingCalendar() {
         if (priceFetchControllerRef.current === controller) {
           priceFetchControllerRef.current = null;
         }
-        // pending 상태 제거는 새 가격이 실제로 적용된 경우에만 실행
-        if (onSettled) onSettled(didApplyFreshPriceData);
+        // 콜백에 적용 여부를 전달 — 콜백 내부에서 didApplyFreshPriceData로 분기
+        if (onSettled) onSettled(didApplyFreshPriceData); // always called so retry logic can run
       }
     }
   }, [companyId, gapCoverageDays, hasVisiblePriceCoverage, updatePriceCache]);
