@@ -3715,7 +3715,7 @@ function BuildingCalendar() {
   }, [calendarBuilding, roomPrices]);
 
   const getActiveUnitInfosForDate = useCallback((roomName, dateStr) => {
-    const unitInfos = BUILDING_ROOMS[calendarBuilding]?.filter(r => r.name === roomName) || [];
+    const unitInfos = roomCatalogByName[roomName] || [];
     if (unitInfos.length <= 1) return unitInfos;
 
     // minStay >= INACTIVE_MINSTAY_THRESHOLD(50/99)이면 비활성 room으로 본다.
@@ -3727,17 +3727,17 @@ function BuildingCalendar() {
 
     // 활성화된 것이 없으면 전체 반환 (비활성화된 roomId로만 구성 가능한 방도 포함)
     return activeInfos;
-  }, [calendarBuilding, getMinStayForRoomIdDate]);
+  }, [roomCatalogByName, getMinStayForRoomIdDate]);
 
   const getDisplayUnitInfosForDate = useCallback((roomName, dateStr) => {
     const dateKey = dateStr.replace(/-/g, "");
     const activeInfos = getActiveUnitInfosForDate(roomName, dateStr);
     if (activeInfos.length > 0) return activeInfos;
 
-    const allInfos = BUILDING_ROOMS[calendarBuilding]?.filter(r => r.name === roomName) || [];
+    const allInfos = roomCatalogByName[roomName] || [];
     const withData = allInfos.filter((info) => roomPrices[String(info.roomId)]?.dates?.[dateKey]);
     return withData.length > 0 ? withData : allInfos;
-  }, [calendarBuilding, getActiveUnitInfosForDate, roomPrices]);
+  }, [roomCatalogByName, getActiveUnitInfosForDate, roomPrices]);
 
   const getMinStayFromUnitInfos = useCallback((unitInfos, dateStr) => {
     const dateKey = dateStr.replace(/-/g, "");
@@ -3764,7 +3764,7 @@ function BuildingCalendar() {
     if (!calendarBuilding || calendarBuilding === "전체") return false;
 
     const dateKey = dateStr.replace(/-/g, "");
-    const allInfos = BUILDING_ROOMS[calendarBuilding]?.filter(r => r.name === roomName) || [];
+    const allInfos = roomCatalogByName[roomName] || [];
     if (allInfos.length === 0) return false;
 
     const activeInfos = getActiveUnitInfosForDate(roomName, dateStr);
@@ -3775,7 +3775,7 @@ function BuildingCalendar() {
       const priceInfo = roomPrices?.[String(info.roomId)]?.dates?.[dateKey];
       return String(priceInfo?.ov || "").toLowerCase() === "blackout";
     });
-  }, [calendarBuilding, getActiveUnitInfosForDate, roomPrices]);
+  }, [roomCatalogByName, getActiveUnitInfosForDate, roomPrices]);
 
   // 날짜별 예약 여부 캐시 (드래그 선택용)
   useEffect(() => {
@@ -5423,17 +5423,11 @@ function BuildingCalendar() {
           }
         }
 
-        const pendingPriceCell = pendingPriceCellMap[cellKey];
-        const isPendingPriceCell = !!pendingPriceCell;
-        if (isPendingPriceCell && pendingPriceCell.airbnbPrice > 0) {
-          airbnbPrice = pendingPriceCell.airbnbPrice;
-        }
-
-        map[cellKey] = { displayRoomInfos, allRoomInfosForDate, airbnbPrice, bookingPrice, minStay, hasError, errorMsg, lastModInfo, isPendingPriceCell };
+        map[cellKey] = { displayRoomInfos, allRoomInfosForDate, airbnbPrice, bookingPrice, minStay, hasError, errorMsg, lastModInfo };
       });
     });
     return map;
-  }, [visibleRooms, stableDisplayDays, roomCatalogByName, roomPrices, pendingPriceCellMap, getSelectedCellKey, getDisplayUnitInfosForDate]);
+  }, [visibleRooms, stableDisplayDays, roomCatalogByName, roomPrices, getSelectedCellKey, getDisplayUnitInfosForDate]);
 
   // [Single View] 건물 통계 데이터 계산
   const analysis = useMemo(() => {
@@ -9576,9 +9570,18 @@ function BuildingCalendar() {
 
                         const dateKey = dateStr.replace(/-/g, "");
 
-                        // 가격/minStay/lastModInfo — memoized per-cell (calendarPriceCellMap)
+                        // 가격/minStay/lastModInfo — base map + lightweight pending overlay
                         const priceCell = calendarPriceCellMap[cellKey] || EMPTY_PRICE_CELL;
-                        const { displayRoomInfos, allRoomInfosForDate, airbnbPrice, bookingPrice, minStay, hasError, errorMsg, lastModInfo, isPendingPriceCell } = priceCell;
+                        const pendingPriceCell = pendingPriceCellMap[cellKey];
+                        const isPendingPriceCell = !!pendingPriceCell;
+                        const displayRoomInfos = priceCell.displayRoomInfos;
+                        const allRoomInfosForDate = priceCell.allRoomInfosForDate;
+                        const airbnbPrice = isPendingPriceCell && pendingPriceCell.airbnbPrice > 0 ? pendingPriceCell.airbnbPrice : priceCell.airbnbPrice;
+                        const bookingPrice = priceCell.bookingPrice;
+                        const minStay = priceCell.minStay;
+                        const hasError = priceCell.hasError;
+                        const errorMsg = priceCell.errorMsg;
+                        const lastModInfo = priceCell.lastModInfo;
 
                         // API 호출 시 발생한 오류 처리
                         if (hasError && airbnbPrice === 0 && bookingPrice === 0) {
