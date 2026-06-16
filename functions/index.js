@@ -2012,13 +2012,14 @@ async function shouldYieldToQueuedPriceJob({ reason = "scheduled", throttleState
     return await getNextQueuedPriceJobHint({ excludeJobIds });
 }
 
-async function beds24GetV2WithRetry(endpoint, params, attempts = 5) {
+async function beds24GetV2WithRetry(endpoint, params, attempts = 5, axiosOptions = {}) {
     for (let i = 0; i < attempts; i++) {
         try {
             const token = await getBeds24Token();
             const response = await axios.get(`https://beds24.com/api/v2${endpoint}`, {
                 headers: { "token": token },
-                params: params
+                params: params,
+                ...axiosOptions
             });
 
             // V2 에러 체크
@@ -2140,9 +2141,20 @@ async function beds24PostV2WithRetry(endpoint, data, attempts = 3) {
     }
 }
 
-async function beds24GetV2WithGuard(endpoint, params, attempts = 5) {
+// 여러 roomId를 반복 파라미터(roomId=A&roomId=B)로 직렬화 — Beds24 GET 배치 지원 형식.
+// (axios 기본 배열 직렬화 roomId[]= 는 Beds24가 전체 객실을 반환하므로 사용 불가. 검증 완료)
+function beds24RepeatParamsSerializer(params) {
+    const parts = [];
+    Object.entries(params).forEach(([k, v]) => {
+        if (Array.isArray(v)) v.forEach((item) => parts.push(`${k}=${encodeURIComponent(item)}`));
+        else if (v !== undefined && v !== null) parts.push(`${k}=${encodeURIComponent(v)}`);
+    });
+    return parts.join("&");
+}
+
+async function beds24GetV2WithGuard(endpoint, params, attempts = 5, axiosOptions = {}) {
     try {
-        const response = await beds24GetV2WithRetry(endpoint, params, attempts);
+        const response = await beds24GetV2WithRetry(endpoint, params, attempts, axiosOptions);
         const creditRemaining = parseInt(response.headers?.["x-five-min-limit-remaining"], 10);
         const resetInSec = parseInt(response.headers?.["x-five-min-limit-resets-in"], 10);
         if (Number.isFinite(creditRemaining) && creditRemaining < BEDS24_API_LOW_CREDIT_THRESHOLD) {
@@ -2284,32 +2296,45 @@ async function syncAllPrices({
             requestedRooms += roomsToFetch.length;
             touchedBuildings.push(buildingName);
 
-            for (const room of roomsToFetch) {
+            // [Cache Protection] 최근 15분 내 수동 수정된 방을 병렬로 확인해 제외
+            const protectionChecks = await Promise.all(roomsToFetch.map((room) =>
+                buildingRef.collection("rooms").doc(String(room.roomId)).get()
+                    .then((snap) => ({ room, snap }))
+                    .catch(() => ({ room, snap: null }))
+            ));
+            const roomsToActuallyFetch = [];
+            for (const { room, snap } of protectionChecks) {
+                if (snap && snap.exists) {
+                    const lastUserUpdate = snap.data()?.lastManualUpdate?.toDate() || null;
+                    if (lastUserUpdate && dayjs().diff(dayjs(lastUserUpdate), 'minute') < 15) {
+                        console.log(`[Price Sync Skip] ${buildingName} - ${room.name}(${room.roomId}): 최근 수동 수정됨`);
+                        skippedRooms++;
+                        continue;
+                    }
+                }
+                roomsToActuallyFetch.push(room);
+            }
+
+            // ★ 배치 GET: 여러 roomId를 한 번에 조회 (객실당 1콜 → 청크당 1콜, 크레딧·시간 대폭 절감)
+            const PRICE_SYNC_GET_BATCH_SIZE = 20;
+            for (let ci = 0; ci < roomsToActuallyFetch.length; ci += PRICE_SYNC_GET_BATCH_SIZE) {
                 const queuedDuringRoomLoop = await shouldYieldToQueuedPriceJob({ reason, throttleState: priorityCheckState, intervalMs: 1500 });
                 if (queuedDuringRoomLoop) {
                     yieldedToManualJob = queuedDuringRoomLoop;
-                    console.log(`[V2 Sync] yielding to queued manual price job ${queuedDuringRoomLoop.id} during ${buildingName}/${room.roomId}`);
+                    console.log(`[V2 Sync] yielding to queued manual price job ${queuedDuringRoomLoop.id} during ${buildingName}`);
                     break buildingLoop;
                 }
-                const rid = String(room.roomId);
-                try {
-                    // [Cache Protection] 최근 15분 내 수동 수정된 방 스킵
-                    const roomDocRef = buildingRef.collection("rooms").doc(rid);
-                    const existingSnap = await roomDocRef.get();
-                    if (existingSnap.exists) {
-                        const roomCache = existingSnap.data();
-                        const lastUserUpdate = roomCache?.lastManualUpdate?.toDate() || null;
-                        if (lastUserUpdate && dayjs().diff(dayjs(lastUserUpdate), 'minute') < 15) {
-                            console.log(`[Price Sync Skip] ${buildingName} - ${room.name}(${rid}): 최근 수동 수정됨`);
-                            skippedRooms++;
-                            continue;
-                        }
-                    }
 
-                    // ★ V2 API 호출 (GET /inventory/rooms/calendar)
-                    // includePrices 필수! 없으면 가격 데이터가 반환되지 않음
-                    const response = await beds24GetV2WithGuard("/inventory/rooms/calendar", {
-                        roomId: rid,
+                const chunk = roomsToActuallyFetch.slice(ci, ci + PRICE_SYNC_GET_BATCH_SIZE);
+                const chunkRoomIds = chunk.map((room) => String(room.roomId));
+                const roomById = new Map(chunk.map((room) => [String(room.roomId), room]));
+
+                let response;
+                try {
+                    // ★ V2 API 호출 (GET /inventory/rooms/calendar) — roomId 배열 + 반복 파라미터 직렬화로 다중 객실 일괄 조회.
+                    // includePrices 필수! 없으면 가격 데이터가 반환되지 않음.
+                    response = await beds24GetV2WithGuard("/inventory/rooms/calendar", {
+                        roomId: chunkRoomIds,
                         startDate: fromDate,
                         endDate: toDate,
                         includePrices: true,
@@ -2318,35 +2343,48 @@ async function syncAllPrices({
                         includeMaxStay: true,
                         includeNumAvail: true,
                         includeOverride: true
+                    }, 5, { paramsSerializer: beds24RepeatParamsSerializer });
+                } catch (err) {
+                    console.error(`[Price Sync Fatal] ${buildingName} batch [${chunkRoomIds.join(",")}]:`, err.message);
+                    await new Promise(r => setTimeout(r, 500));
+                    continue;
+                }
+
+                // V2 응답 구조: { data: [{ roomId, calendar: [{ from, to, price1, minStay, ... }] }, ...] }
+                const entries = Array.isArray(response.data?.data) ? response.data.data : [];
+                if (entries.length === 0 && response.data?.error) {
+                    console.error(`[Price Sync Error] ${buildingName} batch: ${response.data.error}`);
+                }
+
+                // 각 객실 데이터를 병렬로 파싱·저장 (서로 다른 room 문서/month 캐시라 충돌 없음)
+                await Promise.all(entries.map(async (roomData) => {
+                    const rid = String(roomData.roomId);
+                    const room = roomById.get(rid);
+                    if (!room || !Array.isArray(roomData.calendar)) return;
+
+                    const datesObj = {};
+                    roomData.calendar.forEach(entry => {
+                        // from/to 범위를 개별 날짜로 확장
+                        const entryFromDate = dayjs(entry.from);
+                        const entryToDate = dayjs(entry.to);
+
+                        for (let d = entryFromDate; d.isBefore(entryToDate) || d.isSame(entryToDate, 'day'); d = d.add(1, 'day')) {
+                            const dateKey = d.format('YYYYMMDD');
+                            datesObj[dateKey] = {
+                                p1: String(entry.price1 || ""),
+                                p2: String(entry.price2 || ""),
+                                p3: String(entry.price3 || ""),
+                                m: String(entry.minStay || ""),
+                                mx: String(entry.maxStay || ""),
+                                na: entry.numAvail !== undefined && entry.numAvail !== null ? String(entry.numAvail) : "",
+                                ov: entry.override ? String(entry.override) : ""
+                            };
+                        }
                     });
 
-                    // V2 응답 파싱
-                    // 실제 구조: { data: [{ roomId, calendar: [{ from, to, price1, minStay, ... }] }] }
-                    const roomData = response.data?.data?.[0];
-                    if (roomData && Array.isArray(roomData.calendar)) {
-                        const datesObj = {};
-
-                        roomData.calendar.forEach(entry => {
-                            // from/to 범위를 개별 날짜로 확장
-                            const entryFromDate = dayjs(entry.from);
-                            const entryToDate = dayjs(entry.to);
-
-                            for (let d = entryFromDate; d.isBefore(entryToDate) || d.isSame(entryToDate, 'day'); d = d.add(1, 'day')) {
-                                const dateKey = d.format('YYYYMMDD');
-                                datesObj[dateKey] = {
-                                    p1: String(entry.price1 || ""),
-                                    p2: String(entry.price2 || ""),
-                                    p3: String(entry.price3 || ""),
-                                    m: String(entry.minStay || ""),
-                                    mx: String(entry.maxStay || ""),
-                                    na: entry.numAvail !== undefined && entry.numAvail !== null ? String(entry.numAvail) : "",
-                                    ov: entry.override ? String(entry.override) : ""
-                                };
-                            }
-                        });
-
-                        // 원자적 개별 저장 (Atomic Storage)
-                        await roomDocRef.set({
+                    try {
+                        // 원자적 개별 저장 (Atomic Storage) — dates는 deep-merge라 기존 lm(source dot) 보존 (기존 동작과 동일)
+                        await buildingRef.collection("rooms").doc(rid).set({
                             roomName: room.name,
                             roomId: rid,
                             dates: datesObj,
@@ -2363,15 +2401,12 @@ async function syncAllPrices({
                         successInBuilding++;
                         syncedRooms++;
                         syncedRoomIds.add(rid);
-                    } else if (response.data?.error) {
-                        console.error(`[Price Sync Error] ${buildingName} - ${room.name}: ${response.data.error}`);
+                    } catch (writeErr) {
+                        console.error(`[Price Sync Write Fatal] ${buildingName} - ${rid}:`, writeErr.message);
                     }
+                }));
 
-                } catch (err) {
-                    console.error(`[Price Sync Fatal] ${buildingName} - ${room.roomId}:`, err.message);
-                }
-
-                // V2는 빠르므로 대기 시간 단축 (2.0s -> 0.5s)
+                // 청크 간 throttle (객실당이 아니라 청크당 → 호출/대기 횟수 대폭 감소)
                 await new Promise(r => setTimeout(r, 500));
             }
 
