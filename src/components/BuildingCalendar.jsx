@@ -1193,6 +1193,30 @@ function ReservationDetailModal({ reservation, onClose, onRefresh, isMobile, com
   if (!reservation) return null;
 
   const handleUpdate = async () => {
+    if (!reservation.bookId) { alert("Error: bookId가 없습니다."); return; }
+    if (!companyId) { alert("Error: companyId가 없습니다."); return; }
+
+    if (editData.guestName !== undefined && String(editData.guestName ?? "").trim() === "") {
+      alert("게스트 이름은 비워둘 수 없습니다."); return;
+    }
+
+    const numAdult = parseInt(editData.numAdult, 10);
+    if (isNaN(numAdult) || numAdult < 1) { alert("성인 인원은 1명 이상이어야 합니다."); return; }
+
+    const numChild = parseInt(editData.numChild, 10);
+    if (isNaN(numChild) || numChild < 0) { alert("어린이 인원은 0명 이상이어야 합니다."); return; }
+
+    if (!editData.arrival) { alert("체크인 날짜는 필수입니다."); return; }
+    if (!editData.departure) { alert("체크아웃 날짜는 필수입니다."); return; }
+    const arrDay = dayjs(editData.arrival);
+    const depDay = dayjs(editData.departure);
+    if (!arrDay.isValid() || !depDay.isValid()) { alert("날짜 형식이 올바르지 않습니다."); return; }
+    if (!depDay.isAfter(arrDay, "day")) { alert("체크아웃은 체크인보다 늦어야 합니다."); return; }
+
+    const rawPrice = String(editData.totalPrice ?? "").trim();
+    const totalPrice = rawPrice !== "" ? parseFloat(rawPrice) : undefined;
+    if (rawPrice !== "" && isNaN(totalPrice)) { alert("가격은 숫자여야 합니다."); return; }
+
     setLoading(true);
     try {
       const updatePayload = {
@@ -1200,14 +1224,16 @@ function ReservationDetailModal({ reservation, onClose, onRefresh, isMobile, com
         bookId: reservation.bookId,
         building: reservation.building,
         guestName: editData.guestName,
-        price: String(editData.totalPrice || "0"),
-        numAdult: parseInt(editData.numAdult, 10) || 1,
-        numChild: parseInt(editData.numChild, 10) || 0,
-        arrival: editData.arrival,
-        departure: editData.departure,
         guestEmail: editData.guestEmail,
         guestPhone: editData.guestPhone,
-        guestComments: editData.guestComments
+        // guestCountry, arrivalTime: Beds24 POST /bookings 쓰기 지원 미확인 → 전송 안 함 (Firestore only)
+        arrival: editData.arrival,
+        departure: editData.departure,
+        numAdult,
+        numChild,
+        guestComments: editData.guestComments,
+        comments: editData.guestComments,
+        ...(totalPrice !== undefined && { price: String(totalPrice), totalPrice })
       };
 
       const response = await axios.post(`${API_BASE_URL}/updateBooking`, updatePayload);
@@ -1220,7 +1246,9 @@ function ReservationDetailModal({ reservation, onClose, onRefresh, isMobile, com
         throw new Error(response.data.error || "Update failed");
       }
     } catch (err) {
-      alert("Error: " + err.message);
+      console.error("[handleUpdate] error:", err);
+      const serverMsg = err.response?.data?.error || err.message;
+      alert("Error: " + serverMsg);
     } finally {
       setLoading(false);
     }
@@ -1240,6 +1268,7 @@ function ReservationDetailModal({ reservation, onClose, onRefresh, isMobile, com
     <>
       <InfoRow icon={"📧"} label="Email" value={isEditing ? editData.guestEmail : reservation.guestEmail} field="guestEmail" isEditing={isEditing} editData={editData} setEditData={setEditData} />
       <InfoRow icon={"📞"} label="Phone" value={isEditing ? editData.guestPhone : reservation.guestPhone} field="guestPhone" isEditing={isEditing} editData={editData} setEditData={setEditData} />
+      {/* Country / Est. Arrival: Beds24 POST /bookings 쓰기 지원 미확인 → 편집 불가 표시 전용 */}
       <InfoRow icon={"🌍"} label="Country" value={reservation.guestCountry} isEditing={isEditing} editData={editData} setEditData={setEditData} />
       <InfoRow icon={"⏰"} label="Est. Arrival" value={reservation.arrivalTime} isEditing={isEditing} editData={editData} setEditData={setEditData} />
 
@@ -2889,7 +2918,10 @@ function BuildingCalendar() {
   const [showManualBookingModal, setShowManualBookingModal] = useState(false);
   const [showPriceInsightModal, setShowPriceInsightModal] = useState(false);
   const [insightSelectedBuilding, setInsightSelectedBuilding] = useState(null); // 모달 내 건물 선택
-  const [gapEditMode, setGapEditMode] = useState(false); // Gap 설정 모드
+  const [gapEditMode, setGapEditMode] = useState(() => {
+    // Min Stay Edit 모드: 한 번 켜면 적용/이동/페이지 재진입에도 유지되도록 localStorage에서 복원
+    try { return localStorage.getItem('minStayEditMode') === '1'; } catch (_) { return false; }
+  }); // Gap 설정 모드
   const [showGapEditModal, setShowGapEditModal] = useState(false); // Gap 설정 모달
   const [gapEditMinStay, setGapEditMinStay] = useState(1); // 1박 또는 2박
   const [customMinStay, setCustomMinStay] = useState(""); // custom 3+ 입력값
@@ -3897,6 +3929,11 @@ function BuildingCalendar() {
     restoreCalendarViewport(preservedViewport);
   };
 
+  // Min Stay Edit 모드 상태를 localStorage에 동기화 (켜진 상태 유지용)
+  useEffect(() => {
+    try { localStorage.setItem('minStayEditMode', gapEditMode ? '1' : '0'); } catch (_) { /* noop */ }
+  }, [gapEditMode]);
+
   const toggleMinStayEditMode = () => {
     const nextGapMode = !gapEditMode;
     setGapEditMode(nextGapMode);
@@ -4281,12 +4318,16 @@ function BuildingCalendar() {
   }, [calendarBuilding, fetchPrices]);
 
   // 선택 초기화 (건물 변경 시)
+  const buildingResetInitRef = useRef(true);
   useEffect(() => {
     const isAllPropertiesView = !ACTIVE_BUILDING_ORDER.includes(selectedBuilding);
-    if (isAllPropertiesView) {
+    // 마운트 직후에는 모드 리셋을 건너뜀 — localStorage로 복원된 Min Stay Edit 모드 보존.
+    // (기본 selectedBuilding이 ACTIVE_BUILDING_ORDER에 없어 mount 시 isAllPropertiesView=true가 되는 케이스 방지)
+    if (isAllPropertiesView && !buildingResetInitRef.current) {
       setPriceMode(false);
       setGapEditMode(false);
     }
+    buildingResetInitRef.current = false;
     setSelectedRoom(null);
     clearCellSelection();
   }, [selectedBuilding, clearCellSelection]);
@@ -4752,32 +4793,17 @@ function BuildingCalendar() {
   const externalInventoryBlocks = useMemo(() => {
     if (!calendarBuilding || calendarBuilding === '전체' || stableDisplayDays.length === 0 || rooms.length === 0) return [];
 
-    const visibleDateSet = new Set(stableDisplayDays.map((d) => d.dateStr));
-    let visMinStr = stableDisplayDays[0].dateStr;
-    let visMaxStr = stableDisplayDays[0].dateStr;
-    stableDisplayDays.forEach((d) => {
-      if (d.dateStr < visMinStr) visMinStr = d.dateStr;
-      if (d.dateStr > visMaxStr) visMaxStr = d.dateStr;
-    });
-
     const occupiedByRoomDate = new Set();
     reservations.forEach((r) => {
       if (r.isInventoryOverrideBlock || r.status === 'cancelled' || !r.arrival || !r.departure) return;
 
-      let cur = dayjs(r.arrival);
-      const visMinD = dayjs(visMinStr);
-      if (cur.isBefore(visMinD, 'day')) cur = visMinD;
-
-      const depExclusive = dayjs(r.departure);
-      const visEndExclusive = dayjs(visMaxStr).add(1, 'day');
-      const endExclusive = depExclusive.isBefore(visEndExclusive, 'day') ? depExclusive : visEndExclusive;
-
-      while (cur.isBefore(endExclusive, 'day')) {
-        const dStr = cur.format('YYYY-MM-DD');
-        if (visibleDateSet.has(dStr)) {
+      // 가시 날짜만 순회하며 [arrival, departure) 포함 여부를 YYYY-MM-DD 문자열로 비교.
+      // (예약 체류일수만큼 dayjs 객체를 생성하던 루프 제거 → 스냅샷마다 발생하던 GC/연산 비용 절감)
+      for (let i = 0; i < stableDisplayDays.length; i++) {
+        const dStr = stableDisplayDays[i].dateStr;
+        if (dStr >= r.arrival && dStr < r.departure) {
           occupiedByRoomDate.add(`${r.room}__${dStr}`);
         }
-        cur = cur.add(1, 'day');
       }
     });
 
@@ -4902,7 +4928,8 @@ function BuildingCalendar() {
           if (viewStart && viewEndExclusive) {
             const start = reservation.arrival > viewStart ? reservation.arrival : viewStart;
             const endExclusive = reservation.departure < viewEndExclusive ? reservation.departure : viewEndExclusive;
-            if (dayjs(start).isBefore(dayjs(endExclusive))) {
+            // YYYY-MM-DD 문자열 비교 = 시간순 비교 (dayjs 객체 생성 제거로 스냅샷마다 재계산 비용 절감)
+            if (start < endExclusive) {
               visibleByRoom[roomName].push(reservation);
             }
           }
@@ -4920,7 +4947,8 @@ function BuildingCalendar() {
           if (viewStart && viewEndExclusive) {
             const start = reservation.arrival > viewStart ? reservation.arrival : viewStart;
             const endExclusive = reservation.departure < viewEndExclusive ? reservation.departure : viewEndExclusive;
-            if (dayjs(start).isBefore(dayjs(endExclusive))) {
+            // YYYY-MM-DD 문자열 비교 = 시간순 비교 (dayjs 객체 생성 제거)
+            if (start < endExclusive) {
               visibleByRoomVisual[roomName].push(reservation);
             }
           }
@@ -5757,6 +5785,18 @@ function BuildingCalendar() {
     return map;
   }, [roomReservationsMap]);
 
+  // 예약 바 위치 계산용 뷰 경계 — 모든 바에 공통이므로 렌더당 1회만 dayjs 계산 (바마다 재생성 방지)
+  const reservationBarViewBounds = useMemo(() => {
+    if (viewMode === "rolling") {
+      const rangeStart = dayjs(rollingStartDate).startOf('day');
+      return { rangeStart, rangeEnd: rangeStart.add(30, 'day') };
+    }
+    const monthStart = dayjs(`${year}-${String(month + 1).padStart(2, '0')}-01`).startOf('day');
+    const monthEnd = dayjs(`${year}-${String(month + 1).padStart(2, '0')}-${daysInMonth}`).add(1, 'day').startOf('day');
+    return { monthStart, monthEnd };
+  }, [viewMode, rollingStartDate, year, month, daysInMonth]);
+  const reservationTodayStr = dayjs().format('YYYY-MM-DD');
+
   // 예약 바 렌더
   const renderReservationBar = (reservation) => {
 
@@ -5764,11 +5804,12 @@ function BuildingCalendar() {
     const departureDate = new Date(reservation.departure);
 
     let startDay, endDay, totalDays;
+    let clippedStart = false; // 뷰 시작 경계로 잘림(이전 기간부터 이어지는 예약)
+    let clippedEnd = false;   // 뷰 끝 경계로 잘림(다음 기간으로 이어지는 예약)
 
     if (viewMode === "rolling") {
       // 30일 뷰: rollingStartDate 기준으로 계산 (실제로는 30일)
-      const rangeStart = dayjs(rollingStartDate).startOf('day');
-      const rangeEnd = rangeStart.add(30, 'day');
+      const { rangeStart, rangeEnd } = reservationBarViewBounds;
 
       const arrival = dayjs(reservation.arrival).startOf('day');
       const departure = dayjs(reservation.departure).startOf('day');
@@ -5788,12 +5829,13 @@ function BuildingCalendar() {
       // endDay는 totalDays(30)를 초과하지 않도록 clamp (overflow 방지)
       endDay = Math.min(effectiveEnd.diff(rangeStart, 'day'), 30);
       totalDays = 30;
+      clippedStart = arrival.isBefore(rangeStart);
+      clippedEnd = departure.isAfter(rangeEnd);
     } else {
       // 월별 뷰: dayjs 사용 (시각화 문제 해결)
       const arrival = dayjs(reservation.arrival).startOf('day');
       const departure = dayjs(reservation.departure).startOf('day');
-      const monthStart = dayjs(`${year}-${String(month + 1).padStart(2, '0')}-01`).startOf('day');
-      const monthEnd = dayjs(`${year}-${String(month + 1).padStart(2, '0')}-${daysInMonth}`).add(1, 'day').startOf('day');
+      const { monthStart, monthEnd } = reservationBarViewBounds;
 
       // ✅ 범위 결정: 예약이 현재 월에 실제로 걸치는지 확인
       // departure가 현재 월 시작보다 이전이거나 같으면 이미 완료된 예약 (표시 안함)
@@ -5802,9 +5844,11 @@ function BuildingCalendar() {
         return null;
       }
 
-      startDay = arrival.isBefore(monthStart) ? 0 : arrival.date() - 1;
+      clippedStart = arrival.isBefore(monthStart);
+      clippedEnd = departure.isAfter(monthEnd) || departure.isSame(monthEnd);
+      startDay = clippedStart ? 0 : arrival.date() - 1;
       // checkout 이 월 범위 밖이면 월말까지 표시
-      endDay = (departure.isAfter(monthEnd) || departure.isSame(monthEnd)) ? daysInMonth : departure.date() - 1;
+      endDay = clippedEnd ? daysInMonth : departure.date() - 1;
       totalDays = daysInMonth;
     }
 
@@ -5820,9 +5864,13 @@ function BuildingCalendar() {
     }
 
     // ✅ 위치와 너비 계산 — 1박 예약은 최소 1셀 보장 (경계 클리핑 후에도 0이 되지 않음)
-    const nights = Math.max(1, endDay - startDay);
-    const leftPercent = (startDay / totalDays) * 100;
-    const widthPercent = (nights / totalDays) * 100;
+    // ✅ Beds24 스타일 배치: 바를 체크인 날짜의 '중앙'에서 시작해 체크아웃 날짜의 '중앙'에서 끝나도록
+    //    양 끝을 반 칸씩 오프셋한다. (예: 1일 칸까지 채워진 바 = 실제 체크아웃 2일 로 오해되던 문제 해결)
+    //    단, 뷰 경계로 잘린 쪽(이전 기간부터 이어짐/다음 기간으로 이어짐)은 칸 가장자리에 그대로 붙인다.
+    const leftUnit = clippedStart ? startDay : startDay + 0.5;
+    const rightUnit = clippedEnd ? endDay : endDay + 0.5;
+    const leftPercent = (leftUnit / totalDays) * 100;
+    const widthPercent = (Math.max(rightUnit - leftUnit, 0.5) / totalDays) * 100;
 
     const isCancelled = reservation.status === "cancelled";
     const isBlackout = reservation.status === "blackout";
@@ -5879,7 +5927,7 @@ function BuildingCalendar() {
     const isManualCheckoutTargetActive = !!selectionStart && !priceMode && !gapEditMode && selectionStart.room === reservation.room;
     const allowPriceEditThroughBlock = !!priceMode && (isBlackout || isInventoryLikeBlock);
     const isEditMode = priceMode || gapEditMode; // 가격/gap 편집 모드 — 예약 상세 모달 차단
-    const isPastReservation = dayjs(reservation.departure).startOf('day').valueOf() <= dayjs().startOf('day').valueOf();
+    const isPastReservation = reservation.departure <= reservationTodayStr;
     const reservationIdentityKey = getReservationIdentityKey(reservation);
     const attributedConversion = priceAttributionByReservationKey[reservationIdentityKey] || null;
     const isPriceDrivenSuccess = !isCancelled && !isBlackout && !!attributedConversion;
@@ -6867,9 +6915,8 @@ function BuildingCalendar() {
                         alert(`${successCount} cell(s) updated!\nMin stay set to ${gapEditMinStay} for ${cellTargets.length} cell(s).\n\nTime: ${elapsedTime}s`);
                       }
 
-                      // 모달 닫기 및 초기화
+                      // 모달 닫고 선택만 초기화 — Min Stay Edit 모드는 유지(연속 설정 가능)
                       setShowGapEditModal(false);
-                      setGapEditMode(false);
                       clearCellSelection();
                       setSelectedRoom(null);
 

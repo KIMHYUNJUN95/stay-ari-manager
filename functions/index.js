@@ -3627,18 +3627,23 @@ exports.getTodayArrivals = onRequest({ cors: true }, async (req, res) => {
     const date = req.body.date || dayjs().format("YYYY-MM-DD");
     const companyId = req.body.companyId || DEFAULT_COMPANY_ID;
 
-    const snap = await db.collection("reservations")
+    // arrival/departure를 각각 equality로 좁혀 병렬 조회 (전체 confirmed 스캔 제거).
+    // 기존 복합 인덱스 (companyId,status,arrival),(companyId,status,departure) 재사용 — 인덱스 추가 불필요.
+    const base = db.collection("reservations")
         .where("companyId", "==", companyId)
-        .where("status", "==", "confirmed")
-        .get();
+        .where("status", "==", "confirmed");
 
-    const list = [];
-    snap.forEach((d) => {
-        const x = d.data();
-        if (x.arrival === date || x.departure === date) list.push(x);
-    });
+    const [arrSnap, depSnap] = await Promise.all([
+        base.where("arrival", "==", date).get(),
+        base.where("departure", "==", date).get()
+    ]);
 
-    res.json({ success: true, data: list });
+    // arrival==date 와 departure==date 양쪽에 걸리는 문서는 id로 dedup
+    const byId = new Map();
+    arrSnap.forEach((d) => byId.set(d.id, d.data()));
+    depSnap.forEach((d) => byId.set(d.id, d.data()));
+
+    res.json({ success: true, data: [...byId.values()] });
 });
 
 
@@ -3702,6 +3707,7 @@ const {
     buildAndSendSlackDailyReport,
     buildAndSendSlackCleaningReport,
     scheduledSlackDailyReport,
+    scheduledSlackDailyReportRetry,
     sendSlackDailyReportManual,
     scheduledSlackCleaningReport,
     sendSlackCleaningReportManual
@@ -4107,20 +4113,35 @@ exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
                 if (acquired) {
                     const syncedRoomIds = [];
                     try {
-                        for (const roomId of invalidatedRoomIds) {
-                            const roomName = roomNameById[roomId] || getRoomNameByRoomId(roomId);
-                            const syncResult = await syncSingleRoomPriceCache(building, roomId, roomName, {
-                                reason: "getCachedPrices",
-                                companyId
+                        // 무효화된 객실들을 순차가 아닌 동시성 제한 병렬로 재싱크 → fetch(getCachedPrices) 지연 단축.
+                        // 각 호출은 서로 다른 room 문서/month 캐시(rooms.{roomId})만 쓰므로 병렬 충돌 없음.
+                        // Beds24 rate limit(기본 60/5분) 내에서 안전하도록 동시 호출 수 제한.
+                        const GET_CACHED_SYNC_CONCURRENCY = 5;
+                        for (let i = 0; i < invalidatedRoomIds.length; i += GET_CACHED_SYNC_CONCURRENCY) {
+                            const chunk = invalidatedRoomIds.slice(i, i + GET_CACHED_SYNC_CONCURRENCY);
+                            const chunkResults = await Promise.all(chunk.map(async (roomId) => {
+                                const roomName = roomNameById[roomId] || getRoomNameByRoomId(roomId);
+                                try {
+                                    const syncResult = await syncSingleRoomPriceCache(building, roomId, roomName, {
+                                        reason: "getCachedPrices",
+                                        companyId
+                                    });
+                                    return { roomId, roomName, syncResult };
+                                } catch (syncErr) {
+                                    console.warn(`[getCachedPrices] parallel sync failed ${building}/${roomId}:`, syncErr.message);
+                                    return { roomId, roomName, syncResult: null };
+                                }
+                            }));
+                            chunkResults.forEach(({ roomId, roomName, syncResult }) => {
+                                if (syncResult?.success) {
+                                    syncedRoomIds.push(roomId);
+                                    liveRoomDataById[roomId] = {
+                                        roomName,
+                                        roomId: String(roomId),
+                                        dates: syncResult.newDates
+                                    };
+                                }
                             });
-                            if (syncResult?.success) {
-                                syncedRoomIds.push(roomId);
-                                liveRoomDataById[roomId] = {
-                                    roomName,
-                                    roomId: String(roomId),
-                                    dates: syncResult.newDates
-                                };
-                            }
                         }
                     } finally {
                         await releasePriceSyncLock();
@@ -4144,30 +4165,35 @@ exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
                         docData = doc.data() || docData;
                     }
                 } else {
-                    for (const roomId of invalidatedRoomIds) {
-                        const roomName = roomNameById[roomId] || getRoomNameByRoomId(roomId);
-                        try {
-                            const liveRoomSnapshot = await fetchSingleRoomPriceCacheSnapshot(roomId);
-                            if (liveRoomSnapshot?.success) {
-                                try {
-                                    await cleanupStaleInventoryOverrideBlocks({
-                                        companyId,
-                                        roomId,
-                                        currentDates: liveRoomSnapshot.datesObj,
-                                        syncSource: "getCachedPrices:live_fallback"
-                                    });
-                                } catch (cleanupErr) {
-                                    console.warn(`[getCachedPrices] inventory override cleanup failed ${building}/${roomId}:`, cleanupErr.message);
+                    // 락 미획득 시 live 스냅샷 fallback도 동시성 제한 병렬로 처리 (읽기 전용 스냅샷이라 충돌 없음)
+                    const GET_CACHED_FALLBACK_CONCURRENCY = 5;
+                    for (let i = 0; i < invalidatedRoomIds.length; i += GET_CACHED_FALLBACK_CONCURRENCY) {
+                        const chunk = invalidatedRoomIds.slice(i, i + GET_CACHED_FALLBACK_CONCURRENCY);
+                        await Promise.all(chunk.map(async (roomId) => {
+                            const roomName = roomNameById[roomId] || getRoomNameByRoomId(roomId);
+                            try {
+                                const liveRoomSnapshot = await fetchSingleRoomPriceCacheSnapshot(roomId);
+                                if (liveRoomSnapshot?.success) {
+                                    try {
+                                        await cleanupStaleInventoryOverrideBlocks({
+                                            companyId,
+                                            roomId,
+                                            currentDates: liveRoomSnapshot.datesObj,
+                                            syncSource: "getCachedPrices:live_fallback"
+                                        });
+                                    } catch (cleanupErr) {
+                                        console.warn(`[getCachedPrices] inventory override cleanup failed ${building}/${roomId}:`, cleanupErr.message);
+                                    }
+                                    liveRoomDataById[roomId] = {
+                                        roomName,
+                                        roomId: String(roomId),
+                                        dates: liveRoomSnapshot.datesObj
+                                    };
                                 }
-                                liveRoomDataById[roomId] = {
-                                    roomName,
-                                    roomId: String(roomId),
-                                    dates: liveRoomSnapshot.datesObj
-                                };
+                            } catch (liveSyncErr) {
+                                console.warn(`[getCachedPrices] live fallback failed ${building}/${roomId}:`, liveSyncErr.message);
                             }
-                        } catch (liveSyncErr) {
-                            console.warn(`[getCachedPrices] live fallback failed ${building}/${roomId}:`, liveSyncErr.message);
-                        }
+                        }));
                     }
                 }
             }
@@ -4714,6 +4740,9 @@ async function processPriceJob(jobId) {
                 if (respItems && respItems.length === batchRoomIds.length) {
                     let batchSuccessCount = 0;
                     let batchFailCount = 0;
+
+                    // 1) 성공/실패 분류는 순차로 (results 배열 순서를 기존과 동일하게 보존)
+                    const successRids = [];
                     for (let ri = 0; ri < batchRoomIds.length; ri++) {
                         const rid = batchRoomIds[ri];
                         const item = respItems[ri];
@@ -4723,6 +4752,22 @@ async function processPriceJob(jobId) {
                         if (itemSuccess) {
                             results.push({ roomId: rid, success: true });
                             batchSuccessCount++;
+                            successRids.push(rid);
+                        } else {
+                            const errMsg = item?.errors?.map(e => e.message).join("; ") || "Beds24 item-level failure";
+                            results.push({ roomId: rid, success: false, error: errMsg });
+                            batchFailCount++;
+                        }
+                    }
+
+                    // 2) 성공 객실의 Firestore 캐시 패치를 동시성 제한 병렬로 처리.
+                    //    각 rid는 서로 다른 room 문서(rooms.{rid})와 month 캐시(rooms.{rid})만 쓰므로 병렬 충돌 없음.
+                    //    같은 배치 = 같은 논리적 시각이므로 lm.t용 시각은 배치당 1회만 계산.
+                    const ROOM_WRITE_CONCURRENCY = 10;
+                    const nowFormatted = dayjs().utcOffset(9).format("MM-DD HH:mm");
+                    for (let i = 0; i < successRids.length; i += ROOM_WRITE_CONCURRENCY) {
+                        const chunk = successRids.slice(i, i + ROOM_WRITE_CONCURRENCY);
+                        await Promise.all(chunk.map(async (rid) => {
                             try {
                                 const roomDocRef = buildingRef.collection("rooms").doc(rid);
                                 const roomSnap = await roomDocRef.get();
@@ -4734,12 +4779,10 @@ async function processPriceJob(jobId) {
                                 oldPricesByRoom[rid] = {};
                                 Object.keys(roomDates).forEach(dKey => { oldPricesByRoom[rid][dKey] = parseFloat(roomData.dates[dKey]?.p1) || 0; });
                                 roomData.lastManualUpdate = admin.firestore.FieldValue.serverTimestamp();
-                                // 상세 변동 이력(lm)을 위한 현재 시각 (Tokyo/Seoul)
-                                const nowFormatted = dayjs().utcOffset(9).format("MM-DD HH:mm");
-                                
+
                                 Object.entries(roomDates).forEach(([dKey, values]) => {
                                     if (!roomData.dates[dKey]) roomData.dates[dKey] = {};
-                                    
+
                                     // 이전 가격 수집 (p1 기준)
                                     const oldP1 = parseFloat(roomData.dates[dKey].p1) || 0;
                                     const newP1 = values.p1 !== undefined ? parseFloat(values.p1) : oldP1;
@@ -4747,7 +4790,7 @@ async function processPriceJob(jobId) {
                                     if (values.p1 !== undefined) roomData.dates[dKey].p1 = String(values.p1);
                                     if (values.p2 !== undefined) roomData.dates[dKey].p2 = String(values.p2);
                                     if (values.p3 !== undefined) roomData.dates[dKey].p3 = String(values.p3);
-                                    
+
                                     // 가격 변동이 있을 경우 상세 메타데이터(lm) 저장
                                     if (values.p1 !== undefined && oldP1 !== newP1) {
                                         roomData.dates[dKey].lm = {
@@ -4771,11 +4814,7 @@ async function processPriceJob(jobId) {
                             } catch (cacheErr) {
                                 console.error(`[PriceJob ${jobId}] 캐시 패치 실패 roomId=${rid}:`, cacheErr.message);
                             }
-                        } else {
-                            const errMsg = item?.errors?.map(e => e.message).join("; ") || "Beds24 item-level failure";
-                            results.push({ roomId: rid, success: false, error: errMsg });
-                            batchFailCount++;
-                        }
+                        }));
                     }
                     console.log(`[PriceJob ${jobId}] 배치 ${b + 1}/${batches.length}: 성공=${batchSuccessCount}, 실패=${batchFailCount}`);
                 } else {
@@ -6321,51 +6360,124 @@ exports.createBooking = onRequest({ cors: true, memory: "1GiB", timeoutSeconds: 
 // 예약 수정 (우리 시스템 -> Beds24 -> Firebase)
 // ==========================================
 // ★ 예약 수정 - V2 마이그레이션 완료
-exports.updateBooking = onRequest({ cors: true }, async (req, res) => {
+exports.updateBooking = onRequest({ cors: true, memory: "512MiB", timeoutSeconds: 120 }, async (req, res) => {
     try {
         const { bookId, companyId, ...updates } = req.body;
+
+        // 1. 필수 파라미터 검증
         if (!companyId) return res.status(400).json({ success: false, error: "Missing companyId" });
-        if (!bookId) return res.status(400).json({ error: "Missing bookId" });
+        if (!bookId) return res.status(400).json({ success: false, error: "Missing bookId" });
+        const bookIdNum = parseInt(bookId, 10);
+        if (isNaN(bookIdNum)) return res.status(400).json({ success: false, error: "Invalid bookId" });
 
-        const payload = { id: parseInt(bookId) };
+        // 2. Firestore 문서 존재 및 companyId 격리 검증 (Beds24 호출 전)
+        const existingSnap = await db.collection("reservations").doc(String(bookId)).get();
+        if (!existingSnap.exists) {
+            return res.status(404).json({ success: false, error: "Reservation not found" });
+        }
+        const existingData = existingSnap.data();
+        const effectiveCompanyId = getEffectiveCompanyId(existingData);
+        if (effectiveCompanyId && effectiveCompanyId !== companyId) {
+            return res.status(403).json({ success: false, error: "companyId mismatch" });
+        }
 
-        // V1 필드 -> V2 필드 매핑 및 변환
-        if (updates.arrival) payload.arrival = updates.arrival;
-        if (updates.departure) payload.departure = updates.departure; // V2는 그대로 사용
-        if (updates.guestName) {
-            const parts = updates.guestName.split(" ");
+        // 3. Beds24 V2 POST /bookings 페이로드 구성
+        //    필드 존재 여부 기반(hasOwnProperty)으로 매핑 — truthy 체크 아님
+        const hasField = (field) => Object.prototype.hasOwnProperty.call(updates, field);
+        const normalizeStr = (v) => (v == null ? "" : String(v));
+
+        const payload = { id: bookIdNum };
+
+        // arrival/departure: trim 기반 검증 — 공백만 있는 입력도 거부하여 Beds24/Firestore 불일치 방지
+        if (hasField("arrival")) {
+            const arrivalVal = String(updates.arrival ?? "").trim();
+            if (!arrivalVal) return res.status(400).json({ success: false, error: "arrival cannot be empty" });
+            payload.arrival = arrivalVal;
+        }
+        if (hasField("departure")) {
+            const departureVal = String(updates.departure ?? "").trim();
+            if (!departureVal) return res.status(400).json({ success: false, error: "departure cannot be empty" });
+            payload.departure = departureVal;
+        }
+
+        if (hasField("guestName")) {
+            const trimmed = String(updates.guestName || "").trim();
+            if (!trimmed) return res.status(400).json({ success: false, error: "guestName cannot be empty" });
+            const parts = trimmed.split(/\s+/);
             payload.firstName = parts[0];
             payload.lastName = parts.slice(1).join(" ") || ".";
         }
-        if (updates.numAdult) payload.numAdult = parseInt(updates.numAdult);
-        if (updates.numChild) payload.numChild = parseInt(updates.numChild);
-        if (updates.guestPhone) {
-            payload.phone = updates.guestPhone;
-            payload.mobile = updates.guestPhone;
-        }
-        if (updates.guestEmail) payload.email = updates.guestEmail;
-        if (updates.price) payload.price = parseFloat(updates.price);
-        if (updates.comments) payload.comments = updates.comments;
-        // status 필드는 V2에서 유효하지 않으므로 제거
-        // if (updates.status) payload.status = updates.status === "cancelled" ? 0 : 1;
 
-        const response = await beds24PostV2WithRetry("/bookings", [payload]); // 배열 형식
+        if (hasField("numAdult")) {
+            const n = parseInt(updates.numAdult, 10);
+            if (isNaN(n) || n < 1) return res.status(400).json({ success: false, error: "numAdult must be >= 1" });
+            payload.numAdult = n;
+        }
+        // numChild: 0도 유효한 값이므로 hasField 기반으로 처리
+        if (hasField("numChild")) {
+            const n = parseInt(updates.numChild, 10);
+            payload.numChild = isNaN(n) ? 0 : Math.max(0, n);
+        }
+
+        if (hasField("guestEmail")) payload.email = normalizeStr(updates.guestEmail);
+        if (hasField("guestPhone")) {
+            payload.phone = normalizeStr(updates.guestPhone);
+            payload.mobile = normalizeStr(updates.guestPhone);
+        }
+        // guestCountry, arrivalTime: 공식 Beds24 V2 POST /bookings Swagger 접근 불가 + createBooking
+        // 실제 사용 페이로드에도 해당 필드 없음 → 쓰기 지원 미확인.
+        // Beds24 페이로드에 포함하지 않고 Firestore에만 저장 (의도적 정책, canonicalUpdates 참조).
+        // 공식 문서에서 "country", "arrivalTime" 필드가 POST /bookings에서 쓰기 가능하다고 확인되면
+        // payload.country = normalizeStr(updates.guestCountry);
+        // payload.arrivalTime = normalizeStr(updates.arrivalTime); 를 추가할 것.
+
+        // price: price 필드 우선, 없으면 totalPrice 사용
+        const rawPrice = hasField("price") ? updates.price : (hasField("totalPrice") ? updates.totalPrice : undefined);
+        if (rawPrice !== undefined) {
+            const p = parseFloat(rawPrice);
+            if (isNaN(p)) return res.status(400).json({ success: false, error: "Invalid price value" });
+            payload.price = p;
+        }
+
+        // comments: comments 필드 우선, 없으면 guestComments
+        const commentsVal = hasField("comments") ? updates.comments : (hasField("guestComments") ? updates.guestComments : undefined);
+        if (commentsVal !== undefined) payload.comments = normalizeStr(commentsVal);
+
+        // 4. Beds24 V2 POST /bookings 호출
+        const response = await beds24PostV2WithRetry("/bookings", [payload]);
         const result = Array.isArray(response.data) ? response.data[0] : response.data;
-        if (result.errors && result.errors.length > 0) {
-            throw new Error(result.errors.map(e => e.message).join(", "));
-        }
-        const existingSnap = await db.collection("reservations").doc(String(bookId)).get();
-        const existingData = existingSnap.exists ? existingSnap.data() : {};
-
-        /* result handled inside the branch
-
-        if (result.errors && result.errors.length > 0) {
-            throw new Error(result.errors.map(e => e.message).join(", "));
+        if (result && result.errors && result.errors.length > 0) {
+            const errMsg = result.errors.map(e => e.message || JSON.stringify(e)).join(", ");
+            return res.status(502).json({ success: false, error: "Beds24 error: " + errMsg });
         }
 
-        // Firestore 업데이트
-        */
-        // existingData loaded above
+        // 5. Firestore 업데이트 — canonical 필드만 명시적으로 저장
+        const canonicalUpdates = {};
+        const canonical = [
+            ["guestName", updates.guestName],
+            ["guestEmail", updates.guestEmail],
+            ["guestPhone", updates.guestPhone],
+            ["guestCountry", updates.guestCountry],
+            ["arrivalTime", updates.arrivalTime],
+            ["arrival", updates.arrival],
+            ["departure", updates.departure],
+            ["numAdult", payload.numAdult],
+            ["numChild", payload.numChild],
+            ["comments", commentsVal],
+            ["guestComments", commentsVal],
+            ["price", payload.price],
+            ["totalPrice", payload.price],
+        ];
+        for (const [key, val] of canonical) {
+            if (val !== undefined) canonicalUpdates[key] = val;
+        }
+
+        // 응답 성능 개선: 연락처/메모만 바뀐 경우 무거운 요약 재계산을 건너뜀
+        const changedFields = Object.keys(canonicalUpdates);
+        const outputImpactFields = new Set(["arrival", "departure", "price", "totalPrice", "numAdult", "numChild"]);
+        const summaryImpactFields = new Set(["arrival", "departure", "price", "totalPrice", "numAdult", "numChild"]);
+        const shouldUpdateOutput = changedFields.some((field) => outputImpactFields.has(field));
+        const shouldRefreshSummary = changedFields.some((field) => summaryImpactFields.has(field));
 
         const actorId = firstNonEmptyValue(
             normalizePossibleActorId(req.body?.staffId),
@@ -6376,35 +6488,53 @@ exports.updateBooking = onRequest({ cors: true }, async (req, res) => {
         await db.collection("reservations").doc(String(bookId)).set(
             enrichReservationDocument({
                 ...existingData,
-                ...updates,
+                ...canonicalUpdates,
                 id: String(bookId),
                 bookId: String(bookId),
                 lastEventType: "manual_update",
-                lastChangedFields: Object.keys(updates || {}).slice(0, 20),
+                lastChangedFields: Object.keys(canonicalUpdates).slice(0, 20),
                 lastEventAt: new Date().toISOString(),
                 lastActorId: actorId || existingData.lastActorId || "",
                 lastActorSource: actorId ? "manual_request" : (existingData.lastActorSource || ""),
                 lastModifiedByStaffId: actorId || existingData.lastModifiedByStaffId || "",
                 lastModifiedBySource: actorId ? "manual_request" : (existingData.lastModifiedBySource || "")
             }, {
-                companyId: getEffectiveCompanyId(existingData),
+                companyId: effectiveCompanyId || companyId,
                 syncSource: "manual_update_booking",
                 syncMode: "manual"
             }),
             { merge: true }
         );
-        try {
-            const merged = { ...existingData, ...updates, id: String(bookId), bookId: String(bookId) };
-            await scheduleOutputUpdates([buildReservationOutputImpact(merged)]);
-        } catch (e) {
-            console.warn("[updateBooking] Output update failed:", e.message);
-        }
-        await refreshHomeDashboardSummarySafe(companyId, "manual_update_booking", "updateBooking");
+
+        const merged = { ...existingData, ...canonicalUpdates, id: String(bookId), bookId: String(bookId) };
+
+        // 저장 자체가 성공했으면 먼저 응답을 반환해 500 false-failure와 체감 지연을 줄임.
         res.json({ success: true });
+
+        // 6. 후처리 (best-effort, 응답 후 실행)
+        Promise.resolve().then(async () => {
+            if (shouldUpdateOutput) {
+                try {
+                    await scheduleOutputUpdates([buildReservationOutputImpact(merged)]);
+                } catch (e) {
+                    console.warn("[updateBooking] Output update failed:", e.message);
+                }
+            }
+            if (shouldRefreshSummary) {
+                try {
+                    await refreshHomeDashboardSummarySafe(companyId, "manual_update_booking", "updateBooking");
+                } catch (e) {
+                    console.warn("[updateBooking] Summary refresh failed:", e.message);
+                }
+            }
+        }).catch((e) => {
+            console.warn("[updateBooking] Background post-process failed:", e.message);
+        });
 
     } catch (e) {
         console.error("updateBooking Error:", e);
-        res.status(500).json({ success: false, error: e.message });
+        const errDetail = e.response?.data ? JSON.stringify(e.response.data).slice(0, 300) : e.message;
+        res.status(500).json({ success: false, error: errDetail });
     }
 });
 
@@ -7058,6 +7188,7 @@ exports.scheduledNotionDashboardSync = onSchedule({
 });
 
 exports.scheduledSlackDailyReport = scheduledSlackDailyReport;
+exports.scheduledSlackDailyReportRetry = scheduledSlackDailyReportRetry;
 exports.sendSlackDailyReportManual = sendSlackDailyReportManual;
 exports.scheduledSlackCleaningReport = scheduledSlackCleaningReport;
 exports.sendSlackCleaningReportManual = sendSlackCleaningReportManual;
@@ -7252,4 +7383,290 @@ exports.syncCleaningWorkforceForecastOnReservationWrite = onDocumentWritten({
     const reservationId = event.params?.reservationId || "-";
     console.log(`[forecast-trigger] reservation write detected: ${reservationId}`);
     await runCleaningWorkforceForecastUpdate();
+});
+
+// ==========================================
+// CUSTOMER SEARCH INDEX
+// Pre-aggregated customer profiles for fast header search.
+// Each doc = one unique customer (companyId + customerKey).
+// Synced automatically on every reservation write.
+// ==========================================
+
+const CSI_COLLECTION = 'customer_search_index';
+const CSI_EXCLUDED_BUILDING = '다이쿄초';
+const CSI_BUILDING_NAMES = {
+    '아라키초A': 'Araki-cho A', '아라키초B': 'Araki-cho B',
+    '다이쿄초': 'Daikyo-cho', '가부키초': 'Kabuki-cho',
+    '다카다노바바': 'Takadanobaba', '오쿠보A동': 'Okubo A',
+    '오쿠보B동': 'Okubo B', '오쿠보C동': 'Okubo C', '사노시': 'Sano-shi',
+};
+
+function csiBuildingName(raw) {
+    return CSI_BUILDING_NAMES[raw] || raw || 'Unknown';
+}
+
+function csiFormatRoom(room) {
+    return String(room || '').replace('호', '').trim();
+}
+
+function csiCustomerKey(reservation) {
+    const name = String(reservation?.guestName || '').trim().toLowerCase();
+    const email = String(reservation?.guestEmail || '').trim().toLowerCase();
+    const phone = String(reservation?.guestPhone || '').trim().toLowerCase();
+    return email
+        ? `${name}__${email}`
+        : `${name}__${phone || reservation?.bookId || reservation?.id || 'unknown'}`;
+}
+
+function csiDocId(companyId, customerKey) {
+    const safe = customerKey.replace(/[^a-zA-Z0-9@._-]/g, '_').slice(0, 180);
+    return `${companyId}__${safe}`;
+}
+
+function csiPickReservationFields(r) {
+    return {
+        id: r.id || '',
+        arrival: r.arrival || '',
+        departure: r.departure || '',
+        building: r.building || '',
+        room: r.room || '',
+        platform: r.platform || '',
+        totalPrice: Number(r.totalPrice || r.price || 0),
+        nights: Number(r.nights || 0),
+        numAdult: Number(r.numAdult || 0),
+        numChild: Number(r.numChild || 0),
+        status: r.status || '',
+        bookId: r.bookId || '',
+        bookDate: r.bookDate || '',
+        arrivalTime: r.arrivalTime || '',
+    };
+}
+
+function csiNormalizeSearchText(value) {
+    return String(value || '').toLowerCase().trim().replace(/\s+/g, ' ');
+}
+
+function csiBuildSearchTokens(values = []) {
+    const tokens = new Set();
+
+    values.forEach((value) => {
+        const normalized = csiNormalizeSearchText(value);
+        if (!normalized) return;
+
+        tokens.add(normalized);
+        normalized
+            .split(/[^\p{L}\p{N}@._+-]+/u)
+            .filter(Boolean)
+            .forEach((part) => {
+                tokens.add(part);
+                for (let i = 2; i <= Math.min(part.length, 16); i += 1) {
+                    tokens.add(part.slice(0, i));
+                }
+            });
+    });
+
+    return Array.from(tokens).slice(0, 200);
+}
+
+function csiBuildProfile(companyId, customerKey, reservations) {
+    const relevant = reservations.filter(
+        (r) => r.building !== CSI_EXCLUDED_BUILDING && String(r.guestName || '').trim()
+    );
+    if (relevant.length === 0) return null;
+
+    let guestName = '', guestEmail = '', guestPhone = '', guestCountry = '';
+    let guestCity = '', guestAddress = '', lang = '', notes = '';
+    const platforms = new Set();
+    const buildings = new Set();
+    const buildingRooms = new Set();
+    let totalSpent = 0, totalNights = 0, totalAdults = 0, totalChildren = 0;
+
+    relevant.forEach((r) => {
+        if (!guestName) guestName = String(r.guestName || '').trim();
+        if (!guestEmail && r.guestEmail) guestEmail = r.guestEmail;
+        if (!guestPhone && r.guestPhone) guestPhone = r.guestPhone;
+        const country = r.guestCountry || r.guestCountry2 || '';
+        if (!guestCountry && country) guestCountry = country;
+        if (!guestCity && r.guestCity) guestCity = r.guestCity;
+        if (!guestAddress && r.guestAddress) guestAddress = r.guestAddress;
+        if (!lang && r.lang) lang = r.lang;
+        if (!notes && (r.comments || r.notes || r.guestComment)) {
+            notes = r.comments || r.notes || r.guestComment || '';
+        }
+        if (r.platform) platforms.add(r.platform);
+        if (r.building) buildings.add(csiBuildingName(r.building));
+        if (r.building || r.room) {
+            buildingRooms.add(
+                `${csiBuildingName(r.building)}${r.room ? ` / ${csiFormatRoom(r.room)}` : ''}`.trim()
+            );
+        }
+        totalSpent += Number(r.totalPrice || r.price || 0);
+        totalNights += Number(r.nights || 0);
+        totalAdults += Number(r.numAdult || 0);
+        totalChildren += Number(r.numChild || 0);
+    });
+
+    const sorted = [...relevant].sort((a, b) =>
+        String(b.arrival || b.bookDate || '').localeCompare(String(a.arrival || a.bookDate || ''))
+    );
+    const latest = sorted[0] || null;
+    const first = sorted[sorted.length - 1] || null;
+    const platformList = Array.from(platforms);
+    const buildingList = Array.from(buildings);
+    const buildingRoomList = Array.from(buildingRooms);
+    const searchTokens = csiBuildSearchTokens([
+        guestName,
+        guestEmail,
+        guestPhone,
+        guestCountry,
+        guestCity,
+        guestAddress,
+        lang,
+        ...platformList,
+        ...buildingList,
+        ...buildingRoomList,
+    ]);
+
+    return {
+        companyId,
+        customerKey,
+        guestName,
+        guestNameLower: guestName.toLowerCase(),
+        guestEmail,
+        guestPhone,
+        guestCountry,
+        guestCity,
+        guestAddress,
+        lang,
+        notes,
+        visitCount: relevant.length,
+        totalSpent,
+        totalNights,
+        totalAdults,
+        totalChildren,
+        platforms: platformList,
+        buildings: buildingList,
+        buildingRooms: buildingRoomList,
+        searchTokens,
+        lastVisit: latest?.arrival || latest?.bookDate || '',
+        firstVisit: first?.arrival || first?.bookDate || '',
+        latestReservation: latest ? csiPickReservationFields(latest) : null,
+        recentReservations: sorted.slice(0, 5).map(csiPickReservationFields),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+}
+
+// Recompute index docs for all customers sharing the given guestName in the company.
+async function csiUpdateForGuest(companyId, guestName) {
+    if (!companyId || !guestName || guestName.toLowerCase() === 'unknown') return;
+
+    const snap = await db.collection('reservations')
+        .where('companyId', '==', companyId)
+        .where('guestName', '==', guestName)
+        .get();
+
+    const reservations = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const existingProfileSnap = await db.collection(CSI_COLLECTION)
+        .where('companyId', '==', companyId)
+        .where('guestNameLower', '==', guestName.toLowerCase())
+        .get();
+
+    // Group by customerKey (same name, different email/phone = different customer)
+    const grouped = new Map();
+    reservations.forEach((r) => {
+        const key = csiCustomerKey(r);
+        if (!grouped.has(key)) grouped.set(key, []);
+        grouped.get(key).push(r);
+    });
+
+    const batch = db.batch();
+    const validDocIds = new Set();
+    grouped.forEach((customerReservations, customerKey) => {
+        const profile = csiBuildProfile(companyId, customerKey, customerReservations);
+        if (!profile) return;
+        const docRef = db.collection(CSI_COLLECTION).doc(csiDocId(companyId, customerKey));
+        validDocIds.add(docRef.id);
+        batch.set(docRef, profile, { merge: true });
+    });
+
+    existingProfileSnap.docs.forEach((docSnap) => {
+        if (!validDocIds.has(docSnap.id)) {
+            batch.delete(docSnap.ref);
+        }
+    });
+
+    await batch.commit();
+}
+
+// Trigger: keep index in sync whenever a reservation is written/updated/deleted.
+exports.syncCustomerSearchIndexOnReservationWrite = onDocumentWritten({
+    document: 'reservations/{reservationId}',
+    timeoutSeconds: 120,
+    memory: '256MiB',
+}, async (event) => {
+    const before = event.data?.before?.exists ? event.data.before.data() : null;
+    const after = event.data?.after?.exists ? event.data.after.data() : null;
+
+    // Collect distinct (companyId, guestName) pairs that need re-aggregation.
+    const targets = new Set();
+    const addTarget = (r) => {
+        const name = String(r?.guestName || '').trim();
+        const company = r?.companyId;
+        if (company && name && name.toLowerCase() !== 'unknown') {
+            targets.add(`${company}:::${name}`);
+        }
+    };
+    if (before) addTarget(before);
+    if (after) addTarget(after);
+
+    for (const target of targets) {
+        const sep = target.indexOf(':::');
+        const companyId = target.slice(0, sep);
+        const guestName = target.slice(sep + 3);
+        await csiUpdateForGuest(companyId, guestName);
+    }
+});
+
+// HTTP backfill: call once after deploying to populate the index from existing reservations.
+// POST body: { companyId: "..." }  — omit to backfill all companies (slow).
+exports.backfillCustomerSearchIndex = onRequest({ cors: true, timeoutSeconds: 540, memory: '1GiB' }, async (req, res) => {
+    cors(req, res, async () => {
+        const targetCompanyId = req.body?.companyId || null;
+        console.log(`[csi-backfill] start companyId=${targetCompanyId || 'ALL'}`);
+
+        let q = db.collection('reservations');
+        if (targetCompanyId) q = q.where('companyId', '==', targetCompanyId);
+        const snap = await q.get();
+        const allReservations = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        console.log(`[csi-backfill] loaded ${allReservations.length} reservations`);
+
+        // Group by (companyId, customerKey)
+        const profileMap = new Map();
+        allReservations.forEach((r) => {
+            const company = r.companyId;
+            const name = String(r.guestName || '').trim();
+            if (!company || !name || name.toLowerCase() === 'unknown') return;
+            const key = csiCustomerKey(r);
+            const mapKey = `${company}:::${key}`;
+            if (!profileMap.has(mapKey)) profileMap.set(mapKey, { companyId: company, customerKey: key, reservations: [] });
+            profileMap.get(mapKey).reservations.push(r);
+        });
+        console.log(`[csi-backfill] ${profileMap.size} unique customers`);
+
+        const entries = Array.from(profileMap.values());
+        let written = 0;
+        for (let i = 0; i < entries.length; i += 400) {
+            const batch = db.batch();
+            entries.slice(i, i + 400).forEach(({ companyId, customerKey, reservations }) => {
+                const profile = csiBuildProfile(companyId, customerKey, reservations);
+                if (!profile) return;
+                const docRef = db.collection(CSI_COLLECTION).doc(csiDocId(companyId, customerKey));
+                batch.set(docRef, profile);
+                written++;
+            });
+            await batch.commit();
+        }
+        console.log(`[csi-backfill] done. wrote=${written}`);
+        res.json({ ok: true, written, total: profileMap.size });
+    });
 });

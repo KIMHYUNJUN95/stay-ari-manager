@@ -81,6 +81,21 @@
       "density": "SPARSE_ALL"
     },
     {
+      "collectionGroup": "customer_search_index",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "companyId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "searchTokens",
+          "arrayConfig": "CONTAINS"
+        }
+      ],
+      "density": "SPARSE_ALL"
+    },
+    {
       "collectionGroup": "reservations",
       "queryScope": "COLLECTION",
       "fields": [

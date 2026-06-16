@@ -8,6 +8,7 @@ import { auth } from '../firebase';
 import { useUser } from '../contexts/UserContext';
 import { Haptics, ImpactStyle } from '@capacitor/haptics';
 import { Capacitor } from '@capacitor/core';
+import GuestSearchModal from './GuestSearchModal';
 
 // ─── 메뉴 데이터 ────────────────────────────────────────────────────────────────
 
@@ -692,6 +693,8 @@ const NewLayout = ({ children, onSync, syncing }) => {
   const { userData } = useUser();
   const [moreOpen, setMoreOpen] = useState(false);
   const [desktopMenuOpen, setDesktopMenuOpen] = useState(false);
+  const [guestSearchOpen, setGuestSearchOpen] = useState(false);
+  const [guestSearchQuery, setGuestSearchQuery] = useState('');
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
   const mainRef = React.useRef(null);
   const [showScrollTop, setShowScrollTop] = useState(false);
@@ -760,8 +763,22 @@ const NewLayout = ({ children, onSync, syncing }) => {
           {/* 가운데: 페이지 타이틀 (절대 중앙) */}
           <span style={styles.mobileHeaderTitle}>{pageTitle}</span>
 
-          {/* 오른쪽 여백: 제목 중앙 정렬 유지 */}
+          {/* 오른쪽: 검색 아이콘 */}
           <div style={styles.mobileHeaderRight}>
+            <button
+              onClick={() => setGuestSearchOpen(true)}
+              style={{
+                background: 'none', border: 'none', cursor: 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                width: '36px', height: '36px', borderRadius: '10px',
+                WebkitTapHighlightColor: 'transparent',
+              }}
+              aria-label="Search guests"
+            >
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#1C1C1E" strokeWidth="1.8">
+                <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+              </svg>
+            </button>
           </div>
         </header>
       )}
@@ -903,8 +920,27 @@ const NewLayout = ({ children, onSync, syncing }) => {
                 <span style={styles.desktopMenuLabel}>Menu</span>
               </button>
               <div style={styles.headerSearchWrap}>
-                <input type="text" placeholder="Search..." style={styles.headerSearch} autoComplete="off" />
-                <svg style={styles.headerSearchIcon} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#9CA3AF" strokeWidth="2">
+                <input
+                  type="text"
+                  placeholder="Search guest..."
+                  style={styles.headerSearch}
+                  autoComplete="off"
+                  value={guestSearchQuery}
+                  onChange={(e) => setGuestSearchQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && e.target.value.trim()) {
+                      setGuestSearchQuery(e.target.value);
+                      setGuestSearchOpen(true);
+                    }
+                  }}
+                  onFocus={(e) => { e.target.style.borderColor = '#4F46E5'; }}
+                  onBlur={(e) => { e.target.style.borderColor = '#E5E7EB'; }}
+                />
+                <svg
+                  style={{ ...styles.headerSearchIcon, cursor: 'pointer' }}
+                  width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#9CA3AF" strokeWidth="2"
+                  onClick={() => { if (guestSearchQuery.trim()) setGuestSearchOpen(true); }}
+                >
                   <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
                 </svg>
               </div>
@@ -941,6 +977,17 @@ const NewLayout = ({ children, onSync, syncing }) => {
             currentPath={currentPath}
             onNavigate={(path) => navigate(path)}
             onMoreOpen={() => setMoreOpen(true)}
+          />
+        )}
+
+        {/* 게스트 검색 모달 */}
+        {guestSearchOpen && (
+          <GuestSearchModal
+            initialQuery={guestSearchQuery}
+            onClose={() => {
+              setGuestSearchOpen(false);
+              setGuestSearchQuery('');
+            }}
           />
         )}
 

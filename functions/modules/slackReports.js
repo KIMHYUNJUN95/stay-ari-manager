@@ -19,6 +19,11 @@ const CLEANING_BUILDING_ORDER = [
     "아라키초A", "아라키초B", "가부키초", "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동"
 ];
 
+const CLEANING_BUILDING_LABELS = {
+    "오쿠보A동": "오쿠보A (B동)",
+    "오쿠보B동": "오쿠보B (A동)"
+};
+
 function createSlackReportModule({
     onRequest,
     onSchedule,
@@ -31,6 +36,8 @@ function createSlackReportModule({
     assertReservationDataReady,
     getEffectiveCompanyId
 }) {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
     async function sendSyncAlert(title, lines = []) {
         try {
             const webhookUrl = (
@@ -49,6 +56,39 @@ function createSlackReportModule({
         } catch (e) {
             console.error("[Slack] sendSyncAlert 실패 (원래 오류는 호출부 로그 참고):", e.message || e);
         }
+    }
+
+    async function hasSlackDailySnapshot(dateStr) {
+        if (!dateStr) return false;
+        const snapshotDoc = await db.collection("slack_report_snapshots").doc(`daily_report_${dateStr}`).get();
+        return snapshotDoc.exists;
+    }
+
+    async function runSlackDailyReportWithRetry({
+        useToday = false,
+        targetDateStr = null,
+        skipIfUnchanged = false,
+        isResend = false,
+        maxAttempts = 3,
+        baseDelayMs = 5000,
+        context = "scheduledSlackDailyReport"
+    } = {}) {
+        let lastError = null;
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                await buildAndSendSlackDailyReport(useToday, targetDateStr, skipIfUnchanged, isResend);
+                return;
+            } catch (e) {
+                lastError = e;
+                console.warn(`[Slack Daily] ${context} attempt ${attempt}/${maxAttempts} failed:`, e.message || e);
+                if (attempt < maxAttempts) {
+                    await sleep(baseDelayMs * attempt);
+                }
+            }
+        }
+
+        throw lastError;
     }
 
     async function buildAndSendSlackDailyReport(useToday = false, targetDateStr = null, skipIfUnchanged = false, isResend = false) {
@@ -296,6 +336,33 @@ ${buildingLinesClean}
         });
     }
 
+    function formatCleaningRoomCode(building, room) {
+        const buildingName = String(building || "");
+        const roomName = String(room || "");
+        const roomDigits = roomName.replace(/[^0-9]/g, "");
+
+        if (!roomDigits) return roomName;
+
+        if (buildingName === "아라키초A") return "AA" + roomDigits;
+        if (buildingName === "아라키초B") return "AB" + roomDigits;
+        if (buildingName === "가부키초") return "K" + roomDigits;
+
+        if (buildingName === "다카다노바바") {
+            const floorNumber = Number(roomDigits[0]);
+            if (Number.isFinite(floorNumber) && floorNumber >= 2 && floorNumber <= 9) {
+                return "T" + String(floorNumber);
+            }
+            return "T" + roomDigits;
+        }
+
+        return roomName;
+    }
+
+    function formatCleaningBuildingLabel(building) {
+        const buildingName = String(building || "");
+        return CLEANING_BUILDING_LABELS[buildingName] || buildingName;
+    }
+
     function getReservationPax(reservation) {
         return (reservation?.numAdult || 0) + (reservation?.numChild || 0);
     }
@@ -387,12 +454,12 @@ ${buildingLinesClean}
             list.forEach((t) => {
                 const b = t.building || "기타";
                 if (!groups[b]) groups[b] = [];
-                groups[b].push(`${t.room || ""} | ${t.label}`);
+                groups[b].push(`${formatCleaningRoomCode(t.building, t.room)} | ${t.label}`);
             });
             const lines = [];
             CLEANING_BUILDING_ORDER.forEach((b) => {
                 if (!groups[b] || groups[b].length === 0) return;
-                lines.push(`${b}\n${groups[b].join("\n")}`);
+                lines.push(`${formatCleaningBuildingLabel(b)}\n${groups[b].join("\n")}`);
             });
             if (lines.length === 0) return `${title}\n없음`;
             return `${title}\n${lines.join("\n\n")}`;
@@ -409,12 +476,20 @@ ${buildingLinesClean}
     const scheduledSlackDailyReport = onSchedule({
         schedule: "0 8 * * *",
         timeZone: "Asia/Tokyo",
+        retryCount: 3,
+        minBackoffSeconds: 60,
+        maxBackoffSeconds: 600,
+        maxDoublings: 4,
+        maxRetrySeconds: 900,
         timeoutSeconds: 120,
         memory: "256MiB"
     }, async () => {
         try {
             // 아침 08:00 JST: 전날(어제) 기준 일일 리포트 1회 발송. 변동 재전송은 scheduleOutputUpdates에서 처리.
-            await buildAndSendSlackDailyReport();
+            await runSlackDailyReportWithRetry({
+                skipIfUnchanged: true,
+                context: "scheduledSlackDailyReport"
+            });
         } catch (e) {
             console.error("❌ [Slack Daily] scheduledSlackDailyReport 실패:", e.stack || e.message);
             await sendSyncAlert("scheduledSlackDailyReport failed", [String(e.stack || e.message)]);
@@ -423,17 +498,58 @@ ${buildingLinesClean}
 
     const sendSlackDailyReportManual = onRequest({ cors: true }, async (req, res) => {
         try {
-            const useToday = (req.query && req.query.target === "today");
-            await buildAndSendSlackDailyReport(useToday);
-            res.json({ success: true, message: "Slack daily report sent", target: useToday ? "today" : "yesterday" });
+            const dateStr = (req.query && typeof req.query.date === "string" && req.query.date.trim()) ? req.query.date.trim() : null;
+            const useToday = !dateStr && (req.query && req.query.target === "today");
+            await runSlackDailyReportWithRetry({
+                useToday,
+                targetDateStr: dateStr,
+                context: "sendSlackDailyReportManual",
+                maxAttempts: 2,
+                baseDelayMs: 3000
+            });
+            res.json({
+                success: true,
+                message: "Slack daily report sent",
+                target: dateStr || (useToday ? "today" : "yesterday")
+            });
         } catch (e) {
             console.error("sendSlackDailyReportManual:", e);
             res.status(500).json({ success: false, error: e.message });
         }
     });
 
+    const scheduledSlackDailyReportRetry = onSchedule({
+        schedule: "20 8 * * *",
+        timeZone: "Asia/Tokyo",
+        retryCount: 2,
+        minBackoffSeconds: 60,
+        maxBackoffSeconds: 300,
+        maxDoublings: 3,
+        maxRetrySeconds: 600,
+        timeoutSeconds: 120,
+        memory: "256MiB"
+    }, async () => {
+        const yesterdayStr = dayjs().tz("Asia/Tokyo").subtract(1, "day").format("YYYY-MM-DD");
+
+        try {
+            if (await hasSlackDailySnapshot(yesterdayStr)) {
+                console.log(`??툘 [Slack Daily Retry] snapshot already exists, skip: ${yesterdayStr}`);
+                return;
+            }
+
+            await runSlackDailyReportWithRetry({
+                targetDateStr: yesterdayStr,
+                skipIfUnchanged: true,
+                context: "scheduledSlackDailyReportRetry"
+            });
+        } catch (e) {
+            console.error("??[Slack Daily Retry] scheduledSlackDailyReportRetry ?ㅽ뙣:", e.stack || e.message);
+            await sendSyncAlert("scheduledSlackDailyReportRetry failed", [String(e.stack || e.message)]);
+        }
+    });
+
     const scheduledSlackCleaningReport = onSchedule({
-        schedule: "50 8 * * *",
+        schedule: "0 8 * * *",
         timeZone: "Asia/Tokyo",
         timeoutSeconds: 120,
         memory: "256MiB"
@@ -463,6 +579,7 @@ ${buildingLinesClean}
         buildAndSendSlackDailyReport,
         buildAndSendSlackCleaningReport,
         scheduledSlackDailyReport,
+        scheduledSlackDailyReportRetry,
         sendSlackDailyReportManual,
         scheduledSlackCleaningReport,
         sendSlackCleaningReportManual

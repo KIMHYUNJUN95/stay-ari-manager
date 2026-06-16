@@ -919,7 +919,7 @@ function buildHistoryStructures(reservations, resolver, historyStart, todayKey) 
     const arrivalsByDateBuilding = new Map();
     const leadsByBuilding = new Map();
     const losByBuilding = new Map();
-    const recentStart = dayjs.tz(todayKey, TOKYO_TZ).subtract(28, "day").format("YYYY-MM-DD");
+    const recentStart = dayjs.tz(todayKey, TOKYO_TZ).subtract(42, "day").format("YYYY-MM-DD");
     const calibrateStart = dayjs.tz(todayKey, TOKYO_TZ).subtract(56, "day").format("YYYY-MM-DD");
     const yesterday = dayjs.tz(todayKey, TOKYO_TZ).subtract(1, "day").format("YYYY-MM-DD");
 
@@ -980,10 +980,7 @@ function buildHistoryStructures(reservations, resolver, historyStart, todayKey) 
             const dow = dayjs.tz(d, TOKYO_TZ).day();
             const recentKey = `${bKey}__${dow}`;
             const recentAvg = (recentArrivalWeekday.get(recentKey) || 0) / Math.max(1, recentArrivalWeekdayDays.get(recentKey) || 1);
-            const yoyDate = dayjs.tz(d, TOKYO_TZ).subtract(1, "year").format("YYYY-MM-DD");
-            const yoyCount = arrivalsByDateBuilding.get(`${yoyDate}__${bKey}`) || 0;
-            const blended = (recentAvg * 0.6) + (yoyCount * 0.4);
-            expected += blended;
+            expected += recentAvg;
             actual += arrivalsByDateBuilding.get(`${d}__${bKey}`) || 0;
         });
         const ratio = expected > 0 ? (actual / expected) : 1;
@@ -1012,10 +1009,7 @@ function estimateVacantCheckins({
     const recentSum = history.recentArrivalWeekday.get(recentKey) || 0;
     const recentDays = Math.max(1, history.recentArrivalWeekdayDays.get(recentKey) || 1);
     const recentAvg = recentSum / recentDays;
-
-    const yoyDate = dayjs.tz(targetDateKey, TOKYO_TZ).subtract(1, "year").format("YYYY-MM-DD");
-    const yoyCount = history.arrivalsByDateBuilding.get(`${yoyDate}__${buildingKey}`) || 0;
-    const blendedDemand = ((recentAvg * 0.6) + (yoyCount * 0.4)) * profile.demandMultiplier * calibration;
+    const blendedDemand = recentAvg * profile.demandMultiplier * calibration;
 
     const leads = history.leadsByBuilding.get(buildingKey) || [];
     let pickupShare = 0.65 + profile.pickupShift;
@@ -1434,7 +1428,7 @@ function buildCalendarCell(dateKey, stats, isToday) {
         `${d.format("M/D ddd")}${isToday ? "  TODAY" : ""}`,
         `확정 ${confirmed}건`,
         `체크아웃 가능 ${checkoutPossible}건`,
-        `체크인가능건수 ${availableCheckins}건`,
+        `예측 체크인건수 ${availableCheckins}건`,
         `최소인원 ${minStaff}명`,
         yen(stats.confirmedCostBase),
     ].join("\n");

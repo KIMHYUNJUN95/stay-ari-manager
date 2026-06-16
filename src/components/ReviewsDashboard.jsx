@@ -293,9 +293,47 @@ const airbnbThreshold = threshold / 2; // 8.0 -> 4.0
 }
 
 // encoding-fixed comment
-function computeRoomStats(reviews, activeRoomsByBuilding) {
+function computeRoomStats(reviews, activeRoomsByBuilding, channel = "airbnb") {
+  if (channel === "booking") {
+    const bookingReviews = reviews.filter(r => r.channel === "booking");
+    const byBuildingRoomName = {};
+
+    for (const r of bookingReviews) {
+      const b = r.linkedBuilding || r.building;
+      const roomName = normalizeRoomName(r.linkedRoom || r.roomName || "");
+      if (!BUILDING_ORDER.includes(b) || !roomName) continue;
+      if (!byBuildingRoomName[b]) byBuildingRoomName[b] = {};
+      if (!byBuildingRoomName[b][roomName]) byBuildingRoomName[b][roomName] = { scores: [], categories: {} };
+      if (r.score > 0) byBuildingRoomName[b][roomName].scores.push(r.score);
+      if (r.categories) {
+        for (const [k, v] of Object.entries(r.categories)) {
+          if (v !== null && v !== undefined) {
+            if (!byBuildingRoomName[b][roomName].categories[k]) byBuildingRoomName[b][roomName].categories[k] = [];
+            byBuildingRoomName[b][roomName].categories[k].push(v);
+          }
+        }
+      }
+    }
+
+    const result = {};
+    for (const [building, rooms] of Object.entries(byBuildingRoomName)) {
+      result[building] = {};
+      for (const [roomName, data] of Object.entries(rooms)) {
+        const roomAvg = data.scores.length ? avg(data.scores) : null;
+        const catAvgs = {};
+        for (const [k, vs] of Object.entries(data.categories)) catAvgs[k] = avg(vs);
+        result[building][getRoomLabelForBuilding(building, roomName, roomName)] = {
+          count: data.scores.length,
+          avg: roomAvg,
+          catAvgs,
+          roomId: roomName
+        };
+      }
+    }
+    return result;
+  }
+
   const airbnbReviews = reviews.filter(r => r.channel === "airbnb" && r.roomId);
-  // encoding-fixed comment
   const byBuildingRoomId = {};
 
   for (const [building, rooms] of Object.entries(activeRoomsByBuilding || {})) {
@@ -314,7 +352,6 @@ function computeRoomStats(reviews, activeRoomsByBuilding) {
     const b = r.building;
     if (!BUILDING_ORDER.includes(b)) continue;
     const rid = String(r.roomId);
-    // encoding-fixed comment
     if (activeRoomsByBuilding && !activeRoomsByBuilding[b]?.[rid]) continue;
     if (!byBuildingRoomId[b]) byBuildingRoomId[b] = {};
     if (!byBuildingRoomId[b][rid]) byBuildingRoomId[b][rid] = { roomName: getRoomLabelForBuilding(b, r.roomName, rid), scores: [], categories: {} };
@@ -334,14 +371,9 @@ function computeRoomStats(reviews, activeRoomsByBuilding) {
     }
   }
 
-  // encoding-fixed comment
-  // encoding-fixed comment
-  // encoding-fixed comment
-
   const result = {};
   for (const [building, roomIds] of Object.entries(byBuildingRoomId)) {
     result[building] = {};
-    // encoding-fixed comment
     const nameToIds = {};
     for (const [rid, data] of Object.entries(roomIds)) {
       if (!nameToIds[data.roomName]) nameToIds[data.roomName] = [];
@@ -982,6 +1014,11 @@ function ReviewReservationModal({ isOpen, onClose, review, reservation, loading 
   const displayDeparture = reservation?.departure || review.linkedDeparture || "-";
   const displayPlatform = reservation?.platform || (review.channel === "booking" ? "Booking.com" : "Airbnb");
   const displayReference = reservation?.apiReference || review.reservationId || "-";
+  const categoryDefs = review.channel === "booking" ? BOOKING_CATEGORIES : AIRBNB_CATEGORIES;
+  const categoryMax = review.channel === "booking" ? 10 : 5;
+  const categoryRows = categoryDefs
+    .map(({ key, label }) => ({ key, label, score: review?.categories?.[key] }))
+    .filter((item) => item.score !== null && item.score !== undefined);
 
   return (
     <AnimatePresence>
@@ -998,7 +1035,7 @@ function ReviewReservationModal({ isOpen, onClose, review, reservation, loading 
           exit={{ opacity: 0, y: 10, scale: 0.98 }}
           transition={{ duration: 0.2 }}
           onClick={(e) => e.stopPropagation()}
-          style={{ width: "100%", maxWidth: 560, background: "white", borderRadius: 16, border: "1px solid #E2E8F0", boxShadow: "0 18px 50px rgba(15,23,42,0.24)", overflow: "hidden" }}
+          style={{ width: "100%", maxWidth: 660, background: "white", borderRadius: 16, border: "1px solid #E2E8F0", boxShadow: "0 18px 50px rgba(15,23,42,0.24)", overflow: "hidden" }}
         >
           <div style={{ padding: "16px 20px", borderBottom: "1px solid #F1F5F9", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -1027,6 +1064,19 @@ function ReviewReservationModal({ isOpen, onClose, review, reservation, loading 
                 <ReviewDetailInfoRow label="Email" value={reservation?.guestEmail || ""} />
                 <ReviewDetailInfoRow label="Phone" value={reservation?.guestPhone || ""} />
                 <ReviewDetailInfoRow label="Guests" value={reservation ? `${reservation.numAdult || 0} adults, ${reservation.numChild || 0} children` : ""} />
+
+                {categoryRows.length > 0 && (
+                  <div style={{ marginTop: 14, background: "#F8FAFC", border: "1px solid #E2E8F0", borderRadius: 12, padding: "12px 14px" }}>
+                    <div style={{ fontSize: 11, color: "#64748B", fontWeight: 700, marginBottom: 10 }}>Detailed Ratings</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                      {categoryRows.map(({ key, label, score }) => (
+                        <div key={key} style={{ minWidth: 0 }}>
+                          <CategoryBar label={label} score={score} max={categoryMax} />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </>
             )}
 
@@ -1303,7 +1353,7 @@ function ReviewsTab({ reviews, channel: parentChannel, dateSearchReversed, hasDa
 
 // encoding-fixed comment
 
-function RoomsTab({ roomStats, buildingStats, roomsLoading }) {
+function RoomsTab({ roomStats, buildingStats, roomsLoading, channel }) {
   const availableBuildings = BUILDING_ORDER.filter(b => roomStats[b] && Object.keys(roomStats[b]).length > 0);
   const [selectedBuilding, setSelectedBuilding] = useState(null);
 
@@ -1327,7 +1377,7 @@ function RoomsTab({ roomStats, buildingStats, roomsLoading }) {
       <div style={{ textAlign: "center", padding: "80px", color: "#94A3B8" }}>
         <div style={{ fontSize: 40, marginBottom: 12 }}>📭</div>
         <div style={{ fontSize: 16, fontWeight: 600, color: "#64748B", marginBottom: 6 }}>No room-level data yet</div>
-        <div style={{ fontSize: 13 }}>Airbnb room reviews will appear here after syncing.</div>
+        <div style={{ fontSize: 13 }}>{channel === "booking" ? "Booking.com room reviews will appear here after syncing." : "Airbnb room reviews will appear here after syncing."}</div>
       </div>
     );
   }
@@ -1370,11 +1420,13 @@ function RoomsTab({ roomStats, buildingStats, roomsLoading }) {
             <h3 style={{ fontSize: 14, fontWeight: 700, color: "#1E293B", marginBottom: 4, letterSpacing: "-0.3px" }}>
               Room Ratings · {getBuildingEn(selectedBuilding)}
             </h3>
-            <p style={{ fontSize: 12, color: "#94A3B8", marginBottom: 20 }}>Airbnb average score per room (0-5)</p>
+            <p style={{ fontSize: 12, color: "#94A3B8", marginBottom: 20 }}>
+              {channel === "booking" ? "Booking.com average score per room (0-10)" : "Airbnb average score per room (0-5)"}
+            </p>
             <ResponsiveContainer width="100%" height={Math.max(120, barData.length * 44)}>
               <BarChart data={barData} layout="vertical" barCategoryGap="30%">
                 <CartesianGrid strokeDasharray="3 3" stroke="#F1F5F9" horizontal={false} />
-                <XAxis type="number" domain={[3, 5]} tick={{ fontSize: 11, fill: "#94A3B8" }} />
+                <XAxis type="number" domain={channel === "booking" ? [6, 10] : [3, 5]} tick={{ fontSize: 11, fill: "#94A3B8" }} />
                 <YAxis type="category" dataKey="room" tick={{ fontSize: 12, fill: "#374151", fontWeight: 500 }} width={52} />
                 <Tooltip formatter={(v, n) => [v == null ? "N/A" : v, "Avg Score"]} contentStyle={{ borderRadius: 10, border: "1px solid #E2E8F0", fontSize: 12 }} />
                 <Bar dataKey="avg" fill={getBuildingColor(selectedBuilding)} radius={[0, 6, 6, 0]} maxBarSize={32} />
@@ -1395,7 +1447,7 @@ function RoomsTab({ roomStats, buildingStats, roomsLoading }) {
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                   <span style={{ fontSize: 14, fontWeight: 700, color: "#1E293B" }}>{room}</span>
                   {data.count > 0 ? (
-                    <ScoreBadge score={data.avg} max={5} size="sm" />
+                    <ScoreBadge score={data.avg} max={channel === "booking" ? 10 : 5} size="sm" />
                   ) : (
                     <span style={{
                       display: "inline-flex", alignItems: "center", justifyContent: "center",
@@ -1408,14 +1460,14 @@ function RoomsTab({ roomStats, buildingStats, roomsLoading }) {
                   {data.count > 0 ? `${data.count} reviews` : "No reviews yet"}
                 </div>
                 {data.count > 0 ? (
-                  AIRBNB_CATEGORIES.map(({ key, label }) => {
+                  (channel === "booking" ? BOOKING_CATEGORIES : AIRBNB_CATEGORIES).map(({ key, label }) => {
                     const catScore = data.catAvgs[key];
                     if (catScore === undefined) return null;
-                    return <CategoryBar key={key} label={label} score={catScore} max={5} />;
+                    return <CategoryBar key={key} label={label} score={catScore} max={channel === "booking" ? 10 : 5} />;
                   })
                 ) : (
                   <div style={{ fontSize: 12, color: "#94A3B8", lineHeight: 1.5 }}>
-                    This active room has no synced Airbnb reviews yet.
+                    {channel === "booking" ? "This room has no synced Booking.com reviews yet." : "This active room has no synced Airbnb reviews yet."}
                   </div>
                 )}
               </motion.div>
@@ -1731,10 +1783,56 @@ export default function ReviewsDashboard() {
           const key = r.createdDateKey || toDateKey(r.createdAt);
           return key ? key >= cutoff : true;
         });
-      setReviews(data);
+
+      // Booking room linkage fallback:
+      // Some synced booking reviews have reservationId but missing linkedRoom/linkedBuilding.
+      // In this case, resolve by reservations.apiReference (= booking reservation number).
+      let enrichedData = data;
+      const bookingMissingLinks = data.filter((r) =>
+        r.channel === "booking" &&
+        r.reservationId &&
+        (!r.linkedRoom || !r.linkedBuilding)
+      );
+      if (bookingMissingLinks.length > 0) {
+        const refSet = [...new Set(bookingMissingLinks.map((r) => String(r.reservationId).trim()).filter(Boolean))];
+        const reservationByApiRef = {};
+        const CHUNK_SIZE = 10;
+        for (let i = 0; i < refSet.length; i += CHUNK_SIZE) {
+          const chunk = refSet.slice(i, i + CHUNK_SIZE);
+          try {
+            const resSnap = await getDocs(query(
+              collection(db, "reservations"),
+              where("companyId", "==", companyId),
+              where("apiReference", "in", chunk)
+            ));
+            resSnap.docs.forEach((doc) => {
+              const d = doc.data() || {};
+              const k = String(d.apiReference || "").trim();
+              if (k && !reservationByApiRef[k]) reservationByApiRef[k] = d;
+            });
+          } catch (e) {
+            console.warn("[ReviewsDashboard] booking link fallback chunk failed:", e.message);
+          }
+        }
+
+        enrichedData = data.map((r) => {
+          if (r.channel !== "booking") return r;
+          if (r.linkedRoom && r.linkedBuilding) return r;
+          const key = String(r.reservationId || "").trim();
+          const linked = key ? reservationByApiRef[key] : null;
+          if (!linked) return r;
+          return {
+            ...r,
+            linkedRoom: r.linkedRoom || linked.room || null,
+            linkedBuilding: r.linkedBuilding || linked.building || null
+          };
+        });
+      }
+
+      setReviews(enrichedData);
 
       let latest = null;
-      for (const d of data) {
+      for (const d of enrichedData) {
         const t = d.syncedAt?.toDate?.();
         if (t && (!latest || t > latest)) latest = t;
       }
@@ -1882,8 +1980,8 @@ export default function ReviewsDashboard() {
   const weaknesses = useMemo(() => computeWeaknesses(buildingStats), [buildingStats]);
   // encoding-fixed comment
   const roomStats = useMemo(
-    () => activeRoomsByBuilding !== null ? computeRoomStats(dateFilteredReviews, activeRoomsByBuilding) : null,
-    [dateFilteredReviews, activeRoomsByBuilding]
+    () => activeRoomsByBuilding !== null ? computeRoomStats(dateFilteredReviews, activeRoomsByBuilding, activeChannel) : null,
+    [dateFilteredReviews, activeRoomsByBuilding, activeChannel]
   );
   const unansweredCount = dateFilteredReviews.filter(r => r.channel === "booking" && !r.hasReply).length;
 
@@ -1893,6 +1991,7 @@ export default function ReviewsDashboard() {
     { id: "trends", label: "Trends" },
     { id: "insights", label: "Insights" },
     { id: "reviews", label: "Reviews" },
+    { id: "rooms", label: "Room Scores" },
     { id: "unanswered", label: "Unanswered", badge: unansweredCount },
   ];
 
@@ -2021,11 +2120,12 @@ export default function ReviewsDashboard() {
             {activeTab === "trends" && activeChannel === "booking" && <TrendsTab trendData={trendData} buildingStats={buildingStats} />}
             {activeTab === "insights" && <InsightsTab weaknesses={weaknesses.filter(w => (activeChannel === "booking" ? w.channel === "Booking.com" : w.channel === "Airbnb"))} buildingStats={buildingStats} channel={activeChannel} />}
             {activeTab === "reviews" && <ReviewsTab reviews={channelReviews} channel={activeChannel} dateSearchReversed={dateSearchReversed} hasDateFilter={hasDateFilter} companyId={companyId} />}
-            {activeTab === "rooms" && activeChannel === "airbnb" && (
+            {activeTab === "rooms" && (
               <RoomsTab
                 roomStats={roomStats || {}}
                 buildingStats={buildingStats}
                 roomsLoading={activeRoomsLoading || roomStats === null}
+                channel={activeChannel}
               />
             )}
             {activeTab === "unanswered" && activeChannel === "booking" && <UnansweredTab reviews={reviews} />}

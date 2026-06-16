@@ -40,13 +40,13 @@ const COLORS = {
 };
 
 const BUILDINGS = [
-    ["\uc544\ub77c\ud0a4\ucd08A", "\uac1d\uc2e4\ud615", "3.75h", "1\uba85", "1\uba85"],
-    ["\uc544\ub77c\ud0a4\ucd08B", "\uac1d\uc2e4\ud615", "4.5h", "1\uba85", "1\uba85"],
-    ["\uac00\ubd80\ud0a4\ucd08", "\uac1d\uc2e4\ud615", "3h", "1\uba85", "1\uba85"],
-    ["\ub2e4\uce74\ub2e4\ub178\ubc14\ubc14", "\uac1d\uc2e4\ud615", "4.2h", "1\uba85", "1\uba85"],
-    ["\uc624\ucfe0\ubcf4A\ub3d9", "\ub3c5\ucc44\ud615", "2\uba85 3.5h", "2\uba85", "2\uba85"],
-    ["\uc624\ucfe0\ubcf4B\ub3d9", "\ub3c5\ucc44\ud615", "2\uba85 3.5h", "2\uba85", "2\uba85"],
-    ["\uc624\ucfe0\ubcf4C\ub3d9", "\ub3c5\ucc44\ud615", "2\uba85 3.5h", "2\uba85", "2\uba85"],
+    ["\uc544\ub77c\ud0a4\ucd08A", "\uac1d\uc2e4\ud615", "3h 37m", "1\uba85", "1\uba85"],
+    ["\uc544\ub77c\ud0a4\ucd08B", "\uac1d\uc2e4\ud615", "6h 30m", "1\uba85", "1\uba85"],
+    ["\uac00\ubd80\ud0a4\ucd08", "\uac1d\uc2e4\ud615", "3h 17m", "1\uba85", "1\uba85"],
+    ["\ub2e4\uce74\ub2e4\ub178\ubc14\ubc14", "\uac1d\uc2e4\ud615", "5h 46m", "1\uba85", "1\uba85"],
+    ["\uc624\ucfe0\ubcf4A\ub3d9", "\ub3c5\ucc44\ud615", "2\uba85 4h (총 8h)", "2\uba85", "2\uba85"],
+    ["\uc624\ucfe0\ubcf4B\ub3d9", "\ub3c5\ucc44\ud615", "2\uba85 4h (총 8h)", "2\uba85", "2\uba85"],
+    ["\uc624\ucfe0\ubcf4C\ub3d9", "\ub3c5\ucc44\ud615", "2\uba85 4h (총 8h)", "2\uba85", "2\uba85"],
 ];
 
 const DAY_NAMES = [

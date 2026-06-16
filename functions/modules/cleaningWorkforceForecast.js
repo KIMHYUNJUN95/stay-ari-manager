@@ -9,7 +9,7 @@ const TOKYO_TZ = "Asia/Tokyo";
 
 const DEFAULT_WAGE_SCENARIOS = {
     low: 1250,
-    base: 1450,
+    base: 1750,
     high: 1700,
 };
 
@@ -23,7 +23,7 @@ const DEFAULT_BUILDING_RULES = {
         ],
         minWorkers: 1,
         recommendedWorkers: 1,
-        hoursPerWorker: 3.75,
+        hoursPerWorker: 3 + (37 / 60),
         maxUnitsPerWorker: 2,
     },
     arakichoB: {
@@ -35,7 +35,7 @@ const DEFAULT_BUILDING_RULES = {
         ],
         minWorkers: 1,
         recommendedWorkers: 1,
-        hoursPerWorker: 4.5,
+        hoursPerWorker: 6.5,
         maxUnitsPerWorker: 1,
     },
     kabukicho: {
@@ -44,7 +44,7 @@ const DEFAULT_BUILDING_RULES = {
         aliases: ["kabukicho", "Kabukicho", "가부키초"],
         minWorkers: 1,
         recommendedWorkers: 1,
-        hoursPerWorker: 3,
+        hoursPerWorker: 3 + (17 / 60),
         maxUnitsPerWorker: 2,
     },
     takadanobaba: {
@@ -53,7 +53,7 @@ const DEFAULT_BUILDING_RULES = {
         aliases: ["takadanobaba", "baba", "Takadanobaba", "다카다노바바", "바바"],
         minWorkers: 1,
         recommendedWorkers: 1,
-        hoursPerWorker: 4.2,
+        hoursPerWorker: 5 + (46 / 60),
         maxUnitsPerWorker: 1,
     },
     okuboA: {
@@ -65,9 +65,9 @@ const DEFAULT_BUILDING_RULES = {
         ],
         minWorkers: 2,
         recommendedWorkers: 2,
-        hoursPerWorker: 3.5,
-        cleaningUnitMultiplier: 2,
-        fallbackHoursPerWorker: 7,
+        hoursPerWorker: 4,
+        cleaningUnitMultiplier: 1,
+        fallbackHoursPerWorker: 8,
         workersPerPhysicalUnit: 2,
     },
     okuboB: {
@@ -79,9 +79,9 @@ const DEFAULT_BUILDING_RULES = {
         ],
         minWorkers: 2,
         recommendedWorkers: 2,
-        hoursPerWorker: 3.5,
-        cleaningUnitMultiplier: 2,
-        fallbackHoursPerWorker: 7,
+        hoursPerWorker: 4,
+        cleaningUnitMultiplier: 1,
+        fallbackHoursPerWorker: 8,
         workersPerPhysicalUnit: 2,
     },
     okuboC: {
@@ -93,9 +93,9 @@ const DEFAULT_BUILDING_RULES = {
         ],
         minWorkers: 2,
         recommendedWorkers: 2,
-        hoursPerWorker: 3.5,
-        cleaningUnitMultiplier: 2,
-        fallbackHoursPerWorker: 7,
+        hoursPerWorker: 4,
+        cleaningUnitMultiplier: 1,
+        fallbackHoursPerWorker: 8,
         workersPerPhysicalUnit: 2,
     },
 };
