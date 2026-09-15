@@ -4683,10 +4683,64 @@ function BuildingCalendar() {
   // 블록 데이터 일괄 삭제 함수 (Beds24 API + Firestore 동시 삭제)
   // 블락 해제. 백엔드 cancelBooking이 isInventoryOverrideBlock을 감지해
   // Beds24 override를 "none"으로 되돌리고, 블락 직전 저장해둔 numAvail을 복원한다.
+  // 블락 문서가 덮는 날짜들의 ov를 roomPrices/priceCache에 즉시 반영한다.
+  //
+  // 해제하면 reservations 구독이 블락 바를 곧바로 지우지만 roomPrices의 ov는 아직
+  // "blackout"이라, 그 자리에 가상 Beds24 블락 바가 대신 떠서 셀을 덮는다.
+  // 가격 셀은 hasBlockingReservation일 때 숨기므로 재조회가 끝날 때까지(듀얼 ID면 10초 가까이)
+  // 가격이 사라져 보였다. 그래서 요청 전에 ov를 먼저 비우고, 실패한 건만 되돌린다.
+  const patchOverrideForBlockDocs = useCallback((blockDocs, nextOverride) => {
+    const patchMap = {};
+    (blockDocs || []).forEach((blockDoc) => {
+      const roomId = String(blockDoc?.roomId || "");
+      if (!roomId || !blockDoc?.arrival || !blockDoc?.departure) return;
+      if (!patchMap[roomId]) patchMap[roomId] = new Set();
+      let cursor = dayjs(blockDoc.arrival);
+      const end = dayjs(blockDoc.departure);
+      while (cursor.isBefore(end)) {
+        patchMap[roomId].add(cursor.format("YYYYMMDD"));
+        cursor = cursor.add(1, "day");
+      }
+    });
+    if (Object.keys(patchMap).length === 0) return;
+
+    const patchRoomEntry = (roomEntry, dateKeys) => {
+      if (!roomEntry?.dates) return roomEntry;
+      const nextDates = { ...roomEntry.dates };
+      let changed = false;
+      dateKeys.forEach((dateKey) => {
+        if (!nextDates[dateKey]) return;
+        nextDates[dateKey] = { ...nextDates[dateKey], ov: nextOverride };
+        changed = true;
+      });
+      return changed ? { ...roomEntry, dates: nextDates } : roomEntry;
+    };
+
+    setRoomPrices((prev) => {
+      const updated = { ...prev };
+      Object.entries(patchMap).forEach(([roomId, dateKeys]) => {
+        updated[roomId] = patchRoomEntry(updated[roomId], dateKeys);
+      });
+      return updated;
+    });
+
+    // 캐시도 함께 고치지 않으면 fetchPrices가 시작하면서 캐시본을 다시 덮어써 ov가 되살아난다.
+    updatePriceCache((prev) => {
+      if (!prev[calendarBuilding]) return prev;
+      const updatedBuilding = { ...prev[calendarBuilding] };
+      Object.entries(patchMap).forEach(([roomId, dateKeys]) => {
+        updatedBuilding[roomId] = patchRoomEntry(updatedBuilding[roomId], dateKeys);
+      });
+      return { ...prev, [calendarBuilding]: updatedBuilding };
+    });
+  }, [calendarBuilding, updatePriceCache]);
+
   const handleUnblock = async (docs) => {
     if (!companyId || !Array.isArray(docs) || docs.length === 0) return;
     setUnblockBusy(true);
     const failed = [];
+    const failedDocs = [];
+    patchOverrideForBlockDocs(docs, "");
     try {
       for (const blockDoc of docs) {
         try {
@@ -4701,11 +4755,18 @@ function BuildingCalendar() {
             })
           });
           const result = await response.json();
-          if (!result.success) failed.push(`${blockDoc.room} ${blockDoc.arrival}: ${result.error || "unknown"}`);
+          if (!result.success) {
+            failed.push(`${blockDoc.room} ${blockDoc.arrival}: ${result.error || "unknown"}`);
+            failedDocs.push(blockDoc);
+          }
         } catch (err) {
           failed.push(`${blockDoc.room} ${blockDoc.arrival}: ${err.message}`);
+          failedDocs.push(blockDoc);
         }
       }
+
+      // 실패한 건은 Beds24에 여전히 블락이 남아 있으므로 낙관적 해제를 되돌린다.
+      if (failedDocs.length > 0) patchOverrideForBlockDocs(failedDocs, "blackout");
 
       // 해제 결과는 price_sync의 room 문서에만 반영되고 건물 부모 문서는 바뀌지 않으므로
       // 실시간 구독이 걸리지 않는다. 여기서 명시적으로 가격 캐시를 다시 읽는다.
