@@ -3024,6 +3024,13 @@ function BuildingCalendar() {
   const [showPriceInsightModal, setShowPriceInsightModal] = useState(false);
   const [insightSelectedBuilding, setInsightSelectedBuilding] = useState(null); // 모달 내 건물 선택
   const [gapEditMode, setGapEditMode] = useState(false); // Gap 설정 모드
+  // 대량 선택 모드 — 가격/Gap 편집 중일 때만 날짜 열 클릭·주간 칩이 동작한다.
+  const isBulkSelectMode = priceMode || gapEditMode;
+  // 선택 요약용. 선택에 실제로 포함된 객실 수 (선택된 날짜 수와 곱해 보여준다)
+  const selectedRoomCountInSelection = useMemo(
+    () => new Set(selectedCells.map((c) => c.room)).size,
+    [selectedCells]
+  );
   const [showGapEditModal, setShowGapEditModal] = useState(false); // Gap 설정 모달
   const [gapEditMinStay, setGapEditMinStay] = useState(1); // 1박 또는 2박
   const [customMinStay, setCustomMinStay] = useState(""); // custom 3+ 입력값
@@ -3724,10 +3731,15 @@ function BuildingCalendar() {
           const isToday = dayjs(date).format("YYYY-MM-DD") === todayKey;
           const isHeaderSelected = selectedDateSet.has(dayjs(date).format("YYYY-MM-DD"));
           const isPastHeaderDate = date < new Date(new Date().setHours(0, 0, 0, 0));
+          const canPickColumn = isBulkSelectMode && !isPastHeaderDate;
 
           return (
             <div
               key={day}
+              onClick={canPickColumn
+                ? () => toggleDateColumnRef.current?.(dayjs(date).format("YYYY-MM-DD"))
+                : undefined}
+              title={canPickColumn ? "Click to select this date for all rooms" : undefined}
               style={{
                 flex: "1 1 0",
                 minWidth: "32px",
@@ -3753,6 +3765,7 @@ function BuildingCalendar() {
                       : "#F9FAFB",
                 borderRight: "1px solid #F3F4F6",
                 boxShadow: isHeaderSelected ? "inset 0 -3px 0 #F59E0B" : "none",
+                cursor: canPickColumn ? "pointer" : "default",
                 display: "flex",
                 flexDirection: "column",
                 gap: "2px",
@@ -3774,10 +3787,15 @@ function BuildingCalendar() {
           const isNewMonth = i === 0 || d.day === 1;
           const isHeaderSelected = selectedDateSet.has(d.dateStr);
           const isPastHeaderDate = d.date < new Date(new Date().setHours(0, 0, 0, 0));
+          const canPickColumn = isBulkSelectMode && !isPastHeaderDate;
 
           return (
             <div
               key={d.dateStr}
+              onClick={canPickColumn
+                ? () => toggleDateColumnRef.current?.(d.dateStr)
+                : undefined}
+              title={canPickColumn ? "Click to select this date for all rooms" : undefined}
               style={{
                 flex: "1 1 0",
                 minWidth: "32px",
@@ -3806,6 +3824,7 @@ function BuildingCalendar() {
                 borderRight: "1px solid #F3F4F6",
                 borderLeft: isNewMonth && i > 0 ? "2px solid #F59E0B" : "none",
                 boxShadow: isHeaderSelected ? "inset 0 -3px 0 #F59E0B" : "none",
+                cursor: canPickColumn ? "pointer" : "default",
                 display: "flex",
                 flexDirection: "column",
                 gap: "2px",
@@ -3823,7 +3842,7 @@ function BuildingCalendar() {
         })
       )}
     </div>
-  ), [showBeds24DetailView, viewMode, daysInMonth, year, month, rollingDays, selectedDateSet, todayKey]);
+  ), [showBeds24DetailView, viewMode, daysInMonth, year, month, rollingDays, selectedDateSet, todayKey, isBulkSelectMode]);
 
   const gapCoverageDays = useMemo(() => {
     if (stableDisplayDays.length === 0) return [];
@@ -4209,61 +4228,146 @@ function BuildingCalendar() {
     }
   };
 
-  // 요일별 날짜 선택
-  const selectDatesByFilter = (filterType) => {
-    // filterType: 'all', 'weekday', 'weekend', 'mon', 'tue'...
-    const newDates = [];
+  // ── 대량 선택 헬퍼 ────────────────────────────────────────────────
+  //
+  // 필터·주간·날짜열 선택은 전부 '누적'이다. 예전에는 필터가 setSelectedCells(newCells)로
+  // 기존 선택을 버려서 "주말 전부 + 특정 3일"처럼 쌓아 올리는 게 불가능했다.
+  // 비우기는 Clear 버튼(clearCellSelection)으로 명확히 분리한다.
+
+  // 현재 뷰에서 고를 수 있는 날짜 (과거 제외)
+  const getVisibleFutureDates = () => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-
-    // ✅ Bug #3 Fix: 롤링 뷰이면 displayDays 사용, 아니면 월별 반복
     const daysToIterate = viewMode === "rolling" ? displayDays :
       Array.from({ length: daysInMonth }, (_, i) => ({
         date: new Date(year, month, i + 1),
         dateStr: `${year}-${String(month + 1).padStart(2, '0')}-${String(i + 1).padStart(2, '0')}`
       }));
+    return daysToIterate.filter((d) => d.date >= today);
+  };
 
-    daysToIterate.forEach(d => {
-      const date = d.date;
-      if (date < today) return; // 과거날짜 제외
-
-      const dateStr = d.dateStr;
-      const dayOfWeek = date.getDay(); // 0(일) ~ 6(토)
-
-      let shouldSelect = false;
-
-      if (filterType === 'all') shouldSelect = true;
-      else if (filterType === 'weekend') shouldSelect = (dayOfWeek === 5 || dayOfWeek === 6 || dayOfWeek === 0);
-      else if (filterType === 'weekday') shouldSelect = (dayOfWeek >= 1 && dayOfWeek <= 4);
-      else if (typeof filterType === 'number') shouldSelect = (dayOfWeek === filterType);
-
-      if (shouldSelect) newDates.push(dateStr);
-    });
-
-    // 선택된 날짜와 방으로 셀 쌍 생성 (예약 있는 셀 제외)
-    const roomsToUse = selectedRooms.length > 0 ? selectedRooms : selectableRooms;
-    const newCells = [];
+  // 날짜 × 객실 조합에서 예약/블락 셀을 제외한 선택 가능 셀
+  const buildSelectableCells = (dateStrs, roomsOverride = null) => {
+    const roomsToUse = roomsOverride
+      || (selectedRooms.length > 0 ? selectedRooms : selectableRooms);
+    const cells = [];
     let skipped = 0;
-    roomsToUse.forEach(room => {
-      newDates.forEach(date => {
+    roomsToUse.forEach((room) => {
+      dateStrs.forEach((date) => {
         const blocked = priceMode ? isCellPriceBlocked(room, date) : isCellOccupied(room, date);
         if (blocked) { skipped++; return; }
-        newCells.push({ room, date });
+        cells.push({ room, date });
       });
     });
-    setSelectedCells(newCells);
+    return { cells, skipped, roomsToUse };
+  };
 
-    if (newCells.length === 0) {
+  // 기존 선택에 더한다 (중복 제거). 실제로 추가된 개수를 돌려준다.
+  const addCellsToSelection = (cells) => {
+    const existing = new Set(selectedCells.map((c) => getSelectedCellKey(c.room, c.date)));
+    const fresh = cells.filter((c) => !existing.has(getSelectedCellKey(c.room, c.date)));
+    if (fresh.length > 0) setSelectedCells((prev) => [...prev, ...fresh]);
+    return fresh.length;
+  };
+
+  const removeCellsFromSelection = (cells) => {
+    const removeSet = new Set(cells.map((c) => getSelectedCellKey(c.room, c.date)));
+    setSelectedCells((prev) => prev.filter((c) => !removeSet.has(getSelectedCellKey(c.room, c.date))));
+  };
+
+  const areAllCellsSelected = (cells) => {
+    if (cells.length === 0) return false;
+    const existing = new Set(selectedCells.map((c) => getSelectedCellKey(c.room, c.date)));
+    return cells.every((c) => existing.has(getSelectedCellKey(c.room, c.date)));
+  };
+
+  const reportBulkSelection = (addedCount, skipped) => {
+    if (addedCount === 0 && skipped === 0) {
       setBulkSelectMsg('No vacant cells available for selected scope');
     } else {
       setBulkSelectMsg(skipped > 0 ? `${skipped} occupied cell${skipped > 1 ? 's' : ''} excluded` : '');
     }
-
-    // ✅ Bug #1 Fix: 첫 번째 방을 위해 selectedRoom 설정
-    if (roomsToUse.length > 0) {
-      setSelectedRoom(roomsToUse[0]);
-    }
   };
+
+  // 선택된 셀 묶음을 토글한다 (전부 선택돼 있으면 해제, 아니면 추가)
+  const toggleCellGroup = (cells, skipped) => {
+    if (cells.length === 0) {
+      setBulkSelectMsg('No vacant cells available for selected scope');
+      return;
+    }
+    if (areAllCellsSelected(cells)) {
+      removeCellsFromSelection(cells);
+      setBulkSelectMsg('');
+      return;
+    }
+    const added = addCellsToSelection(cells);
+    reportBulkSelection(added, skipped);
+    if (cells.length > 0) setSelectedRoom(cells[0].room);
+  };
+
+  // 요일별 날짜 선택 (누적)
+  const selectDatesByFilter = (filterType) => {
+    const newDates = getVisibleFutureDates()
+      .filter((d) => {
+        const dayOfWeek = d.date.getDay(); // 0(일) ~ 6(토)
+        if (filterType === 'all') return true;
+        // 금·토·일을 주말가로 본다 (기존 정의 유지)
+        if (filterType === 'weekend') return dayOfWeek === 5 || dayOfWeek === 6 || dayOfWeek === 0;
+        if (filterType === 'weekday') return dayOfWeek >= 1 && dayOfWeek <= 4;
+        if (typeof filterType === 'number') return dayOfWeek === filterType;
+        return false;
+      })
+      .map((d) => d.dateStr);
+
+    const { cells, skipped, roomsToUse } = buildSelectableCells(newDates);
+    const added = addCellsToSelection(cells);
+    reportBulkSelection(added, skipped);
+    if (roomsToUse.length > 0) setSelectedRoom(roomsToUse[0]);
+  };
+
+  // 날짜 열 토글 — 그 날짜의 선택 가능한 전 객실
+  const toggleDateColumn = (dateStr) => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (dayjs(dateStr).toDate() < today) return;
+    const { cells, skipped } = buildSelectableCells([dateStr]);
+    toggleCellGroup(cells, skipped);
+  };
+
+  // 주 단위 토글 (월요일 시작 7일, 현재 뷰에 보이는 날짜만)
+  const toggleWeekSelection = (weekStartDateStr) => {
+    const visible = new Set(getVisibleFutureDates().map((d) => d.dateStr));
+    const target = [];
+    for (let i = 0; i < 7; i++) {
+      const ds = dayjs(weekStartDateStr).add(i, 'day').format('YYYY-MM-DD');
+      if (visible.has(ds)) target.push(ds);
+    }
+    const { cells, skipped } = buildSelectableCells(target);
+    toggleCellGroup(cells, skipped);
+  };
+
+  // Shift+클릭 사각 범위 — 기준 셀과 대상 셀이 만드는 직사각형 전체를 더한다
+  const selectCellRectangle = (anchor, target) => {
+    const roomList = selectableRooms;
+    const ai = roomList.indexOf(anchor.room);
+    const bi = roomList.indexOf(target.room);
+    if (ai < 0 || bi < 0) return false;
+    const [r1, r2] = ai <= bi ? [ai, bi] : [bi, ai];
+    const [d1, d2] = anchor.date <= target.date ? [anchor.date, target.date] : [target.date, anchor.date];
+    const dates = getVisibleFutureDates().map((d) => d.dateStr).filter((ds) => ds >= d1 && ds <= d2);
+    const { cells, skipped } = buildSelectableCells(dates, roomList.slice(r1, r2 + 1));
+    const added = addCellsToSelection(cells);
+    reportBulkSelection(added, skipped);
+    return true;
+  };
+
+  // 헤더는 useMemo라 매 렌더 새로 만들어지는 핸들러를 의존성에 넣으면 메모가 무의미해진다.
+  // ref로 최신 핸들러만 넘겨 메모를 유지한다. (fetchPricesRef와 같은 패턴)
+  const toggleDateColumnRef = useRef(null);
+  toggleDateColumnRef.current = toggleDateColumn;
+
+  // Shift+클릭 기준점
+  const priceSelectionAnchorRef = useRef(null);
 
   // 날짜 셀 클릭 핸들러
   const handleDateCellClick = (room, dateStr) => {
@@ -5689,6 +5793,28 @@ function BuildingCalendar() {
   }, [rooms, roomsVacantTodaySet, vacantOnlyMode]);
 
   const selectableRooms = vacantOnlyMode ? visibleRooms : rooms;
+
+  // 주간 선택 칩. 현재 뷰에 보이는 미래 날짜를 월요일 시작 주로 묶는다.
+  const selectableWeeks = useMemo(() => {
+    if (!priceMode && !gapEditMode) return [];
+    const today = dayjs().startOf('day');
+    const byWeek = new Map();
+    stableDisplayDays.forEach((d) => {
+      const day = dayjs(d.dateStr);
+      if (day.isBefore(today, 'day')) return;
+      const offsetToMonday = (day.day() + 6) % 7; // 0(일)=6, 1(월)=0
+      const weekStart = day.subtract(offsetToMonday, 'day').format('YYYY-MM-DD');
+      if (!byWeek.has(weekStart)) byWeek.set(weekStart, []);
+      byWeek.get(weekStart).push(d.dateStr);
+    });
+    return [...byWeek.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([start, dates]) => ({
+        start,
+        dates,
+        label: `${dayjs(start).format('M/D')}–${dayjs(start).add(6, 'day').format('M/D')}`
+      }));
+  }, [priceMode, gapEditMode, stableDisplayDays]);
   const allSelectableRoomsSelected = selectableRooms.length > 0 && selectableRooms.every((room) => selectedRooms.includes(room));
 
   // Gap detection helper: check-in on this date → only 1 sellable night → minStay 2 → red gap.
@@ -8945,11 +9071,43 @@ function BuildingCalendar() {
                     </button>
                   </div>
                   <div style={{ width: "1px", height: "24px", background: "#E5E7EB" }}></div>
-                  <div style={{ display: "flex", gap: "8px" }}>
+                  <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+                    {/* 필터는 누적이다. 비우기는 이 버튼으로만 한다. */}
+                    <button
+                      onClick={clearCellSelection}
+                      disabled={selectedCells.length === 0}
+                      style={{
+                        ...filterBtnStyle,
+                        borderColor: selectedCells.length === 0 ? "#E5E7EB" : "#FCA5A5",
+                        color: selectedCells.length === 0 ? "#9CA3AF" : "#DC2626",
+                        cursor: selectedCells.length === 0 ? "not-allowed" : "pointer"
+                      }}
+                    >
+                      Clear
+                    </button>
                     <button onClick={() => selectDatesByFilter('all')} style={filterBtnStyle}>All Days</button>
                     <button onClick={() => selectDatesByFilter('weekday')} style={filterBtnStyle}>Weekdays</button>
                     <button onClick={() => selectDatesByFilter('weekend')} style={filterBtnStyle}>Weekends</button>
                   </div>
+
+                  {selectableWeeks.length > 0 && (
+                    <>
+                      <div style={{ width: "1px", height: "24px", background: "#E5E7EB" }}></div>
+                      <div style={{ display: "flex", gap: "4px", alignItems: "center", flexWrap: "wrap" }}>
+                        <span style={{ fontSize: "10px", fontWeight: "700", color: "#6B7280", letterSpacing: "0.3px" }}>WEEK</span>
+                        {selectableWeeks.map((w) => (
+                          <button
+                            key={w.start}
+                            onClick={() => toggleWeekSelection(w.start)}
+                            title={`Select ${w.label}`}
+                            style={{ ...dayBtnStyle, width: "auto", padding: "4px 8px", fontSize: "10px", whiteSpace: "nowrap" }}
+                          >
+                            {w.label}
+                          </button>
+                        ))}
+                      </div>
+                    </>
+                  )}
 
                   <div style={{ width: "1px", height: "24px", background: "#E5E7EB" }}></div>
                   <div style={{ display: "flex", gap: "4px" }}>
@@ -8957,6 +9115,24 @@ function BuildingCalendar() {
                       <button key={`day-${idx}`} onClick={() => selectDatesByFilter(idx)} style={dayBtnStyle}>{d}</button>
                     ))}
                   </div>
+
+                  {selectedCells.length > 0 && (
+                    <div style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "5px",
+                      padding: "4px 10px",
+                      borderRadius: "6px",
+                      background: "#EEF2FF",
+                      color: "#4338CA",
+                      fontSize: "11px",
+                      fontWeight: "700",
+                      border: "1px solid #C7D2FE",
+                      whiteSpace: "nowrap"
+                    }}>
+                      {selectedRoomCountInSelection} rooms × {selectedDates.length} dates = {selectedCells.length} cells
+                    </div>
+                  )}
 
                   {bulkSelectMsg && (
                     <div style={{
@@ -9135,9 +9311,47 @@ function BuildingCalendar() {
             >
               {allSelectableRoomsSelected ? "Deselect All Rooms" : "Select All Rooms"}
             </button>
+            <button
+              onClick={clearCellSelection}
+              disabled={selectedCells.length === 0}
+              style={{
+                ...filterBtnStyle,
+                padding: "6px 10px",
+                borderRadius: "7px",
+                fontSize: "11px",
+                borderColor: selectedCells.length === 0 ? "#E5E7EB" : "#FCA5A5",
+                color: selectedCells.length === 0 ? "#9CA3AF" : "#DC2626",
+                cursor: selectedCells.length === 0 ? "not-allowed" : "pointer"
+              }}
+            >
+              Clear
+            </button>
             <button onClick={() => selectDatesByFilter('all')} style={{ ...filterBtnStyle, padding: "6px 10px", borderRadius: "7px", fontSize: "11px" }}>All Days</button>
             <button onClick={() => selectDatesByFilter('weekday')} style={{ ...filterBtnStyle, padding: "6px 10px", borderRadius: "7px", fontSize: "11px" }}>Weekdays</button>
             <button onClick={() => selectDatesByFilter('weekend')} style={{ ...filterBtnStyle, padding: "6px 10px", borderRadius: "7px", fontSize: "11px" }}>Weekends</button>
+            {selectableWeeks.slice(0, 6).map((w) => (
+              <button
+                key={w.start}
+                onClick={() => toggleWeekSelection(w.start)}
+                style={{ ...filterBtnStyle, padding: "6px 8px", borderRadius: "7px", fontSize: "10px", whiteSpace: "nowrap" }}
+              >
+                {w.label}
+              </button>
+            ))}
+            {selectedCells.length > 0 && (
+              <div style={{
+                padding: "4px 8px",
+                borderRadius: "6px",
+                background: "#EEF2FF",
+                color: "#4338CA",
+                fontSize: "10px",
+                fontWeight: "700",
+                border: "1px solid #C7D2FE",
+                whiteSpace: "nowrap"
+              }}>
+                {selectedRoomCountInSelection} × {selectedDates.length} = {selectedCells.length} cells
+              </div>
+            )}
             {bulkSelectMsg && (
               <div style={{
                 width: "100%",
@@ -10452,6 +10666,17 @@ function BuildingCalendar() {
                             onMouseDown={(e) => {
                               if (canEditSelect && (priceMode || gapEditMode)) {
                                 e.stopPropagation();
+
+                                // Shift+클릭: 직전 기준 셀과의 직사각형 전체를 선택.
+                                // 드래그보다 정확하고 긴 범위에 편하다. 드래그는 그대로 동작한다.
+                                if (e.shiftKey && priceSelectionAnchorRef.current) {
+                                  if (selectCellRectangle(priceSelectionAnchorRef.current, { room, date: dateStr })) {
+                                    priceSelectionAnchorRef.current = { room, date: dateStr };
+                                    setSelectedRoom(room);
+                                    return;
+                                  }
+                                }
+
                                 setIsDragging(true);
 
                                 // 첫 번째 셀 및 이전 선택 처리, 방 추가/제거, 날짜 추가/제거
@@ -10459,6 +10684,7 @@ function BuildingCalendar() {
                                 setDragAction(action);
 
                                 setSelectedRoom(room);
+                                priceSelectionAnchorRef.current = { room, date: dateStr };
 
                                 // 셀 범위로 추가/제거
                                   applyCellSelection(room, dateStr, action);
