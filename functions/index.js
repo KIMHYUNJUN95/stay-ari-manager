@@ -2561,12 +2561,28 @@ async function writePriceChangeLogChunks(baseDoc, priceSnapshot = []) {
     const chunkCount = Math.ceil(snapshot.length / PRICE_LOG_SNAPSHOT_CHUNK_SIZE);
     for (let i = 0; i < chunkCount; i++) {
         const chunk = snapshot.slice(i * PRICE_LOG_SNAPSHOT_CHUNK_SIZE, (i + 1) * PRICE_LOG_SNAPSHOT_CHUNK_SIZE);
-        await db.collection("price_change_logs").add({
+        const chunkDoc = {
             ...baseDoc,
             priceSnapshot: chunk,
-            totalChangeCount: snapshot.length,
-            ...(chunkCount > 1 ? { chunkIndex: i, chunkCount } : {})
-        });
+            totalChangeCount: snapshot.length
+        };
+
+        // 분할할 때는 rooms / dateFrom / dateTo 도 그 청크 내용으로 좁힌다.
+        // 그러지 않으면 가격→예약 전환 판정(priceAttribution)이 이 청크에 없는 객실에 대해
+        // 전체 날짜 범위로 폴백해, 실제로 바꾸지 않은 날짜까지 "가격 덕분에 팔림"으로 오인한다.
+        if (chunkCount > 1) {
+            const chunkRooms = [...new Set(chunk.map((row) => row?.room).filter(Boolean))];
+            const chunkDates = chunk.map((row) => row?.date).filter(Boolean).sort();
+            if (chunkRooms.length > 0) chunkDoc.rooms = chunkRooms;
+            if (chunkDates.length > 0) {
+                chunkDoc.dateFrom = chunkDates[0];
+                chunkDoc.dateTo = chunkDates[chunkDates.length - 1];
+            }
+            chunkDoc.chunkIndex = i;
+            chunkDoc.chunkCount = chunkCount;
+        }
+
+        await db.collection("price_change_logs").add(chunkDoc);
     }
     if (chunkCount > 1) {
         console.log(`[PriceChangeLog] ${snapshot.length}건을 ${chunkCount}개 문서로 분할 기록`);

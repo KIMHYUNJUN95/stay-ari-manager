@@ -99,6 +99,9 @@ const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || "https://us-central1-
 const PRICE_CACHE_SESSION_TTL_MS = 5 * 60 * 1000;
 // 가격 조회 실패 시 재시도 간격 (지수 백오프). 길이가 곧 최대 재시도 횟수다.
 const PRICE_FETCH_RETRY_DELAYS_MS = [2000, 5000, 12000];
+// price_sync 부모 문서 변경을 감지한 뒤 실제 재조회까지의 디바운스.
+// 웹훅 1회가 문서를 여러 번 갱신하므로 묶어서 처리한다.
+const PRICE_SYNC_WATCH_DEBOUNCE_MS = 2000;
 
 function getPriceCacheSessionKey(companyId, building) {
   return `stayAri.priceCache.v1.${encodeURIComponent(String(companyId || ""))}.${encodeURIComponent(String(building || ""))}`;
@@ -4613,6 +4616,48 @@ function BuildingCalendar() {
     }, 30000);
     return () => clearTimeout(timer);
   }, [calendarBuilding, currentInvalidatedPriceRoomIdsKey, fetchPrices]);
+
+  // Beds24 쪽 변경(가격·블락·블락 해제)을 실시간으로 화면에 반영한다.
+  //
+  // 웹훅 → Firestore 는 원래 실시간이었지만, Firestore → 화면이 끊겨 있었다.
+  // 가격/블락 데이터(price_sync)는 구독 없이 getCachedPrices 풀 방식이라,
+  // 캘린더를 열어둔 채 Beds24에서 블락을 걸어도 건물을 바꾸거나 새로고침하기 전까지 보이지 않았다.
+  //
+  // 객실 문서를 전부 구독하면 읽기 비용이 크므로, 웹훅이 갱신하는 건물 부모 문서
+  // (lastWebhookAt / invalidatedRoomIds / lastSync) 하나만 구독해 변경 신호로 쓴다.
+  useEffect(() => {
+    if (!companyId || !calendarBuilding || calendarBuilding === "전체") return undefined;
+
+    let skipInitialSnapshot = true;
+    let refreshTimer = null;
+
+    const unsubscribe = onSnapshot(
+      doc(db, "price_sync", calendarBuilding),
+      (snapshot) => {
+        // 최초 스냅샷은 현재 상태일 뿐이다. 건물 전환 시 이미 조회하므로 중복 호출을 피한다.
+        if (skipInitialSnapshot) { skipInitialSnapshot = false; return; }
+        if (!snapshot.exists()) return;
+
+        // 웹훅 1회에 부모 문서가 여러 번 갱신된다(무효화 표시 → 동기화 완료).
+        // 디바운스로 묶고, 너무 이른 시점에 읽었더라도 뒤따르는 변경이 다시 트리거하므로 자기 보정된다.
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => {
+          refreshTimer = null;
+          if (!isMountedRef.current) return;
+          if (selectedBuildingRef.current !== calendarBuilding) return;
+          fetchPricesRef.current?.(true, calendarBuilding);
+        }, PRICE_SYNC_WATCH_DEBOUNCE_MS);
+      },
+      (error) => {
+        console.warn("[BuildingCalendar] price_sync 구독 오류:", error.message);
+      }
+    );
+
+    return () => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      try { unsubscribe(); } catch (_) { /* noop */ }
+    };
+  }, [companyId, calendarBuilding]);
 
   // 선택 초기화 (건물 변경 시)
   const buildingResetInitRef = useRef(true);
