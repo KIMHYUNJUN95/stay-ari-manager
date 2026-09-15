@@ -4686,25 +4686,24 @@ function BuildingCalendar() {
     setBlockLoading(true);
     try {
       const buildings = ACTIVE_BUILDING_ORDER;
-      let allBlocks = [];
       const todayStr = dayjs().format("YYYY-MM-DD");
 
-      for (const building of buildings) {
-        // blackout 상태 조회
-        const blockQuery = query(
-          collection(db, "reservations"),
-          where("companyId", "==", companyId),
-          where("building", "==", building),
-          where("status", "in", ["blackout", "maintenance"]),
-          where("departure", ">=", todayStr)
-        );
-        const blockSnap = await getDocs(blockQuery);
+      // 건물별 조회는 서로 독립적이라 병렬로 보낸다.
+      // 순차 await면 9개 건물의 왕복이 직렬로 쌓인다. (fetchReservations는 이미 이 방식)
+      const blockSnaps = await Promise.all(buildings.map((building) => getDocs(query(
+        collection(db, "reservations"),
+        where("companyId", "==", companyId),
+        where("building", "==", building),
+        where("status", "in", ["blackout", "maintenance"]),
+        where("departure", ">=", todayStr)
+      ))));
 
-        // maintenance 상태 조회
+      const allBlocks = [];
+      blockSnaps.forEach((blockSnap) => {
         blockSnap.docs.forEach(doc => {
           allBlocks.push({ id: doc.id, ...doc.data() });
         });
-      }
+      });
 
       // 날짜별 정렬
       allBlocks.sort((a, b) => (a.arrival || '').localeCompare(b.arrival || ''));

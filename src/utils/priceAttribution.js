@@ -1,3 +1,13 @@
+// 진단용 콘솔 출력 스위치.
+// 브라우저 콘솔에서 localStorage.setItem('attributionDebug', '1') 후 새로고침하면 켜진다.
+const ATTRIBUTION_DEBUG = (() => {
+  try {
+    return typeof window !== 'undefined' && window.localStorage?.getItem('attributionDebug') === '1';
+  } catch (_) {
+    return false;
+  }
+})();
+
 export const PRICE_ATTRIBUTION_DEFAULT_WINDOW_HOURS = 48;
 
 function toMillis(value) {
@@ -212,9 +222,12 @@ export function buildPriceAttributionResult({
 
   // --- DEBUG: �??�계�??�롭 ?�인 추적 ---
   const _dbgTotal = (interventions || []).length;
+  // 이 함수는 로그/예약 스냅샷이 올 때마다 재계산된다. 프로덕션에서 매번 콘솔에
+  // 쓰면(특히 전환 건별 forEach) DevTools가 열려 있을 때 눈에 띄게 느려진다.
+  // 진단이 필요하면 localStorage에 attributionDebug=1을 넣어 켠다.
   const _dbgAfterSuccess = (interventions || []).filter((log) => log?.success !== false);
   const _dbgBeds24Count = _dbgAfterSuccess.filter((log) => String(log?.origin || "").toLowerCase().includes("beds24")).length;
-  console.debug(`[Attribution] input=${_dbgTotal} | success_pass=${_dbgAfterSuccess.length} | beds24=${_dbgBeds24Count}`);
+  if (ATTRIBUTION_DEBUG) console.debug(`[Attribution] input=${_dbgTotal} | success_pass=${_dbgAfterSuccess.length} | beds24=${_dbgBeds24Count}`);
 
   // 제외 사유별 건수와 사유당 샘플 1건 (아래에서 한 줄로 요약 출력)
   const beds24DropReasonCounts = {};
@@ -268,11 +281,11 @@ export function buildPriceAttributionResult({
   const beds24DropTotal = Object.values(beds24DropReasonCounts).reduce((sum, n) => sum + n, 0);
   if (beds24DropTotal > 0) {
     const breakdown = Object.entries(beds24DropReasonCounts).map(([reason, n]) => `${reason}:${n}`).join(", ");
-    console.warn(`[Attribution] Beds24 로그 ${beds24DropTotal}건 제외 (${breakdown}) — 사유별 샘플:`, beds24DropSamples);
+    if (ATTRIBUTION_DEBUG) console.warn(`[Attribution] Beds24 로그 ${beds24DropTotal}건 제외 (${breakdown}) — 사유별 샘플:`, beds24DropSamples);
   }
 
   const _dbgNormBeds24 = normalizedInterventions.filter((i) => String(i.log?.origin || "").toLowerCase().includes("beds24")).length;
-  console.debug(`[Attribution] normalizedInterventions=${normalizedInterventions.length} | beds24_passed=${_dbgNormBeds24} | minInterventionDate=${minInterventionDate}`);
+  if (ATTRIBUTION_DEBUG) console.debug(`[Attribution] normalizedInterventions=${normalizedInterventions.length} | beds24_passed=${_dbgNormBeds24} | minInterventionDate=${minInterventionDate}`);
 
   const normalizedReservations = (reservations || []).map((reservation) => {
     if (!reservation) return null;
@@ -379,8 +392,8 @@ export function buildPriceAttributionResult({
 
   // --- DEBUG: 최종 conversion 결과 ?�약 ---
   const _dbgConvBeds24 = conversionList.filter((c) => String(c.intervention?.origin || "").toLowerCase().includes("beds24"));
-  console.debug(`[Attribution] RESULT total_conversions=${conversionList.length} | beds24_conversions=${_dbgConvBeds24.length}`);
-  if (_dbgConvBeds24.length > 0) {
+  if (ATTRIBUTION_DEBUG) console.debug(`[Attribution] RESULT total_conversions=${conversionList.length} | beds24_conversions=${_dbgConvBeds24.length}`);
+  if (ATTRIBUTION_DEBUG && _dbgConvBeds24.length > 0) {
     _dbgConvBeds24.forEach((c) => {
       console.debug(`[Attribution] ??Beds24 conversion: building=${c.reservation?.building} room=${c.reservation?.room} arrival=${c.reservation?.arrival} hoursToBooking=${c.hoursToBooking}h`);
     });
