@@ -7508,6 +7508,42 @@ async function clearBeds24BlackoutOverride({ roomId, arrival, departure, restore
     }
 }
 
+/**
+ * 여러 roomId에 한 번의 POST로 blackout override를 건다.
+ *
+ * 듀얼 ID 객실은 모든 roomId를 같은 날짜 구간으로 막는데, roomId마다 따로 POST하면
+ * Beds24 왕복(약 3.5초)이 그 수만큼 직렬로 쌓인다. Beds24 calendar API는 roomId 배열을
+ * 받으므로 가격 job과 같은 방식으로 묶어 보낸다.
+ *
+ * @returns {Object} roomId → { success, error }
+ */
+async function createBeds24BlackoutOverrideBatch(roomIds, arrival, departure) {
+    const ids = [...new Set((roomIds || []).map(String).filter(Boolean))];
+    const endDate = getInventoryOverrideEndDate(departure);
+    if (!arrival || !departure || !dayjs(departure).isAfter(dayjs(arrival), "day")) {
+        throw new Error("Invalid blackout date range");
+    }
+
+    const payload = ids.map((rid) => ({
+        roomId: parseInt(rid),
+        calendar: [{ from: arrival, to: endDate, override: "blackout" }]
+    }));
+
+    const response = await beds24PostV2WithGuard("/inventory/rooms/calendar", payload);
+
+    const resultByRoomId = {};
+    ids.forEach((rid, index) => {
+        const item = getBeds24BatchResult(response, index);
+        const itemErrors = item?.errors && item.errors.length > 0
+            ? item.errors.map((e) => e.message).join(", ")
+            : null;
+        resultByRoomId[rid] = (itemErrors || item?.success === false)
+            ? { success: false, error: itemErrors || "Beds24 blackout override create failed" }
+            : { success: true, error: null };
+    });
+    return resultByRoomId;
+}
+
 // ★ 예약 생성 - V2 마이그레이션 완료 (roomId 직접 수신)
 exports.createBooking = onRequest({ cors: true, memory: "1GiB", timeoutSeconds: 120 }, async (req, res) => {
     try {
@@ -7529,17 +7565,54 @@ exports.createBooking = onRequest({ cors: true, memory: "1GiB", timeoutSeconds: 
             const bookingDate = dayjs().tz("Asia/Tokyo").format("YYYY-MM-DD");
             const results = [];
 
+            // numAvail 스냅샷은 blackout을 걸기 전의 값이어야 하므로 POST보다 먼저, 병렬로 읽는다.
+            const numAvailSnapshots = new Map();
+            await Promise.all(blockSegments.map(async (seg) => {
+                try {
+                    numAvailSnapshots.set(seg, await getStoredNumAvailSnapshotForBlock(building, seg.roomId, seg.arrival, seg.departure));
+                } catch (snapErr) {
+                    console.warn(`[createBooking] numAvail 스냅샷 실패 (roomId=${seg.roomId}):`, snapErr.message);
+                    numAvailSnapshots.set(seg, {});
+                }
+            }));
+
+            // 날짜 구간이 같은 세그먼트는 Beds24 POST 1회로 묶는다.
+            // 듀얼 ID 객실은 모든 roomId가 같은 구간이므로 왕복이 1회로 줄어든다.
+            const segmentGroups = new Map();
+            for (const seg of blockSegments) {
+                const key = `${seg.arrival}|${seg.departure}`;
+                if (!segmentGroups.has(key)) segmentGroups.set(key, []);
+                segmentGroups.get(key).push(seg);
+            }
+            const overrideResultBySegment = new Map();
+            for (const [key, segs] of segmentGroups) {
+                const [groupArrival, groupDeparture] = key.split("|");
+                console.log(`[createBooking] 블락 batch: ${building} ${groupArrival}~${groupDeparture} roomIds=[${segs.map(s => s.roomId).join(", ")}]`);
+                try {
+                    const byRoomId = await createBeds24BlackoutOverrideBatch(segs.map(s => s.roomId), groupArrival, groupDeparture);
+                    segs.forEach((s) => overrideResultBySegment.set(
+                        s,
+                        byRoomId[String(s.roomId)] || { success: false, error: "Beds24 응답에 해당 roomId 결과가 없습니다" }
+                    ));
+                } catch (batchErr) {
+                    console.error(`[createBooking] 블락 batch 실패 (${groupArrival}~${groupDeparture}):`, batchErr.message);
+                    segs.forEach((s) => overrideResultBySegment.set(s, { success: false, error: batchErr.message }));
+                }
+            }
+
             for (const seg of blockSegments) {
                 try {
                     const segRoomId = seg.roomId;
                     const segRoomName = seg.room || getRoomNameByRoomId(segRoomId);
                     const segArrival = seg.arrival;
                     const segDeparture = seg.departure;
-                    const segRestoreNumAvailByDate = await getStoredNumAvailSnapshotForBlock(building, segRoomId, segArrival, segDeparture);
+                    const segRestoreNumAvailByDate = numAvailSnapshots.get(seg) || {};
 
-                    console.log(`[createBooking] 블락 segment: ${building} ${segRoomName} (roomId: ${segRoomId}) ${segArrival}~${segDeparture}`);
+                    const overrideResult = overrideResultBySegment.get(seg);
+                    if (!overrideResult?.success) {
+                        throw new Error(overrideResult?.error || "Beds24 blackout override create failed");
+                    }
 
-                    await createBeds24BlackoutOverride({ roomId: segRoomId, arrival: segArrival, departure: segDeparture });
                     await patchPriceSyncForBlackout(building, segRoomId, segArrival, segDeparture);
 
                     const segBookingId = getInventoryOverrideBlockDocId(segRoomId, segArrival, segDeparture);
