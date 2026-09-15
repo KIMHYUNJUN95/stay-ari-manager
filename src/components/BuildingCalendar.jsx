@@ -3009,7 +3009,6 @@ function BuildingCalendar() {
   // 블록 관리 관련 상태
   // 블락 해제 모달: 클릭한 가상 블락 바와, 그에 대응하는 실제 블락 문서들
   const [unblockTarget, setUnblockTarget] = useState(null); // { bar, docs }
-  const [unblockBusy, setUnblockBusy] = useState(false);
   const [showBlockCleanupModal, setShowBlockCleanupModal] = useState(false);
   const [blockData, setBlockData] = useState([]);
   const [blockLoading, setBlockLoading] = useState(false);
@@ -4737,55 +4736,54 @@ function BuildingCalendar() {
 
   const handleUnblock = async (docs) => {
     if (!companyId || !Array.isArray(docs) || docs.length === 0) return;
-    setUnblockBusy(true);
-    const failed = [];
-    const failedDocs = [];
+
+    // 블락 생성과 같은 UX: 낙관적으로 먼저 풀고 모달을 닫은 뒤 나머지는 뒤에서 처리한다.
+    // 모달을 띄운 채 기다리면 듀얼 ID 기준 10초 가까이 화면이 묶여 "가격이 안 보인다"가 된다.
     patchOverrideForBlockDocs(docs, "");
-    try {
-      for (const blockDoc of docs) {
-        try {
-          const response = await fetch(`${API_BASE_URL}/cancelBooking`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              companyId,
-              bookId: blockDoc.bookId || blockDoc.id,
-              building: blockDoc.building,
-              reason: "Block released from calendar"
-            })
-          });
-          const result = await response.json();
-          if (!result.success) {
-            failed.push(`${blockDoc.room} ${blockDoc.arrival}: ${result.error || "unknown"}`);
-            failedDocs.push(blockDoc);
-          }
-        } catch (err) {
-          failed.push(`${blockDoc.room} ${blockDoc.arrival}: ${err.message}`);
-          failedDocs.push(blockDoc);
-        }
-      }
+    setUnblockTarget(null);
 
-      // 실패한 건은 Beds24에 여전히 블락이 남아 있으므로 낙관적 해제를 되돌린다.
-      if (failedDocs.length > 0) patchOverrideForBlockDocs(failedDocs, "blackout");
-
-      // 해제 결과는 price_sync의 room 문서에만 반영되고 건물 부모 문서는 바뀌지 않으므로
-      // 실시간 구독이 걸리지 않는다. 여기서 명시적으로 가격 캐시를 다시 읽는다.
-      clearPriceCacheSession(companyId, calendarBuilding);
-      if (calendarBuilding && calendarBuilding !== "전체") {
-        await fetchPrices(true, calendarBuilding);
-      }
-
-      if (failed.length > 0) {
-        setPriceJobToast({ status: "partial", message: `Unblock partially failed: ${failed.join(" / ")}` });
-      } else {
-        setPriceJobToast({
-          status: "success",
-          message: `Unblocked ${docs.length} block${docs.length === 1 ? "" : "s"}.`
+    // 문서마다 roomId가 달라 Beds24 호출이 서로 겹치지 않는다.
+    // 순차로 돌리면 듀얼 ID가 문서 수만큼 배로 걸려서 병렬로 보낸다.
+    const settled = await Promise.all(docs.map(async (blockDoc) => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/cancelBooking`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            companyId,
+            bookId: blockDoc.bookId || blockDoc.id,
+            building: blockDoc.building,
+            reason: "Block released from calendar"
+          })
         });
+        const result = await response.json();
+        return { blockDoc, error: result.success ? null : (result.error || "unknown") };
+      } catch (err) {
+        return { blockDoc, error: err.message };
       }
-    } finally {
-      setUnblockBusy(false);
-      setUnblockTarget(null);
+    }));
+
+    // 실패한 건은 Beds24에 여전히 블락이 남아 있으므로 낙관적 해제를 되돌린다.
+    const failures = settled.filter((entry) => entry.error);
+    if (failures.length > 0) {
+      patchOverrideForBlockDocs(failures.map((entry) => entry.blockDoc), "blackout");
+    }
+
+    // 해제 결과는 price_sync의 room 문서에만 반영되고 건물 부모 문서는 바뀌지 않으므로
+    // 실시간 구독이 걸리지 않는다. 여기서 명시적으로 가격 캐시를 다시 읽는다.
+    clearPriceCacheSession(companyId, calendarBuilding);
+    if (calendarBuilding && calendarBuilding !== "전체") {
+      await fetchPrices(true, calendarBuilding);
+    }
+
+    if (failures.length > 0) {
+      const detail = failures.map((entry) => `${entry.blockDoc.room} ${entry.blockDoc.arrival}: ${entry.error}`).join(" / ");
+      setPriceJobToast({ status: "partial", message: `Unblock partially failed: ${detail}` });
+    } else {
+      setPriceJobToast({
+        status: "success",
+        message: `Unblocked ${docs.length} block${docs.length === 1 ? "" : "s"}.`
+      });
     }
   };
 
@@ -7049,7 +7047,7 @@ function BuildingCalendar() {
           const nights = dayjs(bar.departure).diff(dayjs(bar.arrival), "day");
           return (
             <div
-              onClick={() => { if (!unblockBusy) setUnblockTarget(null); }}
+              onClick={() => setUnblockTarget(null)}
               style={{
                 position: "fixed", inset: 0, background: "rgba(15, 23, 42, 0.45)",
                 display: "flex", alignItems: "center", justifyContent: "center",
@@ -7103,25 +7101,23 @@ function BuildingCalendar() {
                 <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
                   <button
                     onClick={() => setUnblockTarget(null)}
-                    disabled={unblockBusy}
                     style={{
                       padding: "10px 18px", borderRadius: "10px", border: "1px solid #CBD5E1",
                       background: "#FFFFFF", color: "#475569", fontSize: "13px", fontWeight: "600",
-                      cursor: unblockBusy ? "not-allowed" : "pointer"
+                      cursor: "pointer"
                     }}
                   >{isAppBlock ? "Cancel" : "Close"}</button>
                   {isAppBlock && (
                     <button
                       onClick={() => handleUnblock(docs)}
-                      disabled={unblockBusy}
                       style={{
                         padding: "10px 18px", borderRadius: "10px", border: "none",
-                        background: unblockBusy ? "#94A3B8" : "#4F46E5",
+                        background: "#4F46E5",
                         color: "#FFFFFF", fontSize: "13px", fontWeight: "600",
-                        cursor: unblockBusy ? "not-allowed" : "pointer",
-                        boxShadow: unblockBusy ? "none" : "0 4px 12px rgba(79, 70, 229, 0.3)"
+                        cursor: "pointer",
+                        boxShadow: "0 4px 12px rgba(79, 70, 229, 0.3)"
                       }}
-                    >{unblockBusy ? "Releasing..." : "Release Block"}</button>
+                    >Release Block</button>
                   )}
                 </div>
               </div>
