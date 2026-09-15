@@ -7561,13 +7561,13 @@ exports.createBooking = onRequest({ cors: true, memory: "1GiB", timeoutSeconds: 
                         enrichReservationDocument(segEnriched, { companyId: companyId || DEFAULT_COMPANY_ID, syncSource: "manual_create_inventory_override", syncMode: "manual" }),
                         { merge: true }
                     );
-                    results.push({ success: true, bookingId: segBookingId, arrival: segArrival, departure: segDeparture });
+                    results.push({ success: true, bookingId: segBookingId, roomId: String(segRoomId), room: segRoomName, arrival: segArrival, departure: segDeparture });
 
                     syncSingleRoomPriceCache(building, segRoomId, segRoomName, { reason: "manual_inventory_blackout_create", companyId })
                         .catch(cacheErr => console.warn("[createBooking] Segment cache sync failed:", cacheErr.message));
                 } catch (segErr) {
-                    console.error(`[createBooking] Segment failed (${seg.arrival}~${seg.departure}):`, segErr.message);
-                    results.push({ success: false, error: segErr.message, arrival: seg.arrival, departure: seg.departure });
+                    console.error(`[createBooking] Segment failed (roomId=${seg.roomId} ${seg.arrival}~${seg.departure}):`, segErr.message);
+                    results.push({ success: false, error: segErr.message, roomId: String(seg.roomId || ""), room: seg.room || "", arrival: seg.arrival, departure: seg.departure });
                 }
             }
 

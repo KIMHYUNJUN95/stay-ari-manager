@@ -2080,63 +2080,22 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
       mainRoomInfo = resolvedInfo;
     }
     if (isBlackout && targetRoomInfos.length > 1) {
-      const stayDates = [];
-      let cursor = dayjs(arrival);
-      const dep = dayjs(departure);
-      while (cursor.isBefore(dep)) {
-        stayDates.push(cursor.format("YYYY-MM-DD"));
-        cursor = cursor.add(1, "day");
-      }
-
-      const resolveRoomInfoForDate = (dateStr) => {
-        const dateKey = dateStr.replace(/-/g, "");
-        const activeInfos = targetRoomInfos.filter((info) => {
-          const priceInfo = modalPriceSource?.[String(info.roomId)]?.dates?.[dateKey];
-          const minStay = parseInt(priceInfo?.m, 10);
-          return Number.isFinite(minStay) && minStay >= 1 && minStay < INACTIVE_MINSTAY_THRESHOLD;
-        });
-        return pickPreferredRoomInfo(building, room, activeInfos);
-      };
-
-      const firstInfo = stayDates[0]
-        ? resolveRoomInfoForDate(stayDates[0])
-        : pickPreferredRoomInfo(building, room, targetRoomInfos);
-      if (!firstInfo) {
-        alert("Active room could not be resolved for this block stay after building change. Please refresh prices and try again.");
-        return;
-      }
-
-      const blockSegments = [];
-      let segmentStart = stayDates[0] || arrival;
-      let currentInfo = firstInfo;
-
-      for (let i = 1; i < stayDates.length; i++) {
-        const nextInfo = resolveRoomInfoForDate(stayDates[i]);
-        if (!nextInfo) {
-          alert("Active room could not be resolved for this block stay after building change. Please refresh prices and try again.");
-          return;
-        }
-
-        if (String(nextInfo.roomId) !== String(currentInfo.roomId)) {
-          blockSegments.push({
-            roomInfo: currentInfo,
-            arrival: segmentStart,
-            departure: stayDates[i]
-          });
-          segmentStart = stayDates[i];
-          currentInfo = nextInfo;
-        }
-      }
-
-      blockSegments.push({
-        roomInfo: currentInfo,
-        arrival: segmentStart,
+      // 듀얼 roomId 객실은 모든 ID에 전 구간을 블락한다.
+      //
+      // 이전에는 날짜별 "활성" ID 하나만 골라 블락했는데, 두 ID가 동시에 열리는 교차일에는
+      // 나머지 ID로 예약이 그대로 가능해 블락이 뚫렸다. minStay 50~99는 사내 관례일 뿐
+      // 하드 블락이 아니라서, 비활성 ID도 반드시 함께 막아야 한다.
+      // (같은 물리적 객실이므로 어느 ID로 들어와도 팔리면 안 된다)
+      const blockSegments = targetRoomInfos.map((roomInfo) => ({
+        roomInfo,
+        arrival,
         departure
-      });
+      }));
 
-      const optimisticBlocks = blockSegments.map((seg, index) =>
-        buildOptimisticInventoryBlock(seg.roomInfo.name, seg.arrival, seg.departure, `${Date.now()}:${index}`)
-      );
+      // 화면에 그릴 바는 1개다. roomId마다 만들면 같은 객실·같은 날짜에 바가 겹쳐 보인다.
+      const optimisticBlocks = [
+        buildOptimisticInventoryBlock(room, arrival, departure, `${Date.now()}:0`)
+      ];
       const rollbackIds = optimisticBlocks.map((block) => block.id);
       onOptimisticBlockStart && onOptimisticBlockStart(optimisticBlocks);
       onClose && onClose();
@@ -2168,17 +2127,15 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
         }
 
         if (response.data.partialFailure) {
+          // 이제 모든 세그먼트가 같은 날짜 구간이고 roomId만 다르다.
+          // 일부만 실패하면 "한쪽 ID는 막혔고 다른 쪽은 열려 있는" 위험한 반쪽 상태이므로,
+          // 바를 되돌려 감추지 않고 실패한 roomId를 그대로 알려 재시도하게 한다.
           const failed = (response.data.results || []).filter(r => !r.success);
-          const failedIdSet = new Set(
-            failed.map(r => `${r.arrival}__${r.departure}`)
+          alert(
+            "Block partially failed — this room is still bookable through the remaining room ID.\n\n"
+            + failed.map(r => `roomId ${r.roomId || "?"}: ${r.error || "unknown error"}`).join("\n")
+            + "\n\nPlease retry."
           );
-          const rollbackFailedIds = optimisticBlocks
-            .filter(block => failedIdSet.has(`${block.arrival}__${block.departure}`))
-            .map(block => block.id);
-          if (rollbackFailedIds.length > 0) {
-            onOptimisticBlockRollback && onOptimisticBlockRollback(rollbackFailedIds);
-          }
-          alert("Some segments failed:\n" + failed.map(r => `${r.arrival}~${r.departure}: ${r.error}`).join("\n"));
           onSave();
           return;
         }
@@ -3050,6 +3007,9 @@ function BuildingCalendar() {
   const [showCancelled, setShowCancelled] = useState(false); // 취소된 예약 보기 여부
 
   // 블록 관리 관련 상태
+  // 블락 해제 모달: 클릭한 가상 블락 바와, 그에 대응하는 실제 블락 문서들
+  const [unblockTarget, setUnblockTarget] = useState(null); // { bar, docs }
+  const [unblockBusy, setUnblockBusy] = useState(false);
   const [showBlockCleanupModal, setShowBlockCleanupModal] = useState(false);
   const [blockData, setBlockData] = useState([]);
   const [blockLoading, setBlockLoading] = useState(false);
@@ -4721,6 +4681,53 @@ function BuildingCalendar() {
   }, [companyId]);
 
   // 블록 데이터 일괄 삭제 함수 (Beds24 API + Firestore 동시 삭제)
+  // 블락 해제. 백엔드 cancelBooking이 isInventoryOverrideBlock을 감지해
+  // Beds24 override를 "none"으로 되돌리고, 블락 직전 저장해둔 numAvail을 복원한다.
+  const handleUnblock = async (docs) => {
+    if (!companyId || !Array.isArray(docs) || docs.length === 0) return;
+    setUnblockBusy(true);
+    const failed = [];
+    try {
+      for (const blockDoc of docs) {
+        try {
+          const response = await fetch(`${API_BASE_URL}/cancelBooking`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              companyId,
+              bookId: blockDoc.bookId || blockDoc.id,
+              building: blockDoc.building,
+              reason: "Block released from calendar"
+            })
+          });
+          const result = await response.json();
+          if (!result.success) failed.push(`${blockDoc.room} ${blockDoc.arrival}: ${result.error || "unknown"}`);
+        } catch (err) {
+          failed.push(`${blockDoc.room} ${blockDoc.arrival}: ${err.message}`);
+        }
+      }
+
+      // 해제 결과는 price_sync의 room 문서에만 반영되고 건물 부모 문서는 바뀌지 않으므로
+      // 실시간 구독이 걸리지 않는다. 여기서 명시적으로 가격 캐시를 다시 읽는다.
+      clearPriceCacheSession(companyId, calendarBuilding);
+      if (calendarBuilding && calendarBuilding !== "전체") {
+        await fetchPrices(true, calendarBuilding);
+      }
+
+      if (failed.length > 0) {
+        setPriceJobToast({ status: "partial", message: `Unblock partially failed: ${failed.join(" / ")}` });
+      } else {
+        setPriceJobToast({
+          status: "success",
+          message: `Unblocked ${docs.length} block${docs.length === 1 ? "" : "s"}.`
+        });
+      }
+    } finally {
+      setUnblockBusy(false);
+      setUnblockTarget(null);
+    }
+  };
+
   const deleteBlockData = async (blockIds) => {
     if (blockIds.length === 0) return;
 
@@ -5211,6 +5218,23 @@ function BuildingCalendar() {
     if (selectedBuilding === '전체') return reservations;
     return reservations.filter(r => !r.isInventoryOverrideBlock);
   }, [reservations, selectedBuilding]);
+
+  // 앱에서 만든 블락 문서들. 화면에는 ov 기반 가상 바만 보이고 이 문서들은 숨겨지므로(위 필터),
+  // 해제하려면 클릭한 가상 바에 대응하는 실제 문서를 역으로 찾아야 한다.
+  const appCreatedBlockDocs = useMemo(
+    () => reservations.filter((r) => r.isInventoryOverrideBlock === true && r.status !== "cancelled"),
+    [reservations]
+  );
+
+  // 가상 바 하나가 연속된 blackout 날짜를 병합한 것이라, 여러 문서에 걸칠 수 있다.
+  // 겹치는 문서를 모두 반환한다. (하나도 없으면 Beds24에서 직접 건 블락)
+  const findAppBlockDocsForRange = useCallback(
+    (building, room, arrival, departure) => appCreatedBlockDocs.filter((r) =>
+      r.building === building && r.room === room &&
+      r.arrival && r.departure && r.arrival < departure && r.departure > arrival
+    ),
+    [appCreatedBlockDocs]
+  );
 
   const visibleOptimisticInventoryBlocks = useMemo(() => {
     return optimisticInventoryBlocks.filter((block) => {
@@ -6374,6 +6398,17 @@ function BuildingCalendar() {
         onClick={() => {
           // 편집 모드(가격/gap)에서는 어떤 예약 바 클릭도 상세 모달을 열지 않음
           if (isEditMode) return;
+          // 블락 바 클릭 → 해제 모달. 앱에서 만든 블락인지 Beds24에서 건 블락인지는
+          // 대응하는 실제 문서가 있는지로 구분한다 (화면에 보이는 건 둘 다 가상 바다).
+          if (isInventoryLikeBlock) {
+            setUnblockTarget({
+              bar: reservation,
+              docs: findAppBlockDocsForRange(
+                reservation.building, reservation.room, reservation.arrival, reservation.departure
+              )
+            });
+            return;
+          }
           if (!isInventoryLikeBlock && !allowPriceEditThroughBlock) {
             // Clicking an actual reservation means the user chose details instead of
             // continuing a pending manual-booking range selection.
@@ -6407,7 +6442,8 @@ function BuildingCalendar() {
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
-          cursor: (isEditMode || isInventoryLikeBlock || allowPriceEditThroughBlock) ? "default" : "pointer",
+          // 블락 바도 이제 클릭하면 해제 모달이 열리므로 포인터를 준다.
+          cursor: (isEditMode || allowPriceEditThroughBlock) ? "default" : "pointer",
           boxShadow: isCancelled
             ? "none"
             : (isPriceDrivenSuccess
@@ -6943,6 +6979,94 @@ function BuildingCalendar() {
 
         {/* 데스크탑 전용 뷰 */}
         {!isMobile && (<>
+
+        {/* 블락 해제 모달 */}
+        {unblockTarget && (() => {
+          const { bar, docs } = unblockTarget;
+          const isAppBlock = docs.length > 0;
+          const lastNight = dayjs(bar.departure).subtract(1, "day").format("YYYY-MM-DD");
+          const nights = dayjs(bar.departure).diff(dayjs(bar.arrival), "day");
+          return (
+            <div
+              onClick={() => { if (!unblockBusy) setUnblockTarget(null); }}
+              style={{
+                position: "fixed", inset: 0, background: "rgba(15, 23, 42, 0.45)",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                zIndex: 100000, padding: "16px"
+              }}
+            >
+              <div
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  background: "#FFFFFF", borderRadius: "16px", padding: "24px",
+                  width: "100%", maxWidth: "420px",
+                  boxShadow: "0 20px 48px rgba(15, 23, 42, 0.24)", border: "1px solid #E2E8F0"
+                }}
+              >
+                <div style={{ fontSize: "17px", fontWeight: "700", color: "#1E293B", marginBottom: "6px" }}>
+                  {isAppBlock ? "Release Block" : "Beds24 Block"}
+                </div>
+                <div style={{ fontSize: "13px", color: "#64748B", marginBottom: "18px" }}>
+                  {getBuildingNameEN(bar.building)} · {getRoomNameEN(bar.room)}
+                </div>
+
+                <div style={{
+                  background: "#F8FAFC", border: "1px solid #E2E8F0", borderRadius: "12px",
+                  padding: "14px 16px", marginBottom: "18px", fontSize: "13px", color: "#334155"
+                }}>
+                  <div style={{ fontWeight: "600", marginBottom: "4px" }}>
+                    {bar.arrival} ~ {lastNight}
+                  </div>
+                  <div style={{ color: "#64748B" }}>{nights} night{nights === 1 ? "" : "s"}</div>
+                </div>
+
+                {isAppBlock ? (
+                  <div style={{ fontSize: "13px", color: "#334155", lineHeight: 1.6, marginBottom: "20px" }}>
+                    Releasing will clear the blackout in Beds24 and restore the original availability.
+                    {docs.length > 1 && (
+                      <div style={{ marginTop: "8px", color: "#64748B" }}>
+                        This bar covers {docs.length} blocks — all of them will be released.
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div style={{
+                    fontSize: "13px", color: "#92400E", lineHeight: 1.6, marginBottom: "20px",
+                    background: "#FFFBEB", border: "1px solid #FDE68A", borderRadius: "10px", padding: "12px 14px"
+                  }}>
+                    This block was set directly in Beds24, so there is no record here to release.
+                    Please remove it from the Beds24 calendar — it will disappear here automatically.
+                  </div>
+                )}
+
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
+                  <button
+                    onClick={() => setUnblockTarget(null)}
+                    disabled={unblockBusy}
+                    style={{
+                      padding: "10px 18px", borderRadius: "10px", border: "1px solid #CBD5E1",
+                      background: "#FFFFFF", color: "#475569", fontSize: "13px", fontWeight: "600",
+                      cursor: unblockBusy ? "not-allowed" : "pointer"
+                    }}
+                  >{isAppBlock ? "Cancel" : "Close"}</button>
+                  {isAppBlock && (
+                    <button
+                      onClick={() => handleUnblock(docs)}
+                      disabled={unblockBusy}
+                      style={{
+                        padding: "10px 18px", borderRadius: "10px", border: "none",
+                        background: unblockBusy ? "#94A3B8" : "#4F46E5",
+                        color: "#FFFFFF", fontSize: "13px", fontWeight: "600",
+                        cursor: unblockBusy ? "not-allowed" : "pointer",
+                        boxShadow: unblockBusy ? "none" : "0 4px 12px rgba(79, 70, 229, 0.3)"
+                      }}
+                    >{unblockBusy ? "Releasing..." : "Release Block"}</button>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* 월 선택 모달 */}
         {showMonthPicker && (
