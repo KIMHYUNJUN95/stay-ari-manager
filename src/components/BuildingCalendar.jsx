@@ -97,6 +97,8 @@ const BUILDING_ROOMS = {
 // Firebase Functions API URL
 const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || "https://us-central1-my-booking-app-3f0e7.cloudfunctions.net";
 const PRICE_CACHE_SESSION_TTL_MS = 5 * 60 * 1000;
+// 가격 조회 실패 시 재시도 간격 (지수 백오프). 길이가 곧 최대 재시도 횟수다.
+const PRICE_FETCH_RETRY_DELAYS_MS = [2000, 5000, 12000];
 
 function getPriceCacheSessionKey(companyId, building) {
   return `stayAri.priceCache.v1.${encodeURIComponent(String(companyId || ""))}.${encodeURIComponent(String(building || ""))}`;
@@ -3087,6 +3089,8 @@ function BuildingCalendar() {
   const priceFetchRequestIdRef = useRef(0);
   const priceFetchRequestKeyRef = useRef("");
   const fetchPricesRef = useRef(null);
+  const priceRetryTimerRef = useRef(null);
+  const priceRetryAttemptRef = useRef(0);
   const isMountedRef = useRef(true); // unmount 후 상태 오염 방지
   const lastReservationSignatureRef = useRef("");
   const lastPriceReservationSignatureByBuildingRef = useRef({});
@@ -4369,6 +4373,39 @@ function BuildingCalendar() {
   };
 
   // 가격 데이터 조회 (Firestore 캐시에서 가져옴 - API 직접 호출 안함)
+  // 가격 조회는 실패해도 스스로 복구하지 못했다.
+  // 건물 전환은 gapCoverageDays를 바꾸지 않아 트리거 effect가 단 한 번만 돌기 때문에,
+  // 그 한 번이 실패하면 새로고침하거나 다른 건물을 다녀오기 전까지 가격이 빈 채로 남았다.
+  // → 실패 시 지수 백오프로 재시도한다. (예약 구독이 쓰는 방식과 동일)
+  const clearPriceRetry = useCallback(() => {
+    if (priceRetryTimerRef.current) {
+      clearTimeout(priceRetryTimerRef.current);
+      priceRetryTimerRef.current = null;
+    }
+    priceRetryAttemptRef.current = 0;
+  }, []);
+
+  // 재시도를 예약했으면 true, 횟수를 모두 소진했으면 false
+  const schedulePriceRetry = useCallback((building, reason) => {
+    if (!building || building === "전체") return false;
+    if (priceRetryTimerRef.current) return true; // 이미 예약됨
+    if (priceRetryAttemptRef.current >= PRICE_FETCH_RETRY_DELAYS_MS.length) return false;
+
+    const attempt = priceRetryAttemptRef.current;
+    priceRetryAttemptRef.current = attempt + 1;
+    const delay = PRICE_FETCH_RETRY_DELAYS_MS[attempt];
+    console.warn(`[BuildingCalendar] 가격 조회 재시도 ${attempt + 1}/${PRICE_FETCH_RETRY_DELAYS_MS.length} (${reason}) — ${delay}ms 후`);
+
+    priceRetryTimerRef.current = setTimeout(() => {
+      priceRetryTimerRef.current = null;
+      if (!isMountedRef.current) return;
+      // 그 사이 사용자가 다른 건물로 옮겼으면 그 건물의 조회가 이미 돌고 있으므로 중단
+      if (selectedBuildingRef.current !== building) return;
+      fetchPricesRef.current?.(true, building);
+    }, delay);
+    return true;
+  }, []);
+
   const fetchPrices = useCallback(async (forceRefresh = false, buildingOverride = null, onSettled = null) => {
     const targetBuilding = buildingOverride || selectedBuildingRef.current;
     if (!targetBuilding || targetBuilding === "전체") return; // 전체 보기에서는 가격 조회 안함
@@ -4465,14 +4502,20 @@ function BuildingCalendar() {
         lastPriceCacheReadAtByBuildingRef.current[fetchBuilding] = Date.now();
         writePriceCacheSession(companyId, fetchBuilding, data);
         didApplyFreshPriceData = true;
+        clearPriceRetry();
       } else if (data.noCache) {
-        // noCache는 에러가 아님 — pricesError 올리지 않음
+        // 동기화 전이라 캐시가 아직 없는 상태. 잠시 후 재시도하면 대부분 채워진다.
+        // 예전에는 경고만 찍고 방치해서 가격이 빈 채로 남았다.
         console.warn("Price cache unavailable, waiting for sync...");
+        if (isMountedRef.current && !schedulePriceRetry(fetchBuilding, "noCache")) {
+          setPricesError(true); // 재시도를 모두 소진하면 그때는 사용자에게 알린다
+        }
       } else {
         // 논리 실패: stale 가드(line 위)를 통과한 최신 요청이므로 에러 반영
         console.error("Price fetch failed:", data.error || "Unknown error");
         if (isMountedRef.current) {
           setPricesError(true);
+          schedulePriceRetry(fetchBuilding, "server_error");
         }
       }
     } catch (err) {
@@ -4484,6 +4527,7 @@ function BuildingCalendar() {
       // stale 요청 또는 unmount 후에는 상태 변경 금지
       if (requestId === priceFetchRequestIdRef.current && isMountedRef.current) {
         setPricesError(true);
+        schedulePriceRetry(fetchBuilding, "network_error");
       }
     } finally {
       if (requestId === priceFetchRequestIdRef.current && isMountedRef.current) {
@@ -4497,7 +4541,7 @@ function BuildingCalendar() {
         if (onSettled) onSettled(didApplyFreshPriceData); // always called so retry logic can run
       }
     }
-  }, [companyId, gapCoverageDays, hasVisiblePriceCoverage, updatePriceCache]);
+  }, [companyId, gapCoverageDays, hasVisiblePriceCoverage, updatePriceCache, clearPriceRetry, schedulePriceRetry]);
 
   useEffect(() => {
     fetchPricesRef.current = fetchPrices;
@@ -4512,15 +4556,22 @@ function BuildingCalendar() {
       priceFetchControllerRef.current?.abort();
       priceFetchControllerRef.current = null;
       priceFetchRequestKeyRef.current = "";
+      if (priceRetryTimerRef.current) {
+        clearTimeout(priceRetryTimerRef.current);
+        priceRetryTimerRef.current = null;
+      }
     };
   }, []);
 
   // 일반 모드/가격 모드 모두 날짜별 활성 roomId 결정을 위해 캐시 로드
+  // 건물이 바뀌면 이전 건물에 대해 예약된 재시도는 의미가 없으므로 취소한다.
   useEffect(() => {
+    clearPriceRetry();
+    setPricesError(false);
     if (calendarBuilding && calendarBuilding !== "전체") {
       fetchPrices(false, calendarBuilding);
     }
-  }, [calendarBuilding, fetchPrices]);
+  }, [calendarBuilding, fetchPrices, clearPriceRetry]);
 
   // Reservation changes can make the cached Beds24 availability stale (especially cancellations).
   // Re-read cache metadata immediately and suppress gap warnings until the affected room is refreshed.
@@ -8288,7 +8339,7 @@ function BuildingCalendar() {
                         Failed to load prices.
                         <span
                           style={{ cursor: "pointer", textDecoration: "underline" }}
-                          onClick={() => { setPricesError(false); fetchPrices(true); }}
+                          onClick={() => { clearPriceRetry(); setPricesError(false); fetchPrices(true); }}
                         >Retry</span>
                       </div>
                     )}
@@ -8820,6 +8871,25 @@ function BuildingCalendar() {
             )}
           </div>
         )}
+        {/* 가격 로드 실패 알림 (항상 노출)
+            기존 알림은 가격 모드 액션바 안에만 있어 일반 조회 모드에서는 아무 안내 없이
+            가격이 빈 채로 보였다. 자동 재시도를 모두 소진한 뒤에만 이 배너가 뜬다. */}
+        {pricesError && showBeds24DetailView && !priceMode && (
+          <div style={{
+            display: "flex", alignItems: "center", gap: "8px",
+            marginBottom: isCalendarFullscreen ? "8px" : "12px",
+            padding: "10px 16px", background: "#FEF2F2",
+            border: "1px solid #FCA5A5", borderRadius: "12px",
+            fontSize: "13px", color: "#DC2626", fontWeight: "600", flexShrink: 0
+          }}>
+            <span>Failed to load prices for {getBuildingNameEN(calendarBuilding)}.</span>
+            <span
+              style={{ cursor: "pointer", textDecoration: "underline" }}
+              onClick={() => { clearPriceRetry(); setPricesError(false); fetchPrices(true, calendarBuilding); }}
+            >Retry</span>
+          </div>
+        )}
+
         {/* 툴바 카드: 월 네비게이션 + 뷰 컨트롤 */}
         <div style={{
           display: "flex",
