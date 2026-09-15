@@ -12,7 +12,17 @@
         ".git",
         "firebase-debug.log",
         "firebase-debug.*.log",
-        "*.local"
+        "*.local",
+        ".env",
+        ".env.*",
+        "serviceAccountKey.json",
+        "check-*.js",
+        "check_*.js",
+        "count-*.js",
+        "debug_*.js",
+        "manual-*.js",
+        "test-*.js",
+        "test_*.js"
       ]
     }
   ],

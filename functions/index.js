@@ -1,6 +1,8 @@
 const { onRequest } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onDocumentWritten } = require("firebase-functions/v2/firestore");
+const { defineSecret } = require("firebase-functions/params");
+const { setGlobalOptions } = require("firebase-functions/v2/options");
 const axios = require("axios");
 const admin = require("firebase-admin");
 const dayjs = require("dayjs");
@@ -10,8 +12,10 @@ dayjs.extend(utc);
 dayjs.extend(timezone);
 const cors = require("cors")({ origin: true });
 const { createSlackReportModule } = require("./modules/slackReports");
+const { createHotelsmartCleaningModule } = require("./modules/hotelsmart");
 const { createGoogleSheetReportModule } = require("./modules/googleSheetReports");
 const { createNotionReportModule } = require("./modules/notionReports");
+const { createPriceConsistencyAuditModule } = require("./modules/priceConsistencyAudit");
 const { NOTION_PAGES, syncNotionSalesDashboard, syncNotionOccupancyDashboard, syncNotionPaxOccupancy, testNotionConnection } = require("./modules/notionReportSync");
 const { computeRevenueDashboardData } = require("./modules/revenueDashboardData");
 const { getMonthlyRevenueChartUrl, getBuildingRevenueChartUrl } = require("./modules/chartImage");
@@ -35,11 +39,46 @@ const db = admin.firestore();
 // Beds24 API V2 설정 (Firestore 토큰 캐싱)
 // ==========================================
 // ★ API 크레딧: 예약/캘린더/가격/메시지 등 모든 기능이 공통으로 200 크레딧 한도 사용.
-const BEDS24_REFRESH_TOKEN = "f9dBEWviugAGMcPCPMoRIOG7OpguLo187eDqsuhzaFKNrPdkISHOBZtZaYHGHc2Kc5uEaVljPfPq/xVbzPn0bkXrj2gf6Ly96bpHrsm9X9XwC4U/CAA/QPK9EgbVbQOEAj5iYME1EobhelKpStKYg1OK7zruxGOehEykt7yT5Mw=";
+const beds24RefreshTokenSecret = defineSecret("BEDS24_REFRESH_TOKEN");
+const googleServiceAccountJsonSecret = defineSecret("GOOGLE_SERVICE_ACCOUNT_JSON");
+setGlobalOptions({ secrets: [beds24RefreshTokenSecret, googleServiceAccountJsonSecret] });
 
 // 기본 Company ID (환경 변수 또는 하드코딩된 기본값)
 // 향후 멀티 테넌트 확장 시 각 회사별 Beds24 토큰 관리 필요
 const DEFAULT_COMPANY_ID = process.env.DEFAULT_COMPANY_ID || 'dGxlQyu47LbplLVCVXiV';
+const hotelsmartLoginIdSecret = defineSecret("HOTELSMART_LOGIN_ID");
+const hotelsmartPasswordSecret = defineSecret("HOTELSMART_PASSWORD");
+const HOTELSMART_SECRETS = [hotelsmartLoginIdSecret, hotelsmartPasswordSecret];
+
+async function authorizeInternalAutomationRequest(req) {
+    const authorization = String(req.headers?.authorization || "").trim();
+    const match = /^Bearer\s+(.+)$/i.exec(authorization);
+    if (!match) {
+        const error = new Error("Firebase ID token required");
+        error.statusCode = 401;
+        throw error;
+    }
+
+    let decodedToken;
+    try {
+        decodedToken = await admin.auth().verifyIdToken(match[1]);
+    } catch (verificationError) {
+        const error = new Error("Invalid Firebase ID token");
+        error.statusCode = 401;
+        throw error;
+    }
+
+    const userSnapshot = await db.collection("users").doc(decodedToken.uid).get();
+    const userData = userSnapshot.exists ? (userSnapshot.data() || {}) : {};
+    const allowedRoles = new Set(["owner", "manager"]);
+    if (userData.companyId !== DEFAULT_COMPANY_ID || !allowedRoles.has(userData.role)) {
+        const error = new Error("Owner or manager access required");
+        error.statusCode = 403;
+        throw error;
+    }
+
+    return { uid: decodedToken.uid, companyId: userData.companyId, role: userData.role };
+}
 
 // 메모리 캐시 (같은 인스턴스 내에서 Firestore 읽기 최소화)
 let beds24AccessToken = null;
@@ -96,10 +135,20 @@ async function getBeds24Token() {
     // 3단계: 토큰 갱신 (Beds24 API 호출)
     try {
         console.log("Beds24 토큰 갱신 요청...");
+        const refreshToken = String(beds24RefreshTokenSecret.value() || "")
+            .replace(/\uFEFF/g, "")
+            .replace(/[\r\n]/g, "")
+            .trim();
+        if (!refreshToken) {
+            throw new Error("BEDS24_REFRESH_TOKEN secret is empty");
+        }
+        if (/[\u0000-\u001F\u007F-\u009F]/.test(refreshToken)) {
+            throw new Error("BEDS24_REFRESH_TOKEN secret contains invalid control characters");
+        }
         const response = await axios.get("https://beds24.com/api/v2/authentication/token", {
             headers: {
                 "accept": "application/json",
-                "refreshToken": BEDS24_REFRESH_TOKEN
+                "refreshToken": refreshToken
             }
         });
 
@@ -140,6 +189,7 @@ const PROPERTIES = [
     { name: "오쿠보A동", id: "dJQloWov7XuXMUmSXyVsLP8LR", v2Id: 205165, companyId: DEFAULT_COMPANY_ID },
     { name: "오쿠보B동", id: "WbtREQENBg6aIR0pgEIympSAv", v2Id: 294552, companyId: DEFAULT_COMPANY_ID },
     { name: "오쿠보C동", id: "MXP5jJXp2mPxVhjdTAF0KnHTP", v2Id: 211056, companyId: DEFAULT_COMPANY_ID },
+    { name: "STAY ARI Apartment Hotel", id: "343112", v2Id: 343112, companyId: DEFAULT_COMPANY_ID },
     { name: "사노시", id: "gDzuVIkyvm5fqtuifdveeIKZO", v2Id: 226546, companyId: DEFAULT_COMPANY_ID }
 ];
 
@@ -176,6 +226,19 @@ async function fetchAllBeds24Properties() {
     }
 
     return allProperties;
+}
+
+async function assertBeds24PropertyCoverage(properties = PROPERTIES) {
+    const expectedIds = (properties || [])
+        .filter((prop) => prop && !prop.disabled)
+        .map((prop) => String(prop.v2Id));
+    const accessibleProperties = await fetchAllBeds24Properties();
+    const accessibleIds = new Set(accessibleProperties.map((prop) => String(prop.id)));
+    const missingIds = expectedIds.filter((propertyId) => !accessibleIds.has(propertyId));
+    if (missingIds.length > 0) {
+        throw new Error(`Beds24 property coverage incomplete: ${missingIds.join(",")}`);
+    }
+    return { expectedCount: expectedIds.length, accessibleCount: accessibleIds.size };
 }
 
 async function syncBeds24Properties({ reason = "manual" } = {}) {
@@ -250,7 +313,9 @@ const PRICE_FULL_RECONCILE_INTERVAL_MINUTES = 360;       // 가격은 웹훅+증
 const RESERVATION_SYNC_PAST_MONTHS = 6;
 const RESERVATION_SYNC_FUTURE_MONTHS = 12;
 const RESERVATION_INCREMENTAL_BUFFER_MINUTES = 10;
-const BEDS24_REQUEST_SOFT_LIMIT = 120;
+// Beds24 credits are shared at account level. Keep enough headroom for
+// booking/inventory webhooks and other functions running in parallel.
+const BEDS24_REQUEST_SOFT_LIMIT = 80;
 const BEDS24_REQUEST_WINDOW_MS = 5 * 60 * 1000;
 const BEDS24_REQUEST_WINDOW_BUFFER_MS = 5000;
 const PRICE_WEBHOOK_INVALIDATION_DEBOUNCE_MS = 5 * 60 * 1000;
@@ -322,6 +387,7 @@ const RESERVATION_MUTATION_FIELDS = [
     "guestPhone",
     "guestEmail",
     "room",
+    "roomId",
     "referer",
     "referrer",
     "subSource",
@@ -358,6 +424,30 @@ function buildReservationMutationSummary(beforeData, afterData) {
         changedFields: changes.map((change) => change.field),
         changes
     };
+}
+
+const SLACK_CLEANING_CORRECTION_FIELDS = new Set(["arrival", "room", "status"]);
+
+function shouldQueueSlackCleaningCorrection(beforeData, afterData, changedFields, todayStr) {
+    if (!beforeData || !afterData || !todayStr) return false;
+    if (!(changedFields || []).some((field) => SLACK_CLEANING_CORRECTION_FIELDS.has(field))) return false;
+
+    const beforeArrival = String(beforeData.arrival || "").slice(0, 10);
+    const afterArrival = String(afterData.arrival || "").slice(0, 10);
+    const beforeAffected = beforeData.status === "confirmed" && beforeArrival === todayStr;
+    const afterAffected = afterData.status === "confirmed" && afterArrival === todayStr;
+    return beforeAffected || afterAffected;
+}
+
+async function queueSlackCleaningCorrection({ companyId, bookingId, targetDate, changedFields }) {
+    await db.collection("slack_cleaning_correction_jobs").add({
+        companyId,
+        bookingId: String(bookingId || ""),
+        targetDate,
+        changedFields: Array.from(new Set(changedFields || [])),
+        status: "queued",
+        requestedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
 }
 
 function applyReservationActorMetadata(data, beforeData = null, eventType = "updated") {
@@ -672,19 +762,61 @@ async function recordReservationSyncAudit({
     syncVariant = null,
     ...rest
 }) {
-    const statusMarkers = {};
-    if (syncVariant === "webhook" || rest.syncType === "webhook") {
-        statusMarkers.lastWebhookAt = true;
+    const isWebhookAudit = syncVariant === "webhook" || rest.syncType === "webhook";
+    if (isWebhookAudit) {
+        const auditId = await recordSyncAudit({
+            domain: "reservations",
+            statusDocId: RESERVATION_SYNC_STATUS_DOC_ID,
+            ...rest,
+            updateStatusDoc: false
+        });
+        const webhookStatus = {
+            lastWebhookAuditId: auditId,
+            lastWebhookAt: admin.firestore.FieldValue.serverTimestamp(),
+            lastWebhookStatus: rest.status || "success",
+            lastWebhookErrorMessage: rest.errorMessage || "",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+        if ((rest.status || "success") !== "error") {
+            webhookStatus.lastWebhookSuccessAt = admin.firestore.FieldValue.serverTimestamp();
+        }
+        await db.collection("sync_status").doc(RESERVATION_SYNC_STATUS_DOC_ID).set(webhookStatus, { merge: true });
+        return auditId;
     }
-    if (syncVariant === "incremental") {
+
+    const errorMessage = String(rest.errorMessage || "");
+    const isTransientRateLimitError = rest.status === "error" &&
+        /(status code 429|\b429\b|limit exceeded|too many requests|rate limit)/i.test(errorMessage);
+    if (isTransientRateLimitError) {
+        const auditId = await recordSyncAudit({
+            domain: "reservations",
+            statusDocId: RESERVATION_SYNC_STATUS_DOC_ID,
+            ...rest,
+            updateStatusDoc: false
+        });
+        await db.collection("sync_status").doc(RESERVATION_SYNC_STATUS_DOC_ID).set({
+            lastAttemptAuditId: auditId,
+            lastAttemptAt: admin.firestore.FieldValue.serverTimestamp(),
+            lastAttemptStatus: "error",
+            lastAttemptErrorMessage: errorMessage,
+            lastTransientErrorAt: admin.firestore.FieldValue.serverTimestamp(),
+            lastTransientErrorReason: "beds24_rate_limit_429",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        return auditId;
+    }
+
+    const statusMarkers = {};
+    const isSuccessfulAudit = rest.status !== "error" && rest.status !== "skipped";
+    if (isSuccessfulAudit && syncVariant === "incremental") {
         statusMarkers.lastIncrementalAt = true;
         statusMarkers.lastReconciledAt = true;
     }
-    if (syncVariant === "full_reconcile" || syncVariant === "manual_quick" || syncVariant === "manual_full") {
+    if (isSuccessfulAudit && (syncVariant === "full_reconcile" || syncVariant === "manual_quick" || syncVariant === "manual_full")) {
         statusMarkers.lastFullReconcileAt = true;
         statusMarkers.lastReconciledAt = true;
     }
-    if (!syncVariant && rest.syncType !== "webhook") {
+    if (isSuccessfulAudit && !syncVariant && rest.syncType !== "webhook") {
         statusMarkers.lastReconciledAt = true;
     }
 
@@ -701,19 +833,20 @@ async function recordPriceSyncAudit({
     ...rest
 }) {
     const statusMarkers = {};
-    if (syncVariant === "webhook" || syncVariant === "immediate" ||
-        syncVariant === "queued" || syncVariant === "failed" || syncVariant === "skipped") {
+    const isSuccessfulAudit = rest.status !== "error" && rest.status !== "skipped";
+    if (isSuccessfulAudit && (syncVariant === "webhook" || syncVariant === "immediate" ||
+        syncVariant === "queued" || syncVariant === "failed" || syncVariant === "skipped")) {
         statusMarkers.lastWebhookAt = true;
     }
-    if (syncVariant === "incremental") {
+    if (isSuccessfulAudit && syncVariant === "incremental") {
         statusMarkers.lastIncrementalAt = true;
         statusMarkers.lastReconciledAt = true;
     }
-    if (syncVariant === "full_reconcile" || syncVariant === "manual_full") {
+    if (isSuccessfulAudit && (syncVariant === "full_reconcile" || syncVariant === "manual_full")) {
         statusMarkers.lastFullReconcileAt = true;
         statusMarkers.lastReconciledAt = true;
     }
-    if (syncVariant === "minstay_reconcile") {
+    if (isSuccessfulAudit && syncVariant === "minstay_reconcile") {
         statusMarkers.lastReconciledAt = true;
         statusMarkers.lastMinStayReconcileAt = true;
     }
@@ -736,8 +869,6 @@ function toDateOrNull(value) {
 
 function getLatestReservationSyncAt(statusData = {}) {
     const candidates = [
-        statusData.lastSuccessAt,
-        statusData.lastWebhookAt,
         statusData.lastIncrementalAt,
         statusData.lastFullReconcileAt,
         statusData.lastReconciledAt
@@ -765,6 +896,8 @@ const BEDS24_API_LOW_CREDIT_THRESHOLD = 10;
 const BEDS24_API_GUARD_MIN_COOLDOWN_SEC = 15;
 const BEDS24_API_GUARD_DEFAULT_COOLDOWN_SEC = 60;
 const BEDS24_API_GUARD_MAX_COOLDOWN_SEC = 300;
+const RESERVATION_FULL_SYNC_LOCK_DOC_ID = "reservation_full_sync_lock";
+const RESERVATION_FULL_SYNC_LOCK_TTL_MS = 20 * 60 * 1000;
 
 function normalizeBeds24ApiCooldownSec(resetInSec, fallbackSec = BEDS24_API_GUARD_DEFAULT_COOLDOWN_SEC) {
     const baseSec = Number.isFinite(resetInSec) && resetInSec > 0 ? (resetInSec + 2) : fallbackSec;
@@ -811,6 +944,47 @@ async function activateBeds24ApiGuard({
     }, { merge: true });
     console.warn(`[Beds24ApiGuard] ${reason} -> cooldown ${cooldownSec}s (${method || "API"} ${endpoint || ""})`);
     return { cooldownSec, cooldownUntil };
+}
+
+async function acquireReservationFullSyncLock(owner) {
+    const lockRef = db.collection("sync_status").doc(RESERVATION_FULL_SYNC_LOCK_DOC_ID);
+    return db.runTransaction(async (tx) => {
+        const snap = await tx.get(lockRef);
+        const data = snap.exists ? (snap.data() || {}) : {};
+        const expiresAt = toDateOrNull(data.expiresAt);
+        if (data.state === "running" && expiresAt && expiresAt.getTime() > Date.now()) {
+            return {
+                acquired: false,
+                owner: data.owner || null,
+                expiresAt
+            };
+        }
+
+        const nextExpiresAt = new Date(Date.now() + RESERVATION_FULL_SYNC_LOCK_TTL_MS);
+        tx.set(lockRef, {
+            state: "running",
+            owner,
+            acquiredAt: admin.firestore.FieldValue.serverTimestamp(),
+            expiresAt: nextExpiresAt,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        return { acquired: true, owner, expiresAt: nextExpiresAt };
+    });
+}
+
+async function releaseReservationFullSyncLock(owner) {
+    const lockRef = db.collection("sync_status").doc(RESERVATION_FULL_SYNC_LOCK_DOC_ID);
+    await db.runTransaction(async (tx) => {
+        const snap = await tx.get(lockRef);
+        if (!snap.exists || snap.data()?.owner !== owner) return;
+        tx.set(lockRef, {
+            state: "released",
+            owner: null,
+            expiresAt: new Date(0),
+            releasedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+    });
 }
 
 function getReservationSyncWindow(base = dayjs().tz("Asia/Tokyo")) {
@@ -935,14 +1109,12 @@ async function getScheduledReservationReconcileDecision({
 async function assertReservationDataReady(context, {
     companyId = DEFAULT_COMPANY_ID,
     maxAgeMinutes = REPORT_SYNC_MAX_AGE_MINUTES,
-    invalidThreshold = REPORT_INVALID_THRESHOLD
+    invalidThreshold = REPORT_INVALID_THRESHOLD,
+    allowAuditErrorWhenFresh = false
 } = {}) {
     const statusSnap = await db.collection("sync_status").doc(RESERVATION_SYNC_STATUS_DOC_ID).get();
     if (!statusSnap.exists) {
-        await sendSyncAlert(`${context}: sync status missing`, [
-            `companyId=${companyId}`,
-            "sync_status/reservations 문서가 없어 리포트를 중단했습니다."
-        ]);
+        console.warn(`[Reservation Gate] ${context}: sync status missing (companyId=${companyId})`);
         throw new Error(`[${context}] sync_status/reservations 문서가 없습니다.`);
     }
 
@@ -960,7 +1132,13 @@ async function assertReservationDataReady(context, {
         }
     }
 
-    if (data.lastAuditStatus === "error") {
+    const shouldIgnoreAuditError = (
+        allowAuditErrorWhenFresh &&
+        Boolean(lastHealthyAt) &&
+        invalidCriticalCount <= invalidThreshold
+    );
+
+    if (data.lastAuditStatus === "error" && !shouldIgnoreAuditError) {
         errors.push(`마지막 sync audit 상태가 error 입니다 (${data.lastErrorMessage || "원인 미상"})`);
     }
     if (invalidCriticalCount > invalidThreshold) {
@@ -968,10 +1146,10 @@ async function assertReservationDataReady(context, {
     }
 
     if (errors.length > 0) {
-        await sendSyncAlert(`${context}: reservation integrity gate blocked`, [
-            `companyId=${companyId}`,
-            ...errors
-        ]);
+        // The owning scheduled/manual function sends one incident alert.
+        // Sending here multiplied one sync issue across every downstream
+        // report and every webhook-triggered sales-log refresh.
+        console.warn(`[Reservation Gate] ${context} blocked (companyId=${companyId}): ${errors.join(" | ")}`);
         throw new Error(`[${context}] ${errors.join(" | ")}`);
     }
 }
@@ -1000,7 +1178,13 @@ function getStandardRoomName(roomId, rawName) {
         "437952": "오쿠보A", "615969": "오쿠보B", "450096": "오쿠보C", "496532": "오쿠보C", "648399": "오쿠보C",
         "481152": "사노",
         "513698": "201호", "513699": "301호", "513700": "401호", "556719": "401호",
-        "513701": "501호", "513702": "601호", "513703": "701호", "513704": "801호", "513705": "901호"
+        "513701": "501호", "513702": "601호", "513703": "701호", "513704": "801호", "513705": "901호",
+        "708662": "101", "708663": "102", "708632": "103", "708635": "105",
+        "708636": "106", "708637": "107", "708638": "108", "708642": "109", "708643": "110",
+        "708664": "201", "708665": "202", "708644": "203", "708645": "205",
+        "708646": "206", "708650": "207", "708651": "208", "708652": "209", "708653": "210",
+        "708666": "302", "708654": "303", "708656": "305", "708657": "306",
+        "708658": "307", "708659": "308", "708660": "309", "708661": "310"
     };
     return ROOM_MAPPING[roomId] || rawName || `Room(${roomId})`;
 }
@@ -1391,6 +1575,17 @@ async function fetchAllBookingsFromProperty(prop, dateParams, options = {}) {
                     await sleep(waitSec * 1000);
                     continue;
                 }
+                const isTransientNetworkError = (
+                    !err.response &&
+                    ["ECONNRESET", "ETIMEDOUT", "ECONNABORTED", "ENOTFOUND", "EAI_AGAIN"].includes(err.code)
+                ) || /socket hang up|network|timeout/i.test(err.message || "");
+                if (isTransientNetworkError && rateLimitRetry < 3) {
+                    rateLimitRetry++;
+                    const waitSec = rateLimitRetry * 5; // 5s, 10s, 15s
+                    console.warn(`  ⚠️ Transient Beds24 network error. ${waitSec}초 대기 후 재시도 (${rateLimitRetry}/3)`);
+                    await sleep(waitSec * 1000);
+                    continue;
+                }
                 throw err;
             }
             rateLimitRetry = 0; // 성공 시 재시도 카운터 리셋
@@ -1408,6 +1603,68 @@ async function fetchAllBookingsFromProperty(prop, dateParams, options = {}) {
 }
 
 // 빠른 동기화: 도쿄 시간 기준 과거 6개월 ~ 향후 12개월
+const BEDS24_BOOKING_STATUSES = ["confirmed", "new", "cancelled", "request", "black", "inquiry"];
+
+// Beds24 V2 supports repeated propertyId/status parameters. Fetch all active
+// properties in one pagination flow so reconciliation stays credit efficient.
+async function fetchAllBookingsFromProperties(properties, dateParams, options = {}) {
+    const activeProperties = (properties || []).filter((prop) => prop && !prop.disabled);
+    if (activeProperties.length === 0) return [];
+
+    const toV2Date = (value) => {
+        if (!value || value.length !== 8) return value;
+        return `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`;
+    };
+    const propertyById = new Map(activeProperties.map((prop) => [String(prop.v2Id), prop]));
+    const statuses = options.legacyMode
+        ? ["confirmed", "new", "cancelled"]
+        : BEDS24_BOOKING_STATUSES;
+    const requestBudget = options.requestBudget || null;
+    const finalParams = { ...dateParams };
+    if (finalParams.arrivalFrom) finalParams.arrivalFrom = toV2Date(finalParams.arrivalFrom);
+    if (finalParams.arrivalTo) finalParams.arrivalTo = toV2Date(finalParams.arrivalTo);
+
+    const allBookings = [];
+    let page = 1;
+    while (true) {
+        const params = {
+            propertyId: activeProperties.map((prop) => prop.v2Id),
+            status: statuses,
+            page,
+            limit: 100
+        };
+        if (finalParams.modifiedFrom) {
+            params.modifiedFrom = finalParams.modifiedFrom;
+        } else {
+            if (finalParams.arrivalFrom) params.arrivalFrom = finalParams.arrivalFrom;
+            if (finalParams.arrivalTo) params.arrivalTo = finalParams.arrivalTo;
+        }
+
+        await waitForBeds24RequestBudget(requestBudget, `bookings:batch:page${page}`);
+        consumeBeds24RequestBudget(requestBudget);
+        const response = await beds24GetV2WithGuard("/bookings", params, 5, {
+            paramsSerializer: beds24RepeatParamsSerializer
+        });
+        const rows = Array.isArray(response.data?.data) ? response.data.data : [];
+
+        for (const booking of rows) {
+            const prop = propertyById.get(String(booking.propertyId));
+            if (!prop) {
+                console.warn(`[Bookings Batch] Unknown propertyId=${booking.propertyId}, bookingId=${booking.id || "-"}`);
+                continue;
+            }
+            allBookings.push(normalize(booking, prop.id, prop.name, prop.companyId));
+        }
+
+        console.log(`[Bookings Batch] page=${page}, fetched=${rows.length}, accepted=${allBookings.length}`);
+        if (!response.data?.pages?.nextPageExists) break;
+        page++;
+        await sleep(500);
+    }
+
+    return allBookings;
+}
+
 async function fetchFromBeds24Quick(options = {}) {
     const tokyoNow = options.now ? dayjs(options.now).utcOffset(9) : dayjs().utcOffset(9);
     const syncWindow = getReservationSyncWindow(tokyoNow);
@@ -1417,26 +1674,10 @@ async function fetchFromBeds24Quick(options = {}) {
 
     console.log(`[Quick Sync] Tokyo: ${tokyoNow.format("YYYY-MM-DD HH:mm")} | Arrival Range: ${arrivalFrom} ~ ${arrivalTo}`);
 
-    const allBookings = [];
-
-    // ★ 순차 호출 (Beds24 제한: 동시 1개만)
-    for (const prop of PROPERTIES) {
-        if (prop.disabled) {
-            console.log(`⏭️  Skipping (disabled): ${prop.name}`);
-            continue;
-        }
-        console.log(`🔄 Fetching: ${prop.name}...`);
-        const bookings = await fetchAllBookingsFromProperty(prop, {
-            arrivalFrom: arrivalFrom,
-            arrivalTo: arrivalTo
-        }, {
-            requestBudget
-        });
-        allBookings.push(...bookings);
-
-        // API 호출 사이 딜레이 (2초로 증가 - Rate Limit 방지)
-        await sleep(2000);
-    }
+    const allBookings = await fetchAllBookingsFromProperties(PROPERTIES, {
+        arrivalFrom,
+        arrivalTo
+    }, { requestBudget });
 
     console.log(`✅ Quick Sync 완료: 총 ${allBookings.length}건`);
     return allBookings;
@@ -1450,27 +1691,10 @@ async function fetchFromBeds24Full(options = {}) {
 
     console.log(`[Full Sync] ${arrivalFrom} ~ ${arrivalTo}`);
 
-    const allBookings = [];
-
-    // ★ 순차 호출 (Beds24 제한: 동시 1개만)
-    for (const prop of PROPERTIES) {
-        if (prop.disabled) {
-            console.log(`⏭️  Skipping (disabled): ${prop.name}`);
-            continue;
-        }
-        console.log(`🔄 Fetching: ${prop.name}...`);
-        // ★ 변경: 객체 형태로 전달 (Arrival 기준)
-        const bookings = await fetchAllBookingsFromProperty(prop, {
-            arrivalFrom: arrivalFrom,
-            arrivalTo: arrivalTo
-        }, {
-            requestBudget
-        });
-        allBookings.push(...bookings);
-
-        // API 호출 사이 딜레이 (2초로 증가 - Rate Limit 방지)
-        await sleep(2000);
-    }
+    const allBookings = await fetchAllBookingsFromProperties(PROPERTIES, {
+        arrivalFrom,
+        arrivalTo
+    }, { requestBudget });
 
     console.log(`✅ Full Sync 완료: 총 ${allBookings.length}건`);
     return allBookings;
@@ -1488,19 +1712,156 @@ async function fetchFromBeds24Incremental(modifiedSince, options = {}) {
     const requestBudget = options.requestBudget || null;
     console.log(`[Incremental Sync] modifiedFrom=${modifiedFrom} (변경분만 조회)`);
 
-    const allBookings = [];
-    for (const prop of PROPERTIES) {
-        if (prop.disabled) continue;
-        const bookings = await fetchAllBookingsFromProperty(prop, { modifiedFrom }, { requestBudget });
-        allBookings.push(...bookings);
-        await sleep(1500);
-    }
+    const allBookings = await fetchAllBookingsFromProperties(PROPERTIES, { modifiedFrom }, { requestBudget });
     console.log(`✅ Incremental Sync 완료: ${allBookings.length}건 (변경분만)`);
     return allBookings;
 }
 
 function getBookingAmount(doc) {
     return Number(doc.totalPrice ?? doc.price) || 0;
+}
+
+async function collectReservationMutations(list) {
+    const uniqueItems = [...new Map((list || []).map((item) => [String(item.id), item])).values()];
+    const mutations = [];
+    const READ_CHUNK = 100;
+    for (let i = 0; i < uniqueItems.length; i += READ_CHUNK) {
+        const chunk = uniqueItems.slice(i, i + READ_CHUNK);
+        const refs = chunk.map((item) => db.collection("reservations").doc(String(item.id)));
+        const snapshots = await db.getAll(...refs);
+        snapshots.forEach((snapshot, index) => {
+            const beforeData = snapshot.exists ? snapshot.data() : null;
+            const afterData = chunk[index];
+            const mutationSummary = buildReservationMutationSummary(beforeData, afterData);
+            if (!beforeData || mutationSummary.changedFields.length > 0) {
+                mutations.push({ beforeData, afterData, mutationSummary });
+            }
+        });
+    }
+    return mutations;
+}
+
+const PRICE_CACHE_RESERVATION_FIELDS = new Set(["arrival", "departure", "status", "room", "roomId"]);
+
+async function invalidatePriceCacheForReservationMutations(
+    mutations,
+    companyId = DEFAULT_COMPANY_ID,
+    source = "reservation_mutation"
+) {
+    const affectedRoomIdsByBuilding = new Map();
+    const todayJst = dayjs().tz("Asia/Tokyo").format("YYYY-MM-DD");
+
+    const addAffectedReservation = (reservation) => {
+        if (!reservation) return;
+        if (reservation.companyId && reservation.companyId !== companyId) return;
+
+        const building = String(reservation.building || "").trim();
+        const roomId = String(reservation.roomId || "").trim();
+        const departure = String(reservation.departure || "").slice(0, 10);
+        if (!building || !roomId) return;
+        if (departure && departure < todayJst) return;
+
+        const property = PROPERTIES.find((item) => item.name === building && !item.disabled);
+        if (!property) return;
+
+        if (!affectedRoomIdsByBuilding.has(building)) {
+            affectedRoomIdsByBuilding.set(building, new Set());
+        }
+        affectedRoomIdsByBuilding.get(building).add(roomId);
+    };
+
+    for (const mutation of mutations || []) {
+        const changedFields = mutation?.mutationSummary?.changedFields || [];
+        if (!changedFields.some((field) => PRICE_CACHE_RESERVATION_FIELDS.has(field))) continue;
+
+        // A cancellation/date/room move can affect both the old and new inventory location.
+        addAffectedReservation(mutation.beforeData);
+        addAffectedReservation(mutation.afterData);
+    }
+
+    await Promise.all([...affectedRoomIdsByBuilding.entries()].map(async ([building, roomIdSet]) => {
+        const priceSyncRef = db.collection("price_sync").doc(building);
+        await db.runTransaction(async (transaction) => {
+            const snapshot = await transaction.get(priceSyncRef);
+            const current = snapshot.exists ? snapshot.data() : {};
+            const invalidatedRoomIds = new Set((current.invalidatedRoomIds || []).map(String));
+            const reservationInvalidatedRoomIds = new Set(
+                (current.reservationInvalidatedRoomIds || []).map(String)
+            );
+            roomIdSet.forEach((roomId) => invalidatedRoomIds.add(String(roomId)));
+            roomIdSet.forEach((roomId) => reservationInvalidatedRoomIds.add(String(roomId)));
+
+            transaction.set(priceSyncRef, {
+                invalidatedRoomIds: [...invalidatedRoomIds],
+                pendingInvalidationCount: invalidatedRoomIds.size,
+                reservationInvalidatedRoomIds: [...reservationInvalidatedRoomIds],
+                pendingReservationInvalidationCount: reservationInvalidatedRoomIds.size,
+                invalidatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                invalidatedBy: source,
+                reservationInvalidatedAt: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        });
+    }));
+
+    return Object.fromEntries(
+        [...affectedRoomIdsByBuilding.entries()].map(([building, roomIds]) => [building, [...roomIds]])
+    );
+}
+
+async function runReservationReconcileAlertFallbacks(mutations, companyId = DEFAULT_COMPANY_ID) {
+    try {
+        await invalidatePriceCacheForReservationMutations(
+            mutations,
+            companyId,
+            "reservation_reconcile"
+        );
+    } catch (error) {
+        console.warn("[Reservation Reconcile] price cache invalidation failed:", error.message);
+        await sendSyncAlert("reservation price cache invalidation failed", [
+            `companyId=${companyId}`,
+            String(error.message || error)
+        ]);
+    }
+
+    const todayJst = dayjs().tz("Asia/Tokyo").format("YYYY-MM-DD");
+    for (const { beforeData, afterData, mutationSummary } of mutations || []) {
+        const bookingId = afterData.bookId || afterData.id;
+        if (shouldQueueSlackCleaningCorrection(beforeData, afterData, mutationSummary.changedFields, todayJst)) {
+            try {
+                await queueSlackCleaningCorrection({
+                    companyId,
+                    bookingId,
+                    targetDate: todayJst,
+                    changedFields: mutationSummary.changedFields.filter((field) => SLACK_CLEANING_CORRECTION_FIELDS.has(field))
+                });
+            } catch (error) {
+                console.warn(`[Reservation Reconcile] cleaning correction queue failed for ${bookingId}:`, error.message);
+            }
+        }
+
+        const amount = getBookingAmount(afterData);
+        const isSameDayCreated = mutationSummary.eventType === "created" &&
+            afterData.status === "confirmed" &&
+            String(afterData.bookDate || "").slice(0, 10) === todayJst &&
+            String(afterData.arrival || "").slice(0, 10) === todayJst &&
+            amount > 0 &&
+            afterData.building !== "다이쿄초";
+        if (isSameDayCreated) {
+            try {
+                await sendSameDayBookingAlert(afterData);
+            } catch (error) {
+                console.warn(`[Reservation Reconcile] same-day alert failed for ${bookingId}:`, error.message);
+            }
+        }
+
+        if (mutationSummary.eventType === "cancelled") {
+            try {
+                await sendCancelAlert(afterData);
+            } catch (error) {
+                console.warn(`[Reservation Reconcile] cancel alert failed for ${bookingId}:`, error.message);
+            }
+        }
+    }
 }
 
 async function upsertReservations(list, {
@@ -1563,6 +1924,8 @@ async function fullReservationReconcile(list, syncRangeStart = null, syncRangeEn
     const batchLimit = 400;
     let batch = db.batch();
     let cancelledCount = 0;
+    const cancelledItems = [];
+    const automationMutations = [];
 
     // Beds24에서 가져온 예약 ID 목록 (문자열로 통일해 비교)
     const beds24BookIds = new Set(list.map(item => String(item.id)));
@@ -1621,6 +1984,12 @@ async function fullReservationReconcile(list, syncRangeStart = null, syncRangeEn
 
                     batch.set(doc.ref, cancelledDoc, { merge: true });
                     cancelledCount++;
+                    cancelledItems.push(cancelledDoc);
+                    automationMutations.push({
+                        beforeData: existingData,
+                        afterData: cancelledDoc,
+                        mutationSummary: buildReservationMutationSummary(existingData, cancelledDoc)
+                    });
 
                     if (cancelledCount % batchLimit === 0) {
                         await batch.commit();
@@ -1655,6 +2024,8 @@ async function fullReservationReconcile(list, syncRangeStart = null, syncRangeEn
 
     return {
         cancelledCount,
+        cancelledItems,
+        automationMutations,
         ...upsertResult
     };
 }
@@ -1691,13 +2062,14 @@ async function refreshHomeDashboardSummarySafe(companyId, reason, source) {
 
 // 빠른 동기화 (기본) - 과거 6개월 ~ 향후 12개월
 // ★ 순차 호출로 변경되어 타임아웃 증가
-exports.syncBeds24 = onRequest({ cors: true, timeoutSeconds: 540, memory: '512MiB' }, async (req, res) => {
+exports.syncBeds24 = onRequest({ cors: true, timeoutSeconds: 540, memory: "16GiB", cpu: 4, maxInstances: 4 }, async (req, res) => {
     try {
         const companyId = req.body?.companyId || DEFAULT_COMPANY_ID;
         const tokyoNow = dayjs().utcOffset(9);
         const syncWindow = getReservationSyncWindow(tokyoNow);
         const requestBudget = createBeds24RequestBudget();
         // 수동 Quick Sync는 사용자 기대(전체 재대사·삭제 반영)에 맞춰 항상 전체 fetch 후 재대사. 증분 미사용.
+        await assertBeds24PropertyCoverage();
         let list = await fetchFromBeds24Quick({ now: tokyoNow, requestBudget });
         const result = await saveBookings(list, syncWindow.start, syncWindow.end, companyId, "beds24_manual_quick");
         const syncVariant = "manual_quick";
@@ -1719,7 +2091,8 @@ exports.syncBeds24 = onRequest({ cors: true, timeoutSeconds: 540, memory: '512Mi
         const tokyoNowQuick = dayjs().utcOffset(9);
         const fourteenDaysAgoQuick = tokyoNowQuick.subtract(14, "day").format("YYYY-MM-DD");
         const fourteenDaysLaterQuick = tokyoNowQuick.add(14, "day").format("YYYY-MM-DD");
-        const recentListQuick = list.filter((r) => {
+        await runReservationReconcileAlertFallbacks(result.automationMutations || [], companyId);
+        const recentListQuick = [...list, ...(result.cancelledItems || [])].filter((r) => {
             const d = r.arrival || r.departure || r.bookDate || "";
             const dt = String(d).slice(0, 10);
             return dt >= fourteenDaysAgoQuick && dt <= fourteenDaysLaterQuick;
@@ -1751,9 +2124,12 @@ exports.syncBeds24 = onRequest({ cors: true, timeoutSeconds: 540, memory: '512Mi
 });
 
 exports.scheduledBeds24PropertySync = onSchedule({
-    schedule: "every 24 hours",
+    schedule: "30 3 * * 0",
+    timeZone: "Asia/Tokyo",
     timeoutSeconds: 540,
-    memory: "512MiB"
+    memory: "4GiB",
+    cpu: 4,
+    maxInstances: 1
 }, async () => {
     const tokyoNow = dayjs().utcOffset(9);
     try {
@@ -1768,7 +2144,7 @@ exports.scheduledBeds24PropertySync = onSchedule({
     }
 });
 
-exports.triggerBeds24PropertySync = onRequest({ cors: true, timeoutSeconds: 540 }, async (req, res) => {
+exports.triggerBeds24PropertySync = onRequest({ cors: true, timeoutSeconds: 540, memory: "16GiB", cpu: 4, maxInstances: 4 }, async (req, res) => {
     try {
         console.log("[Manual Trigger] Beds24 property sync start");
         const result = await syncBeds24Properties({ reason: "manual" });
@@ -1781,12 +2157,32 @@ exports.triggerBeds24PropertySync = onRequest({ cors: true, timeoutSeconds: 540 
 
 // 전체 동기화 (관리자용) - 2023년 1월부터 전체
 // ★ 순차 호출 + 페이지네이션으로 모든 데이터 가져오기 (최대 10분)
-exports.syncBeds24Full = onRequest({ cors: true, timeoutSeconds: 900, memory: '1GiB' }, async (req, res) => {
+exports.syncBeds24Full = onRequest({ cors: true, timeoutSeconds: 900, memory: "16GiB", cpu: 4, maxInstances: 2 }, async (req, res) => {
+    if (req.method !== "POST") {
+        return res.status(405).json({ success: false, error: "POST required" });
+    }
+
+    const companyId = String(req.body?.companyId || "").trim();
+    if (!companyId || companyId !== DEFAULT_COMPANY_ID) {
+        return res.status(403).json({ success: false, error: "Valid companyId required" });
+    }
+
+    const lockOwner = `manual_full_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    let lockAcquired = false;
     try {
-        const companyId = req.body?.companyId || DEFAULT_COMPANY_ID;
+        const lock = await acquireReservationFullSyncLock(lockOwner);
+        if (!lock.acquired) {
+            return res.status(409).json({
+                success: false,
+                error: "A full reservation sync is already running",
+                lockExpiresAt: lock.expiresAt?.toISOString?.() || null
+            });
+        }
+        lockAcquired = true;
         const syncRangeStart = "2023-01-01"; // 다시 2023년부터
         const syncRangeEnd = dayjs().add(24, "month").format("YYYY-MM-DD");
         const requestBudget = createBeds24RequestBudget();
+        await assertBeds24PropertyCoverage();
         const list = await fetchFromBeds24Full({ requestBudget });
         const result = await saveBookings(list, syncRangeStart, syncRangeEnd, companyId, "beds24_manual_full");
         await recordReservationSyncAudit({
@@ -1806,7 +2202,8 @@ exports.syncBeds24Full = onRequest({ cors: true, timeoutSeconds: 900, memory: '1
         const tokyoNowFull = dayjs().utcOffset(9);
         const fourteenDaysAgoFull = tokyoNowFull.subtract(14, "day").format("YYYY-MM-DD");
         const fourteenDaysLaterFull = tokyoNowFull.add(14, "day").format("YYYY-MM-DD");
-        const recentListFull = list.filter((r) => {
+        await runReservationReconcileAlertFallbacks(result.automationMutations || [], companyId);
+        const recentListFull = [...list, ...(result.cancelledItems || [])].filter((r) => {
             const d = r.arrival || r.departure || r.bookDate || "";
             const dt = String(d).slice(0, 10);
             return dt >= fourteenDaysAgoFull && dt <= fourteenDaysLaterFull;
@@ -1824,10 +2221,18 @@ exports.syncBeds24Full = onRequest({ cors: true, timeoutSeconds: 900, memory: '1
             syncType: "manual_full",
             status: "error",
             syncSource: "beds24_manual_full",
-            companyId: req.body?.companyId || DEFAULT_COMPANY_ID,
+            companyId,
             errorMessage: e.message
         });
         res.status(500).json({ success: false, error: e.message });
+    } finally {
+        if (lockAcquired) {
+            try {
+                await releaseReservationFullSyncLock(lockOwner);
+            } catch (lockError) {
+                console.warn("Full Sync lock release failed:", lockError.message);
+            }
+        }
     }
 });
 
@@ -2072,6 +2477,108 @@ function consolidateCalendarRanges(calendar) {
     return result;
 }
 
+/**
+ * GET /inventory/rooms/calendar 를 페이지 끝까지 읽어 roomId별로 병합한다.
+ *
+ * 배치 조회는 20객실 × 12개월을 한 번에 요청하므로 응답이 한 페이지를 넘을 수 있다.
+ * 이 프로젝트의 다른 Beds24 V2 호출은 모두 pages.nextPageExists를 처리하는데
+ * 가격 캘린더 조회만 빠져 있었고, 잘린 뒤쪽은 조용히 사라져 영구 미동기화가 됐다.
+ *
+ * @returns {{ roomsById: Map<string, {roomId, calendar: []}>, pageCount: number, truncated: boolean }}
+ */
+async function beds24GetRoomCalendarAllPages(params, { maxPages = 20, label = "calendar" } = {}) {
+    const roomsById = new Map();
+    let nextLink = null;
+    let pageCount = 0;
+    let lastError = null;
+
+    while (pageCount < maxPages) {
+        let result;
+        if (nextLink) {
+            const token = await getBeds24Token();
+            const pageRes = await axios.get(nextLink, { headers: { token } });
+            result = pageRes.data;
+        } else {
+            const res = await beds24GetV2WithGuard("/inventory/rooms/calendar", params, 5, {
+                paramsSerializer: beds24RepeatParamsSerializer
+            });
+            result = res.data;
+        }
+        pageCount++;
+
+        if (result?.error) lastError = result.error;
+
+        const rows = Array.isArray(result?.data) ? result.data : [];
+        rows.forEach((roomData) => {
+            const rid = String(roomData?.roomId || "");
+            if (!rid) return;
+            const existing = roomsById.get(rid);
+            if (existing) {
+                // 같은 roomId가 여러 페이지에 걸쳐 오면 calendar를 이어 붙인다.
+                existing.calendar = existing.calendar.concat(Array.isArray(roomData.calendar) ? roomData.calendar : []);
+            } else {
+                roomsById.set(rid, {
+                    ...roomData,
+                    roomId: rid,
+                    calendar: Array.isArray(roomData.calendar) ? [...roomData.calendar] : []
+                });
+            }
+        });
+
+        if (!result?.pages?.nextPageExists || !result?.pages?.nextPageLink) {
+            return { roomsById, pageCount, truncated: false, error: lastError };
+        }
+        nextLink = result.pages.nextPageLink;
+        await sleep(200);
+    }
+
+    // maxPages를 다 쓰고도 다음 페이지가 남아 있으면 결과가 불완전하다는 뜻이다. 조용히 넘기지 않는다.
+    console.warn(`[Beds24 Calendar] ${label}: ${maxPages}페이지를 초과해 응답이 잘렸습니다. 결과 불완전.`);
+    return { roomsById, pageCount, truncated: true, error: lastError };
+}
+
+// Beds24는 minStay가 설정되지 않은 날짜를 "빈칸"으로 반환하며, 이는 1박을 의미한다.
+// 이를 빈 문자열로 저장하면 프론트의 활성 roomId 판정(1 <= m < 50)과 setMinStay의
+// getActiveRoomId가 NaN을 만나 해당 roomId를 "비활성"으로 오인한다.
+// 그 결과 ① minStay 재수정이 통째로 스킵되고 ② 듀얼룸에서 그 roomId의 blackout이 화면에서 누락된다.
+// 따라서 캐시에는 항상 1 이상의 숫자 문자열로 정규화해 저장/응답한다.
+/**
+ * price_change_logs 기록. priceSnapshot이 크면 여러 문서로 나눠 쓴다.
+ *
+ * 한 번의 가격 수정이 수천 건(최대 91객실 × 365일)을 담을 수 있는데,
+ * priceSnapshot을 한 문서에 몰아넣으면 Firestore 문서 1MB 상한을 넘겨 로그가 통째로 유실된다.
+ * 잘라내지 않고 분할하므로 이력 커버리지는 그대로 유지된다.
+ */
+const PRICE_LOG_SNAPSHOT_CHUNK_SIZE = 2000;
+
+async function writePriceChangeLogChunks(baseDoc, priceSnapshot = []) {
+    const snapshot = Array.isArray(priceSnapshot) ? priceSnapshot : [];
+    if (snapshot.length === 0) {
+        await db.collection("price_change_logs").add(baseDoc);
+        return 1;
+    }
+
+    const chunkCount = Math.ceil(snapshot.length / PRICE_LOG_SNAPSHOT_CHUNK_SIZE);
+    for (let i = 0; i < chunkCount; i++) {
+        const chunk = snapshot.slice(i * PRICE_LOG_SNAPSHOT_CHUNK_SIZE, (i + 1) * PRICE_LOG_SNAPSHOT_CHUNK_SIZE);
+        await db.collection("price_change_logs").add({
+            ...baseDoc,
+            priceSnapshot: chunk,
+            totalChangeCount: snapshot.length,
+            ...(chunkCount > 1 ? { chunkIndex: i, chunkCount } : {})
+        });
+    }
+    if (chunkCount > 1) {
+        console.log(`[PriceChangeLog] ${snapshot.length}건을 ${chunkCount}개 문서로 분할 기록`);
+    }
+    return chunkCount;
+}
+
+function normalizeBeds24MinStay(rawMinStay) {
+    const parsed = parseInt(rawMinStay, 10);
+    return Number.isFinite(parsed) && parsed >= 1 ? String(parsed) : "1";
+}
+
 function buildBeds24CalendarUpdatesFromDates(dates = {}) {
     const rawCalendarUpdates = [];
     const toV2Date = (d) => `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
@@ -2082,9 +2589,10 @@ function buildBeds24CalendarUpdatesFromDates(dates = {}) {
         if (val.p1 !== undefined) updateItem.price1 = (val.p1 === 'REMOVE' || val.p1 === -1) ? null : parseFloat(val.p1);
         if (val.p2 !== undefined) updateItem.price2 = (val.p2 === 'REMOVE' || val.p2 === -1) ? null : parseFloat(val.p2);
         if (val.p3 !== undefined) updateItem.price3 = (val.p3 === 'REMOVE' || val.p3 === -1) ? null : parseFloat(val.p3);
-        if (val.m !== undefined) {
-            console.warn(`[setRoomPrices] minStay field ignored (use setMinStay instead). dateStr=${dateStr}, m=${val.m}`);
-        }
+        if (val.m !== undefined) updateItem.minStay = parseInt(val.m, 10);
+        if (val.mx !== undefined) updateItem.maxStay = parseInt(val.mx, 10);
+        if (val.na !== undefined) updateItem.numAvail = parseInt(val.na, 10);
+        if (val.ov !== undefined) updateItem.override = val.ov || null;
         rawCalendarUpdates.push(updateItem);
     }
 
@@ -2246,6 +2754,7 @@ async function syncAllPrices({
             intervalMinutes: PRICE_FULL_RECONCILE_INTERVAL_MINUTES,
             now: tokyoNow.toDate()
         });
+        const isTargetedSync = Array.isArray(targetBuildings) && targetBuildings.length > 0;
 
         // firestore 저장용 키 생성 (YYYYMMDD) 헬퍼
         const toKey = (d) => d.replace(/-/g, '');
@@ -2282,6 +2791,9 @@ async function syncAllPrices({
             const buildingSnap = await buildingRef.get();
             const buildingCache = buildingSnap.exists ? buildingSnap.data() : {};
             const invalidatedRoomIds = new Set((buildingCache.invalidatedRoomIds || []).map((id) => String(id)));
+            const reservationInvalidatedRoomIds = new Set(
+                (buildingCache.reservationInvalidatedRoomIds || []).map((id) => String(id))
+            );
             const roomsToFetch = runFullSync
                 ? allRooms
                 : allRooms.filter((room) => invalidatedRoomIds.has(String(room.roomId)));
@@ -2303,8 +2815,13 @@ async function syncAllPrices({
                     .catch(() => ({ room, snap: null }))
             ));
             const roomsToActuallyFetch = [];
+            // 위 protectionChecks가 이미 읽어온 스냅샷을 재사용해 이전 가격을 보관한다.
+            // 스케줄 동기화로만 들어온 Beds24 가격 변경도 lm(셀 dot/이력)과 price_change_logs에 남기기 위함이며,
+            // Firestore 읽기는 한 건도 늘지 않는다.
+            const previousDatesByRoomId = {};
             for (const { room, snap } of protectionChecks) {
                 if (snap && snap.exists) {
+                    previousDatesByRoomId[String(room.roomId)] = snap.data()?.dates || {};
                     const lastUserUpdate = snap.data()?.lastManualUpdate?.toDate() || null;
                     if (lastUserUpdate && dayjs().diff(dayjs(lastUserUpdate), 'minute') < 15) {
                         console.log(`[Price Sync Skip] ${buildingName} - ${room.name}(${room.roomId}): 최근 수동 수정됨`);
@@ -2314,6 +2831,8 @@ async function syncAllPrices({
                 }
                 roomsToActuallyFetch.push(room);
             }
+            // 이 건물에서 이번 동기화로 감지된 가격 변동 (price_change_logs 기록용)
+            const scheduledPriceDiffs = [];
 
             // ★ 배치 GET: 여러 roomId를 한 번에 조회 (객실당 1콜 → 청크당 1콜, 크레딧·시간 대폭 절감)
             const PRICE_SYNC_GET_BATCH_SIZE = 20;
@@ -2329,11 +2848,12 @@ async function syncAllPrices({
                 const chunkRoomIds = chunk.map((room) => String(room.roomId));
                 const roomById = new Map(chunk.map((room) => [String(room.roomId), room]));
 
-                let response;
+                let pageResult;
                 try {
                     // ★ V2 API 호출 (GET /inventory/rooms/calendar) — roomId 배열 + 반복 파라미터 직렬화로 다중 객실 일괄 조회.
                     // includePrices 필수! 없으면 가격 데이터가 반환되지 않음.
-                    response = await beds24GetV2WithGuard("/inventory/rooms/calendar", {
+                    // 20객실 × 12개월은 한 페이지를 넘을 수 있어 반드시 끝까지 읽는다.
+                    pageResult = await beds24GetRoomCalendarAllPages({
                         roomId: chunkRoomIds,
                         startDate: fromDate,
                         endDate: toDate,
@@ -2343,7 +2863,7 @@ async function syncAllPrices({
                         includeMaxStay: true,
                         includeNumAvail: true,
                         includeOverride: true
-                    }, 5, { paramsSerializer: beds24RepeatParamsSerializer });
+                    }, { label: `${buildingName} batch [${chunkRoomIds.join(",")}]` });
                 } catch (err) {
                     console.error(`[Price Sync Fatal] ${buildingName} batch [${chunkRoomIds.join(",")}]:`, err.message);
                     await new Promise(r => setTimeout(r, 500));
@@ -2351,9 +2871,16 @@ async function syncAllPrices({
                 }
 
                 // V2 응답 구조: { data: [{ roomId, calendar: [{ from, to, price1, minStay, ... }] }, ...] }
-                const entries = Array.isArray(response.data?.data) ? response.data.data : [];
-                if (entries.length === 0 && response.data?.error) {
-                    console.error(`[Price Sync Error] ${buildingName} batch: ${response.data.error}`);
+                const entries = [...pageResult.roomsById.values()];
+                if (entries.length === 0 && pageResult.error) {
+                    console.error(`[Price Sync Error] ${buildingName} batch: ${pageResult.error}`);
+                }
+                // 응답이 잘렸으면 이 배치는 저장하지 않는다.
+                // 불완전한 데이터를 캐시에 쓰면 Beds24에 있는 날짜가 "없는 날짜"로 굳어버린다.
+                if (pageResult.truncated) {
+                    console.error(`[Price Sync] ${buildingName} batch [${chunkRoomIds.join(",")}] 응답 잘림 — 저장 skip (다음 주기 재시도)`);
+                    await new Promise(r => setTimeout(r, 500));
+                    continue;
                 }
 
                 // 각 객실 데이터를 병렬로 파싱·저장 (서로 다른 room 문서/month 캐시라 충돌 없음)
@@ -2374,12 +2901,37 @@ async function syncAllPrices({
                                 p1: String(entry.price1 || ""),
                                 p2: String(entry.price2 || ""),
                                 p3: String(entry.price3 || ""),
-                                m: String(entry.minStay || ""),
+                                m: normalizeBeds24MinStay(entry.minStay),
                                 mx: String(entry.maxStay || ""),
                                 na: entry.numAvail !== undefined && entry.numAvail !== null ? String(entry.numAvail) : "",
                                 ov: entry.override ? String(entry.override) : ""
                             };
                         }
+                    });
+
+                    // 이전 가격과 비교해 변동을 감지한다.
+                    // 웹훅이 누락된 Beds24 변경은 이 스케줄 동기화로만 들어오는데,
+                    // 여기서 lm을 남기지 않으면 캘린더 이력이 이전 변경에 멈춰 잘못된 정보를 보여준다.
+                    const previousDates = previousDatesByRoomId[rid] || {};
+                    const nowFormattedForLm = dayjs().utcOffset(9).format("MM-DD HH:mm");
+                    Object.keys(datesObj).forEach((dateKey) => {
+                        const oldP1 = parseFloat(previousDates[dateKey]?.p1) || 0;
+                        const newP1 = parseFloat(datesObj[dateKey].p1) || 0;
+                        if (oldP1 === newP1 || (oldP1 === 0 && newP1 === 0)) return;
+                        datesObj[dateKey].lm = {
+                            u: "Beds24",
+                            t: nowFormattedForLm,
+                            o: oldP1,
+                            n: newP1,
+                            s: "beds24",
+                            ts: Date.now()
+                        };
+                        scheduledPriceDiffs.push({
+                            date: `${dateKey.slice(0, 4)}-${dateKey.slice(4, 6)}-${dateKey.slice(6, 8)}`,
+                            room: room.name,
+                            oldPrice: oldP1,
+                            newPrice: newP1
+                        });
                     });
 
                     try {
@@ -2410,16 +2962,48 @@ async function syncAllPrices({
                 await new Promise(r => setTimeout(r, 500));
             }
 
+            // 스케줄 동기화로 감지된 가격 변동을 이력에 남긴다.
+            // 지금까지는 priceWebhook과 가격 job만 로그를 써서, 웹훅이 누락된 변경은 이력에 전혀 남지 않았다.
+            if (scheduledPriceDiffs.length > 0) {
+                try {
+                    scheduledPriceDiffs.sort((a, b) => a.date.localeCompare(b.date));
+                    const avgOld = Math.round(scheduledPriceDiffs.reduce((s, d) => s + d.oldPrice, 0) / scheduledPriceDiffs.length);
+                    const avgNew = Math.round(scheduledPriceDiffs.reduce((s, d) => s + d.newPrice, 0) / scheduledPriceDiffs.length);
+                    await writePriceChangeLogChunks({
+                        companyId: prop.companyId || DEFAULT_COMPANY_ID,
+                        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                        building: buildingName,
+                        rooms: [...new Set(scheduledPriceDiffs.map((d) => d.room))],
+                        success: true,
+                        worker: "Beds24 System",
+                        origin: "Beds24 Scheduled Sync",
+                        notes: `정기 동기화에서 ${buildingName} 가격 변동 ${scheduledPriceDiffs.length}건 감지`,
+                        oldPrice: avgOld,
+                        newPrice: avgNew,
+                        dateFrom: scheduledPriceDiffs[0].date,
+                        dateTo: scheduledPriceDiffs[scheduledPriceDiffs.length - 1].date
+                    }, scheduledPriceDiffs);
+                    console.log(`[Price Sync] ${buildingName} 가격 변동 ${scheduledPriceDiffs.length}건 로그 기록`);
+                } catch (logErr) {
+                    console.warn(`[Price Sync] ${buildingName} price_change_logs 기록 실패:`, logErr.message);
+                }
+            }
+
+            const buildingFullComplete = runFullSync && successInBuilding === roomsToFetch.length;
             const remainingInvalidatedRoomIds = runFullSync
-                ? []
+                ? roomsToFetch.map((room) => String(room.roomId)).filter((id) => !syncedRoomIds.has(id))
                 : [...invalidatedRoomIds].filter((id) => !syncedRoomIds.has(String(id)));
+            const remainingReservationInvalidatedRoomIds = [...reservationInvalidatedRoomIds]
+                .filter((id) => !syncedRoomIds.has(String(id)));
 
             // 건물 요약 정보 업데이트
             await buildingRef.set({
                 building: buildingName,
                 lastSync: admin.firestore.FieldValue.serverTimestamp(),
                 lastIncrementalSync: runFullSync ? buildingCache.lastIncrementalSync || null : admin.firestore.FieldValue.serverTimestamp(),
-                lastFullSync: runFullSync ? admin.firestore.FieldValue.serverTimestamp() : (buildingCache.lastFullSync || null),
+                lastFullSync: buildingFullComplete
+                    ? admin.firestore.FieldValue.serverTimestamp()
+                    : (buildingCache.lastFullSync || null),
                 roomCount: successInBuilding,
                 targetRoomCount: roomsToFetch.length,
                 dateFrom: fromDate,
@@ -2427,19 +3011,24 @@ async function syncAllPrices({
                 outputImpact: buildPriceOutputImpact({ building: buildingName, fromDate, toDate }),
                 invalidatedRoomIds: remainingInvalidatedRoomIds,
                 pendingInvalidationCount: remainingInvalidatedRoomIds.length,
+                reservationInvalidatedRoomIds: remainingReservationInvalidatedRoomIds,
+                pendingReservationInvalidationCount: remainingReservationInvalidatedRoomIds.length,
                 invalidatedAt: remainingInvalidatedRoomIds.length > 0
                     ? (buildingCache.invalidatedAt || admin.firestore.FieldValue.serverTimestamp())
                     : admin.firestore.FieldValue.delete(),
                 invalidatedBy: remainingInvalidatedRoomIds.length > 0
                     ? (buildingCache.invalidatedBy || "priceWebhook")
+                    : admin.firestore.FieldValue.delete(),
+                reservationInvalidatedAt: remainingReservationInvalidatedRoomIds.length > 0
+                    ? (buildingCache.reservationInvalidatedAt || admin.firestore.FieldValue.serverTimestamp())
                     : admin.firestore.FieldValue.delete()
             }, { merge: true });
 
             syncResults[buildingName] = {
-                success: true,
+                success: runFullSync ? buildingFullComplete : successInBuilding === roomsToFetch.length,
                 rooms: successInBuilding,
                 targetRooms: roomsToFetch.length,
-                mode: runFullSync ? "full" : "incremental"
+                mode: runFullSync ? (buildingFullComplete ? "full" : "full_partial") : "incremental"
             };
 
             // 건물 간 대기 시간도 단축 (5s -> 1s)
@@ -2468,9 +3057,13 @@ async function syncAllPrices({
             };
         }
 
+        const fullComplete = runFullSync && !yieldedToManualJob && skippedRooms === 0 && syncedRooms === requestedRooms;
         await recordPriceSyncAudit({
             syncType: reason,
-            syncVariant: runFullSync ? "full_reconcile" : "incremental",
+            syncVariant: runFullSync
+                ? (fullComplete ? "full_reconcile" : "full_reconcile_partial")
+                : "incremental",
+            status: runFullSync && !fullComplete ? "partial" : "success",
             syncSource: runFullSync ? "beds24_price_full_reconcile" : "beds24_price_incremental",
             companyId: DEFAULT_COMPANY_ID,
             fetchedCount: requestedRooms,
@@ -2481,14 +3074,17 @@ async function syncAllPrices({
                 requestedRooms,
                 syncedRooms,
                 skippedRooms,
+                fullComplete,
                 yieldedToManualJobId: yieldedToManualJob?.id || null
-            }
+            },
+            updateStatusDoc: !isTargetedSync
         });
 
         console.log(`[V2 Sync] 전체 완료:`, syncResults);
         return {
             success: true,
-            mode: runFullSync ? "full" : "incremental",
+            mode: runFullSync ? (fullComplete ? "full" : "full_partial") : "incremental",
+            fullComplete,
             requestedRooms,
             syncedRooms,
             skippedRooms,
@@ -2513,12 +3109,10 @@ async function syncAllPrices({
 }
 
 // ==========================================
-// minStay 전용 reconcile
-// Beds24 inventory webhook은 minStay 변경을 트리거하지 않으므로
-// 별도 주기(60분)로 전 객실의 m/mx 필드만 패치함.
-// 가격 필드(p1/p2/p3)는 건드리지 않음.
+// Targeted minStay recovery helper. Scheduled minStay protection is handled by
+// the six-hour full price reconcile, which already fetches m/mx in bulk.
 // ==========================================
-async function syncMinStayOnly({ reason = "scheduled" } = {}) {
+async function syncMinStayOnly({ reason = "scheduled", targetBuildings = null } = {}) {
     const apiGuard = await getBeds24ApiGuardState();
     if (apiGuard.active) {
         console.log(`[MinStay Reconcile] Beds24 API cooldown active (${apiGuard.remainingSec}s remaining)`);
@@ -2565,6 +3159,9 @@ async function syncMinStayOnly({ reason = "scheduled" } = {}) {
                 break;
             }
             if (prop.disabled) continue;
+            if (Array.isArray(targetBuildings) && targetBuildings.length > 0 && !targetBuildings.includes(prop.name)) {
+                continue;
+            }
             const buildingName = prop.name;
             const allRooms = BUILDING_ROOMS[buildingName] || [];
             if (allRooms.length === 0) continue;
@@ -2584,7 +3181,7 @@ async function syncMinStayOnly({ reason = "scheduled" } = {}) {
                 try {
                     // includePrices: false 로 경량화. Beds24 V2는 includeMinStay 독립 지원.
                     // 만약 minStay 필드가 반환되지 않으면 includePrices: true 로 변경 필요.
-                    const response = await beds24GetV2WithGuard("/inventory/rooms/calendar", {
+                    const pageResult = await beds24GetRoomCalendarAllPages({
                         roomId: rid,
                         startDate: fromDate,
                         endDate: toDate,
@@ -2592,9 +3189,15 @@ async function syncMinStayOnly({ reason = "scheduled" } = {}) {
                         includeLinkedPrices: false,
                         includeMinStay: true,
                         includeMaxStay: true
-                    });
+                    }, { label: `minStay reconcile ${buildingName}/${rid}` });
 
-                    const roomData = response.data?.data?.[0];
+                    if (pageResult.truncated) {
+                        console.error(`[MinStay Reconcile] ${buildingName}/${rid} 응답 잘림 — 갱신 skip`);
+                        totalSkipped++;
+                        continue;
+                    }
+
+                    const roomData = pageResult.roomsById.get(rid);
                     if (!roomData || !Array.isArray(roomData.calendar)) {
                         totalSkipped++;
                         continue;
@@ -2608,10 +3211,10 @@ async function syncMinStayOnly({ reason = "scheduled" } = {}) {
                         const entryTo = dayjs(entry.to);
                         for (let d = entryFrom; d.isBefore(entryTo) || d.isSame(entryTo, 'day'); d = d.add(1, 'day')) {
                             const dateKey = d.format('YYYYMMDD');
-                            updateMap[`dates.${dateKey}.m`] = String(entry.minStay || "");
+                            updateMap[`dates.${dateKey}.m`] = normalizeBeds24MinStay(entry.minStay);
                             updateMap[`dates.${dateKey}.mx`] = String(entry.maxStay || "");
                             datesPatch[dateKey] = {
-                                m: String(entry.minStay || ""),
+                                m: normalizeBeds24MinStay(entry.minStay),
                                 mx: String(entry.maxStay || "")
                             };
                         }
@@ -2694,12 +3297,33 @@ async function syncMinStayOnly({ reason = "scheduled" } = {}) {
     }
 }
 
-// 수동 가격 동기화 (HTTP 호출용)
-exports.triggerPriceSync = onRequest({ cors: true, timeoutSeconds: 540 }, async (req, res) => {
+// 수동 가격 동기화 (HTTP 호출용, 단일 건물만 허용)
+exports.triggerPriceSync = onRequest({ cors: true, timeoutSeconds: 540, memory: "16GiB", cpu: 4, maxInstances: 4 }, async (req, res) => {
     try {
-        console.log("[Manual Trigger] 가격 동기화 시작");
-        const result = await syncAllPrices({ forceFull: true, reason: "manual" });
-        res.json({ success: true, message: "가격 동기화 완료", result });
+        const companyId = String(req.body?.companyId || "").trim();
+        const building = String(req.body?.building || "").trim();
+        if (!companyId) {
+            return res.status(400).json({ success: false, error: "Missing companyId" });
+        }
+        if (companyId !== DEFAULT_COMPANY_ID) {
+            return res.status(403).json({ success: false, error: "Access denied: companyId mismatch" });
+        }
+        if (!building) {
+            return res.status(400).json({ success: false, error: "Missing building" });
+        }
+
+        const targetProperty = PROPERTIES.find((property) => property.name === building && !property.disabled);
+        if (!targetProperty) {
+            return res.status(400).json({ success: false, error: `Unknown or disabled building: ${building}` });
+        }
+
+        console.log(`[Manual Trigger] 단일 건물 가격 동기화 시작: ${building}`);
+        const result = await syncAllPrices({
+            forceFull: true,
+            reason: "manual_targeted",
+            targetBuildings: [building]
+        });
+        res.json({ success: true, message: `${building} 가격 동기화 완료`, building, result });
     } catch (e) {
         console.error("[Manual Trigger] 가격 동기화 실패:", e.message);
         res.status(500).json({ success: false, error: e.message });
@@ -2719,6 +3343,23 @@ async function runScheduledReservationReconcile({ forceFull = false } = {}) {
     const modifiedSince = new Date(baseTime.getTime() - (RESERVATION_INCREMENTAL_BUFFER_MINUTES * 60 * 1000));
 
     const incrementalList = await fetchFromBeds24Incremental(modifiedSince, { requestBudget });
+    let incrementalMutations = [];
+    try {
+        incrementalMutations = await collectReservationMutations(incrementalList);
+    } catch (error) {
+        console.warn("[Scheduled Reservation Reconcile] mutation pre-read failed:", error.message);
+        await sendSyncAlert("scheduledBeds24Sync automation fallback pre-read failed", [error.message]);
+    }
+    try {
+        await invalidatePriceCacheForReservationMutations(
+            incrementalMutations,
+            companyId,
+            "beds24_scheduled_daily_incremental"
+        );
+    } catch (error) {
+        console.warn("[Scheduled Reservation Reconcile] price cache invalidation failed:", error.message);
+        await sendSyncAlert("scheduledBeds24Sync price cache invalidation failed", [error.message]);
+    }
     const incrementalResult = await saveBookings(
         incrementalList,
         null,
@@ -2743,49 +3384,74 @@ async function runScheduledReservationReconcile({ forceFull = false } = {}) {
         sampleIds: incrementalResult.sampleIds || [],
         note: "mode=incremental_backup"
     });
+    await runReservationReconcileAlertFallbacks(incrementalMutations, companyId);
 
     let fullList = [];
     let fullResult = null;
+    let fullAuditError = null;
     const shouldRunDeepAudit = forceFull || shouldRunFullAudit(statusData, {
         intervalMinutes: RESERVATION_FULL_RECONCILE_INTERVAL_MINUTES,
         now: tokyoNow.toDate()
     });
 
     if (shouldRunDeepAudit) {
-        fullList = await fetchFromBeds24Quick({
-            now: tokyoNow,
-            requestBudget
-        });
-        fullResult = await saveBookings(
-            fullList,
-            syncWindow.start,
-            syncWindow.end,
-            companyId,
-            "beds24_scheduled_daily_window",
-            { mode: "full_reconcile" }
-        );
+        try {
+            await assertBeds24PropertyCoverage();
+            fullList = await fetchFromBeds24Quick({
+                now: tokyoNow,
+                requestBudget
+            });
+            fullResult = await saveBookings(
+                fullList,
+                syncWindow.start,
+                syncWindow.end,
+                companyId,
+                "beds24_scheduled_daily_window",
+                { mode: "full_reconcile" }
+            );
+            await runReservationReconcileAlertFallbacks(fullResult.automationMutations || [], companyId);
 
-        await recordReservationSyncAudit({
-            syncType: "scheduled_daily",
-            syncVariant: "full_reconcile",
-            syncSource: "beds24_scheduled_daily_window",
-            companyId,
-            rangeStart: syncWindow.start,
-            rangeEnd: syncWindow.end,
-            fetchedCount: fullList.length,
-            upsertedCount: fullResult.upsertedCount,
-            cancelledCount: fullResult.cancelledCount,
-            invalidCriticalCount: fullResult.invalidCriticalCount,
-            invalidReportCount: fullResult.invalidReportCount,
-            sampleIds: fullResult.sampleIds || [],
-            note: `mode=window_audit, forceFull=${forceFull}`
-        });
+            await recordReservationSyncAudit({
+                syncType: "scheduled_daily",
+                syncVariant: "full_reconcile",
+                syncSource: "beds24_scheduled_daily_window",
+                companyId,
+                rangeStart: syncWindow.start,
+                rangeEnd: syncWindow.end,
+                fetchedCount: fullList.length,
+                upsertedCount: fullResult.upsertedCount,
+                cancelledCount: fullResult.cancelledCount,
+                invalidCriticalCount: fullResult.invalidCriticalCount,
+                invalidReportCount: fullResult.invalidReportCount,
+                sampleIds: fullResult.sampleIds || [],
+                note: `mode=window_audit, forceFull=${forceFull}`
+            });
+        } catch (error) {
+            fullAuditError = error;
+            fullList = [];
+            fullResult = null;
+            await recordReservationSyncAudit({
+                syncType: "scheduled_daily",
+                syncVariant: "full_reconcile",
+                status: "error",
+                syncSource: "beds24_scheduled_daily_window",
+                companyId,
+                rangeStart: syncWindow.start,
+                rangeEnd: syncWindow.end,
+                errorMessage: error.message,
+                note: "full reconcile skipped destructive changes because coverage was incomplete"
+            });
+            await sendSyncAlert("scheduledBeds24Sync full reconcile failed", [
+                `companyId=${companyId}`,
+                error.message
+            ]);
+        }
     }
 
     const fourteenDaysAgo = tokyoNow.subtract(14, "day").format("YYYY-MM-DD");
     const fourteenDaysLater = tokyoNow.add(14, "day").format("YYYY-MM-DD");
     const impactMap = new Map();
-    [...incrementalList, ...fullList].forEach((item) => {
+    [...incrementalList, ...fullList, ...(fullResult?.cancelledItems || [])].forEach((item) => {
         const d = item.arrival || item.departure || item.bookDate || "";
         const dt = String(d).slice(0, 10);
         if (dt < fourteenDaysAgo || dt > fourteenDaysLater) return;
@@ -2807,16 +3473,20 @@ async function runScheduledReservationReconcile({ forceFull = false } = {}) {
         incrementalResult,
         fullList,
         fullResult,
-        ranFullAudit: shouldRunDeepAudit
+        ranFullAudit: Boolean(fullResult),
+        fullAuditError: fullAuditError?.message || null
     };
 }
 
-// 예약 자동 재대사: 자정 1회만 실행. 웹훅이 메인이고, 자정 배치는 누락분 백업 + 주기적 깊은 감사 역할만 수행한다.
+// Webhooks are primary. One hourly batched GET recovers dropped events before
+// they can be omitted from time-sensitive Slack/Google automations.
 exports.scheduledBeds24Sync = onSchedule({
-    schedule: "0 0 * * *",
+    schedule: "5 * * * *",
     timeZone: "Asia/Tokyo",
     timeoutSeconds: 540,
-    memory: "1GiB"
+    memory: "4GiB",
+    cpu: 4,
+    maxInstances: 1
 }, async () => {
     try {
         const result = await runScheduledReservationReconcile();
@@ -2844,7 +3514,8 @@ exports.scheduledBeds24Sync = onSchedule({
 exports.scheduledBeds24PriceSync = onSchedule({
     schedule: "every 15 minutes",
     timeoutSeconds: 540,
-    memory: "1GiB"
+    memory: "16GiB",
+    cpu: 4
 }, async () => {
     const tokyoNow = dayjs().utcOffset(9);
     try {
@@ -2885,31 +3556,34 @@ exports.scheduledBeds24PriceSync = onSchedule({
     }
 });
 
-// minStay 전용 스케줄 (60분 간격) — 가격 full reconcile(6시간)보다 짧게 유지
-exports.scheduledMinStayReconcile = onSchedule({
-    schedule: "every 6 hours",
-    timeoutSeconds: 540,
-    memory: "512MiB"
-}, async () => {
-    const tokyoNow = dayjs().utcOffset(9);
+// minStay is included in the six-hour full price reconcile. Keep this targeted
+// manual trigger only for recovery/testing without restoring per-room polling.
+exports.triggerMinStaySync = onRequest({ cors: true, timeoutSeconds: 540, memory: "16GiB", cpu: 4, maxInstances: 4 }, async (req, res) => {
     try {
-        const result = await syncMinStayOnly({ reason: "scheduled" });
-        console.log(`✅ minStay 동기화 완료 (${tokyoNow.format("YYYY-MM-DD HH:mm")})`, result);
-    } catch (e) {
-        await sendSyncAlert("scheduledMinStayReconcile failed", [
-            `companyId=${DEFAULT_COMPANY_ID}`,
-            e.message
-        ]);
-        throw e;
-    }
-});
+        if (req.method !== "POST") {
+            return res.status(400).json({ success: false, error: "POST required" });
+        }
 
-// minStay 수동 트리거 (테스트/즉시 반영용)
-exports.triggerMinStaySync = onRequest({ cors: true, timeoutSeconds: 540 }, async (req, res) => {
-    try {
-        console.log("[Manual Trigger] minStay 동기화 시작");
-        const result = await syncMinStayOnly({ reason: "manual" });
-        res.json({ success: true, message: "minStay 동기화 완료", result });
+        const companyId = String(req.body?.companyId || "").trim();
+        const building = String(req.body?.building || "").trim();
+        if (!companyId) {
+            return res.status(400).json({ success: false, error: "Missing companyId" });
+        }
+        if (companyId !== DEFAULT_COMPANY_ID) {
+            return res.status(403).json({ success: false, error: "Access denied: companyId mismatch" });
+        }
+        if (!building) {
+            return res.status(400).json({ success: false, error: "Missing building" });
+        }
+
+        const targetProperty = PROPERTIES.find((property) => property.name === building && !property.disabled);
+        if (!targetProperty) {
+            return res.status(400).json({ success: false, error: `Unknown or disabled building: ${building}` });
+        }
+
+        console.log(`[Manual Trigger] 단일 건물 minStay 동기화 시작: ${building}`);
+        const result = await syncMinStayOnly({ reason: "manual_targeted", targetBuildings: [building] });
+        res.json({ success: true, message: `${building} minStay 동기화 완료`, building, result });
     } catch (e) {
         console.error("[Manual Trigger] minStay 동기화 실패:", e.message);
         res.status(500).json({ success: false, error: e.message });
@@ -3310,8 +3984,9 @@ async function syncAllReviews(companyId, fromDate = null, options = {}) {
                             },
                             reviewerName: review.reviewer?.name || null,
                             reviewerCountry: review.reviewer?.country_code || null,
-                            hasReply: !!review.reply,
+                            hasReply: !!(review.reply && (review.reply.text || review.reply.message || review.reply.last_change_timestamp)),
                             reply: review.reply || null,
+                            replyAt: review.reply?.last_change_timestamp || null,
                             createdAt: review.created_timestamp || null,
                             createdDateKey: toReviewDateKey(review.created_timestamp),
                             reservationId: String(review.reservation_id || ""),
@@ -3409,8 +4084,9 @@ async function syncAllReviews(companyId, fromDate = null, options = {}) {
                                 reviewerName: review.reviewer_id ? `Guest #${String(review.reviewer_id).slice(-6)}` : null,
                                 reviewerId: review.reviewer_id || null,
                                 reviewerCountry: null,
-                                hasReply: false,
-                                reply: null,
+                                hasReply: !!(review.reviewee_response || review.responded_at),
+                                reply: review.reviewee_response || null,
+                                replyAt: review.responded_at || null,
                                 createdAt: review.submitted_at || review.first_completed_at || null,
                                 createdDateKey: toReviewDateKey(review.submitted_at || review.first_completed_at),
                                 reservationId: review.reservation_confirmation_code || null,
@@ -3527,6 +4203,7 @@ async function syncAllReviews(companyId, fromDate = null, options = {}) {
 // 리뷰 풀 재대사: Beds24 전체 목록 vs Firestore 비교 → 삭제된 리뷰 하드 삭제
 async function reconcileReviews(companyId) {
     const beds24ReviewIds = new Set();
+    let completeTraversal = true;
 
     // Booking.com 전체 리뷰 ID 수집
     for (const prop of PROPERTIES) {
@@ -3538,41 +4215,95 @@ async function reconcileReviews(companyId) {
             while (hasMore && pageCount < 50) {
                 const res = await beds24GetV2WithRetry("/channels/booking/reviews", { propertyId: prop.v2Id, from: pageFrom });
                 const result = res.data;
-                if (!result || !Array.isArray(result.data) || result.data.length === 0) break;
+                if (!result || !Array.isArray(result.data)) {
+                    completeTraversal = false;
+                    hasMore = false;
+                    break;
+                }
+                if (result.data.length === 0) {
+                    hasMore = false;
+                    break;
+                }
                 result.data.forEach(r => beds24ReviewIds.add(`booking_${r.review_id}`));
                 if (result.pages?.nextPageExists) {
                     const lastTs = result.data[result.data.length - 1].created_timestamp;
                     const lastDate = lastTs ? lastTs.split(" ")[0] : null;
                     if (lastDate && lastDate !== pageFrom) { pageFrom = lastDate; pageCount++; }
-                    else { hasMore = false; }
+                    else {
+                        completeTraversal = false;
+                        hasMore = false;
+                    }
                 } else { hasMore = false; }
                 await new Promise(r => setTimeout(r, 300));
             }
+            if (hasMore) {
+                completeTraversal = false;
+                console.warn(`[reconcileReviews] Booking.com ${prop.name} page cap reached; deletion disabled`);
+            }
         } catch (err) {
+            completeTraversal = false;
             console.warn(`[reconcileReviews] Booking.com ${prop.name} 실패:`, err.message);
         }
         await new Promise(r => setTimeout(r, 300));
     }
 
     // Airbnb 전체 리뷰 ID 수집
-    for (const [, rooms] of Object.entries(BUILDING_ROOMS)) {
+    for (const [buildingName, rooms] of Object.entries(BUILDING_ROOMS)) {
+        const prop = PROPERTIES.find((item) => item.name === buildingName);
+        if (!prop || prop.disabled) continue;
         for (const room of rooms) {
             try {
-                const res = await beds24GetV2WithRetry("/channels/airbnb/reviews", { roomId: parseInt(room.roomId) });
-                const result = res.data;
-                if (result && Array.isArray(result.data)) {
-                    result.data.forEach(r => beds24ReviewIds.add(`airbnb_${r.id}`));
+                let nextLink = null;
+                let hasMore = true;
+                let pageCount = 0;
+                while (hasMore && pageCount < 20) {
+                    let result;
+                    if (nextLink) {
+                        const token = await getBeds24Token();
+                        const pageResponse = await axios.get(nextLink, { headers: { token } });
+                        result = pageResponse.data;
+                    } else {
+                        const response = await beds24GetV2WithRetry("/channels/airbnb/reviews", {
+                            roomId: parseInt(room.roomId)
+                        });
+                        result = response.data;
+                    }
+                    if (!result || !Array.isArray(result.data)) {
+                        completeTraversal = false;
+                        break;
+                    }
+                    result.data.forEach((review) => beds24ReviewIds.add(`airbnb_${review.id}`));
+                    nextLink = result.pages?.nextPageExists ? result.pages?.nextPageLink : null;
+                    hasMore = Boolean(nextLink);
+                    pageCount++;
+                    if (hasMore) await new Promise((resolve) => setTimeout(resolve, 300));
+                }
+                if (hasMore) {
+                    completeTraversal = false;
+                    console.warn(`[reconcileReviews] Airbnb ${buildingName}/${room.name} page cap reached; deletion disabled`);
                 }
             } catch (err) {
-                if (err.response?.status !== 400) console.warn(`[reconcileReviews] Airbnb ${room.name} 실패:`, err.message);
+                if (err.response?.status !== 400) {
+                    completeTraversal = false;
+                    console.warn(`[reconcileReviews] Airbnb ${room.name} 실패:`, err.message);
+                }
             }
             await new Promise(r => setTimeout(r, 200));
         }
     }
 
+    if (!completeTraversal) {
+        console.warn("[reconcileReviews] Partial Beds24 traversal detected; local review deletion skipped");
+        return 0;
+    }
+
     // Firestore에서 삭제된 리뷰 찾아서 하드 삭제
     const firestoreSnap = await db.collection("reviews").where("companyId", "==", companyId).get();
-    const toDelete = firestoreSnap.docs.filter(d => !beds24ReviewIds.has(d.id));
+    const activeReviewBuildings = new Set(PROPERTIES.filter((prop) => !prop.disabled).map((prop) => prop.name));
+    const toDelete = firestoreSnap.docs.filter((docSnap) => {
+        const building = docSnap.data()?.building;
+        return activeReviewBuildings.has(building) && !beds24ReviewIds.has(docSnap.id);
+    });
     const CHUNK = 400;
     for (let i = 0; i < toDelete.length; i += CHUNK) {
         const wb = db.batch();
@@ -3599,14 +4330,12 @@ exports.unifiedSync = onRequest({ cors: true, timeoutSeconds: 900, memory: "2GiB
         const arrivalTo = toDate || dayjs().add(24, "month").format("YYYY-MM-DD");
         // 과거 데이터(6개월 이상 이전) 동기화 시 inquiry/request/black 스킵 — 속도 최적화
         const isLegacyRange = toDate && dayjs(toDate).isBefore(dayjs().subtract(6, "month"));
-        const allBookings = [];
-        for (const prop of PROPERTIES) {
-            if (prop.disabled) continue;
-            console.log(`[UnifiedSync] 예약 fetch: ${prop.name} (${arrivalFrom} ~ ${arrivalTo})${isLegacyRange ? " [legacy mode]" : ""}`);
-            const bookings = await fetchAllBookingsFromProperty(prop, { arrivalFrom, arrivalTo }, { legacyMode: isLegacyRange });
-            allBookings.push(...bookings);
-            await new Promise(r => setTimeout(r, 500));
-        }
+        console.log(`[UnifiedSync] 예약 batch fetch: ${arrivalFrom} ~ ${arrivalTo}${isLegacyRange ? " [legacy mode]" : ""}`);
+        const allBookings = await fetchAllBookingsFromProperties(
+            PROPERTIES,
+            { arrivalFrom, arrivalTo },
+            { legacyMode: isLegacyRange }
+        );
         console.log(`[UnifiedSync] 예약 fetch 완료: ${allBookings.length}건`);
         const reservationResult = await incrementalReservationSync(allBookings, companyId, "unified_sync");
         console.log(`✅ [UnifiedSync] 예약 완료: ${reservationResult.upsertedCount}건`);
@@ -3633,9 +4362,11 @@ exports.unifiedSync = onRequest({ cors: true, timeoutSeconds: 900, memory: "2GiB
     }
 });
 
-// 리뷰 증분 자동 동기화 (3시간마다, 최근 90일 + 90일 초과 자동 삭제)
+// Reviews have no supported webhook in the Beds24 V2 docs. Poll once daily;
+// review data is not operationally time-critical like bookings/inventory.
 exports.scheduledReviewsSync = onSchedule({
-    schedule: "0 0,3,6,9,12,15,18,21 * * *",
+    schedule: "15 4 * * *",
+    timeZone: "Asia/Tokyo",
     timeoutSeconds: 540,
     memory: "512MiB"
 }, async () => {
@@ -3645,9 +4376,10 @@ exports.scheduledReviewsSync = onSchedule({
     console.log(`✅ 리뷰 증분 동기화 완료: ${count}건, 정리: ${pruned}건 (${dayjs().utcOffset(9).format("YYYY-MM-DD HH:mm")})`);
 });
 
-// 리뷰 풀 재대사 (매일 새벽 3시 JST — 삭제된 리뷰 정리)
+// Weekly safety reconcile. Destructive pruning runs only after a complete
+// Beds24 traversal; partial API results must never delete local review data.
 exports.scheduledReviewsReconcile = onSchedule({
-    schedule: "0 18 * * *", // 매일 18:00 UTC = JST 03:00
+    schedule: "45 4 * * 0",
     timeZone: "Asia/Tokyo",
     timeoutSeconds: 540,
     memory: "512MiB"
@@ -3731,8 +4463,102 @@ const BUILDING_ROOMS = {
     "오쿠보A동": [{ roomId: "437952", name: "오쿠보A" }],
     "오쿠보B동": [{ roomId: "615969", name: "오쿠보B" }],
     "오쿠보C동": [{ roomId: "450096", name: "오쿠보C" }, { roomId: "496532", name: "오쿠보C" }, { roomId: "648399", name: "오쿠보C" }],
+    "STAY ARI Apartment Hotel": [
+        { roomId: "708662", name: "101" }, { roomId: "708663", name: "102" },
+        { roomId: "708632", name: "103" }, { roomId: "708635", name: "105" },
+        { roomId: "708636", name: "106" }, { roomId: "708637", name: "107" },
+        { roomId: "708638", name: "108" }, { roomId: "708642", name: "109" },
+        { roomId: "708643", name: "110" }, { roomId: "708664", name: "201" },
+        { roomId: "708665", name: "202" }, { roomId: "708644", name: "203" },
+        { roomId: "708645", name: "205" }, { roomId: "708646", name: "206" },
+        { roomId: "708650", name: "207" }, { roomId: "708651", name: "208" },
+        { roomId: "708652", name: "209" }, { roomId: "708653", name: "210" },
+        { roomId: "708666", name: "302" }, { roomId: "708654", name: "303" },
+        { roomId: "708656", name: "305" }, { roomId: "708657", name: "306" },
+        { roomId: "708658", name: "307" }, { roomId: "708659", name: "308" },
+        { roomId: "708660", name: "309" }, { roomId: "708661", name: "310" }
+    ],
     "사노시": [{ roomId: "481152", name: "사노" }]
 };
+
+// Beds24 Daily Price links. Price writes must target the source price row,
+// while inventory/min-stay writes must continue to target the active roomId.
+// These links were verified against GET /properties?includePriceRules=true.
+// A post-write readback below prevents a future Beds24 configuration change
+// from being reported as a false success.
+const BEDS24_PRICE_SOURCE_ROOM_ID = Object.freeze({
+    "502229": "383975",
+    "515300": "440617",
+    "601545": "383971",
+    "601546": "403542",
+    "601547": "383972",
+    "601548": "383978",
+    "601549": "383974",
+    "601550": "383976",
+    "601551": "537451",
+    "601552": "383973",
+    "601553": "383977",
+    "451220": "383979",
+    "451223": "383982",
+    "451224": "383983",
+    "452061": "383980",
+    "452062": "383981",
+    "452063": "383984",
+    "452064": "383985",
+    "452065": "441885",
+    "601560": "543189",
+    "648398": "624198",
+    "496532": "450096",
+    "648399": "450096",
+    "556719": "513700"
+});
+
+function getBeds24PriceSourceRoomId(roomId) {
+    const roomIdStr = String(roomId || "");
+    return BEDS24_PRICE_SOURCE_ROOM_ID[roomIdStr] || roomIdStr;
+}
+
+function getRelatedBeds24RoomIds(building, roomName, roomId = null) {
+    const allRooms = BUILDING_ROOMS[building] || [];
+    const normalizedRoomName = String(roomName || "");
+    const relatedIds = allRooms
+        .filter((room) => normalizedRoomName && room.name === normalizedRoomName)
+        .map((room) => String(room.roomId));
+
+    if (roomId != null && roomId !== "") relatedIds.push(String(roomId));
+    const sourceIds = relatedIds.map((id) => getBeds24PriceSourceRoomId(id));
+    return [...new Set([...relatedIds, ...sourceIds].filter(Boolean))];
+}
+
+function normalizeBeds24PriceWriteRoomUpdates(building, roomUpdates = []) {
+    const updatesBySourceRoomId = new Map();
+
+    roomUpdates.forEach((roomUpdate) => {
+        const requestedRoomId = String(roomUpdate?.roomId || "");
+        if (!requestedRoomId) return;
+
+        const sourceRoomId = getBeds24PriceSourceRoomId(requestedRoomId);
+        const roomName = roomUpdate?.roomName || getRoomNameByRoomId(requestedRoomId);
+        const existing = updatesBySourceRoomId.get(sourceRoomId) || {
+            roomId: sourceRoomId,
+            roomName,
+            dates: {},
+            cacheRoomIds: []
+        };
+
+        existing.dates = { ...existing.dates, ...(roomUpdate?.dates || {}) };
+        existing.cacheRoomIds = [...new Set([
+            ...existing.cacheRoomIds,
+            ...getRelatedBeds24RoomIds(building, roomName, requestedRoomId)
+        ])];
+        updatesBySourceRoomId.set(sourceRoomId, existing);
+    });
+
+    return [...updatesBySourceRoomId.values()].map((roomUpdate) => ({
+        ...roomUpdate,
+        calendarUpdates: buildBeds24CalendarUpdatesFromDates(roomUpdate.dates)
+    }));
+}
 
 const HOME_DASHBOARD_EXCLUDED_BUILDING = PROPERTIES.find((property) => property.disabled)?.name || "";
 const HOME_DASHBOARD_REFERENCE_ONLY_BUILDING = PROPERTIES[PROPERTIES.length - 1]?.name || "";
@@ -3741,10 +4567,13 @@ const {
     sendSyncAlert,
     buildAndSendSlackDailyReport,
     buildAndSendSlackCleaningReport,
+    sendSlackCleaningReportCorrectionIfSent,
     scheduledSlackDailyReport,
     scheduledSlackDailyReportRetry,
     sendSlackDailyReportManual,
+    scheduledHotelsmartCleaningPrefetch,
     scheduledSlackCleaningReport,
+    scheduledSlackCleaningReportRetry,
     sendSlackCleaningReportManual
 } = createSlackReportModule({
     onRequest,
@@ -3756,7 +4585,17 @@ const {
     filterDocsToCompany,
     getBookingAmount,
     assertReservationDataReady,
-    getEffectiveCompanyId
+    getEffectiveCompanyId,
+    hotelsmartSecrets: HOTELSMART_SECRETS,
+    authorizeInternalRequest: authorizeInternalAutomationRequest
+});
+
+const {
+    collectHotelsmartCleaningAssignmentsManual,
+} = createHotelsmartCleaningModule({
+    onRequest,
+    hotelsmartSecrets: HOTELSMART_SECRETS,
+    authorizeInternalRequest: authorizeInternalAutomationRequest,
 });
 
 const {
@@ -3786,8 +4625,23 @@ const {
     db,
     dayjs,
     DEFAULT_COMPANY_ID,
-    BUILDING_ROOMS
+    BUILDING_ROOMS,
+    assertReservationDataReady
 });
+
+// Beds24 ↔ price_sync 캐시 정합성 대조 (읽기 전용 — 쓰기 없음)
+const { auditPriceConsistency } = createPriceConsistencyAuditModule({
+    onRequest,
+    db,
+    dayjs,
+    beds24GetRoomCalendarAllPages,
+    normalizeBeds24MinStay,
+    authorizeInternalRequest: authorizeInternalAutomationRequest,
+    BUILDING_ROOMS,
+    PROPERTIES,
+    DEFAULT_COMPANY_ID
+});
+exports.auditPriceConsistency = auditPriceConsistency;
 
 // ==========================================
 // 가격 조회: Legacy API (효과적인 가격 반환 - API V2는 명시적 설정값만 반환하므로 사용 불가)
@@ -3826,13 +4680,13 @@ function mergeArakichoA501PriceRoomIds(roomIds = []) {
     return [...new Set([...normalizeRoomIdList(roomIds), ...ARAKICHO_A_501_DUAL_ROOM_IDS])];
 }
 
-exports.setRoomPrices = onRequest({ cors: true, timeoutSeconds: 30 }, async (req, res) => {
+exports.setRoomPrices = onRequest({ cors: true, timeoutSeconds: 120, memory: "1GiB", cpu: 1, minInstances: 1, maxInstances: 4 }, async (req, res) => {
     try {
         const { companyId, roomId, roomIds, dates, building, worker, workerEmail, roomUpdates } = req.body;
         if (!companyId) return res.status(400).json({ success: false, error: "Missing companyId" });
 
         let effectiveBuilding = building || null;
-        const normalizedRoomUpdates = [];
+        let normalizedRoomUpdates = [];
         if (Array.isArray(roomUpdates) && roomUpdates.length > 0) {
             roomUpdates.forEach((roomUpdate) => {
                 const updateDates = roomUpdate?.dates || {};
@@ -3874,6 +4728,8 @@ exports.setRoomPrices = onRequest({ cors: true, timeoutSeconds: 30 }, async (req
             });
         }
 
+        normalizedRoomUpdates = normalizeBeds24PriceWriteRoomUpdates(effectiveBuilding, normalizedRoomUpdates);
+
         if (normalizedRoomUpdates.length === 0) {
             return res.status(400).json({ success: false, error: "No valid room updates to queue" });
         }
@@ -3897,7 +4753,8 @@ exports.setRoomPrices = onRequest({ cors: true, timeoutSeconds: 30 }, async (req
             progress: { processed: 0, total: activeRoomIds.length, results: [] },
             failedRoomIds: [],
             retryCount: 0,
-            error: null
+            error: null,
+            jobType: "price"
         });
 
         const totalDateCount = normalizedRoomUpdates.reduce((sum, item) => sum + Object.keys(item.dates || {}).length, 0);
@@ -3917,7 +4774,7 @@ exports.setRoomPrices = onRequest({ cors: true, timeoutSeconds: 30 }, async (req
     }
 });
 
-exports.triggerPriceJobNow = onRequest({ cors: true, timeoutSeconds: 540 }, async (req, res) => {
+exports.triggerPriceJobNow = onRequest({ cors: true, timeoutSeconds: 540, memory: "16GiB", cpu: 4, maxInstances: 4 }, async (req, res) => {
     try {
         const { jobId, companyId } = req.body;
         if (!jobId || !companyId) {
@@ -4080,15 +4937,31 @@ async function readPriceSyncMonthCache({ buildingRef, building, fromKey, toKey, 
         priceData[roomId] = filterRoomDataByDateRange(priceData[roomId]);
     });
 
+    // [불변식] 월 캐시가 hit이면 rooms 서브컬렉션은 아예 읽지 않는다.
+    // 따라서 price_sync/{building}/rooms/{roomId} 를 쓰는 코드는 반드시
+    // mergePriceSyncMonthCache 또는 patchPriceSyncMonthCacheFields 도 함께 호출해야 한다.
+    // 한쪽만 쓰면 그 변경은 화면에 영원히 반영되지 않는다.
     const expectedRoomIds = (BUILDING_ROOMS[building] || []).map((room) => String(room.roomId));
     const hasAllRequestedMonths = existingSnaps.length === monthKeys.length;
-    const hasAllExpectedRooms = expectedRoomIds.length > 0 && expectedRoomIds.every((roomId) => {
-        return existingSnaps.every((snap) => snap.data()?.rooms?.[roomId]?.cacheComplete === true);
-    });
-    return { hit: hasAllRequestedMonths && hasAllExpectedRooms, priceData, monthKeys };
+    const incompleteRoomIds = expectedRoomIds.filter((roomId) =>
+        !existingSnaps.every((snap) => snap.data()?.rooms?.[roomId]?.cacheComplete === true)
+    );
+    const hasAllExpectedRooms = expectedRoomIds.length > 0 && incompleteRoomIds.length === 0;
+    const hit = hasAllRequestedMonths && hasAllExpectedRooms;
+
+    // miss가 계속되면 월 캐시가 사실상 죽은 것이다(매 요청마다 rooms 전체 조회).
+    // 원인을 눈으로 확인할 수 있게 사유를 남긴다.
+    if (!hit) {
+        const reason = !hasAllRequestedMonths
+            ? `월 문서 누락 (${existingSnaps.length}/${monthKeys.length})`
+            : `cacheComplete 아닌 roomId ${incompleteRoomIds.length}개: ${incompleteRoomIds.slice(0, 5).join(",")}`;
+        console.log(`[PriceCache] ${building} month cache miss — ${reason}`);
+    }
+
+    return { hit, priceData, monthKeys };
 }
 
-exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
+exports.getCachedPrices = onRequest({ cors: true, timeoutSeconds: 60, memory: "2GiB", cpu: 1, minInstances: 1, maxInstances: 12 }, async (req, res) => {
     try {
         const { companyId, building, dateFrom, dateTo } = req.body;
 
@@ -4134,8 +5007,15 @@ exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
         }
 
         const invalidatedRoomIds = [...new Set((docData.invalidatedRoomIds || []).map((id) => String(id)).filter(Boolean))];
+        const reservationInvalidatedRoomIds = [
+            ...new Set((docData.reservationInvalidatedRoomIds || []).map((id) => String(id)).filter(Boolean))
+        ];
         const liveRoomDataById = {};
-        if (invalidatedRoomIds.length > 0) {
+        const refreshInvalidatedRoomsDuringCacheRead = false;
+        if (!refreshInvalidatedRoomsDuringCacheRead && invalidatedRoomIds.length > 0) {
+            console.log(`[getCachedPrices] ${building} has ${invalidatedRoomIds.length} invalidated room(s); serving cached data without blocking on Beds24 live refresh`);
+        }
+        if (refreshInvalidatedRoomsDuringCacheRead && invalidatedRoomIds.length > 0) {
             const apiGuard = await getBeds24ApiGuardState();
             const roomNameById = {};
             (BUILDING_ROOMS[building] || []).forEach((room) => {
@@ -4278,6 +5158,16 @@ exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
             priceData[roomId] = filterRoomDataByDateRange(roomData);
         });
 
+        // 정규화 도입 이전에 m: ""로 저장된 캐시도 즉시 1박으로 응답한다.
+        // (그러지 않으면 다음 full sync까지 해당 roomId가 프론트에서 비활성으로 오인된다)
+        Object.values(priceData).forEach((roomData) => {
+            Object.values(roomData?.dates || {}).forEach((dateEntry) => {
+                if (dateEntry && typeof dateEntry === "object") {
+                    dateEntry.m = normalizeBeds24MinStay(dateEntry.m);
+                }
+            });
+        });
+
         const data = docData;
         const lastSync = data.lastSync?.toDate() || null;
         const diffMinutes = lastSync ? Math.round((new Date() - lastSync) / (1000 * 60)) : null;
@@ -4293,6 +5183,10 @@ exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
             lastSync: lastSync?.toISOString(),
             syncAge: diffMinutes,
             cacheMode,
+            invalidatedRoomIds,
+            reservationInvalidatedRoomIds,
+            invalidatedRoomCount: invalidatedRoomIds.length,
+            hasPendingInvalidation: invalidatedRoomIds.length > 0,
             roomCount: Object.keys(priceData).length // 실제 로드된 방 개수
         });
     } catch (e) {
@@ -4304,7 +5198,7 @@ exports.getCachedPrices = onRequest({ cors: true }, async (req, res) => {
 // ==========================================
 // 수기예약/수정 전 실시간 확인 (충돌 방지)
 // ==========================================
-exports.checkAvailability = onRequest({ cors: true, timeoutSeconds: 60 }, async (req, res) => {
+exports.checkAvailability = onRequest({ cors: true, timeoutSeconds: 120, memory: "16GiB", cpu: 4, maxInstances: 4 }, async (req, res) => {
     try {
         const { companyId, building, roomId, dateFrom, dateTo } = req.body;
 
@@ -4382,6 +5276,11 @@ function getPriceJobCreatedAtMs(jobData = {}, jobSnapshot = null) {
         || 0;
 }
 
+function getPriceJobType(jobData = {}) {
+    if (jobData?.jobType === "min_stay" || jobData?.worker === "Min Stay Queue") return "min_stay";
+    return "price";
+}
+
 function normalizePriceJobRoomUpdates(jobData = {}) {
     const { roomUpdates, roomIds, dates, calendarUpdates } = jobData || {};
     return Array.isArray(roomUpdates) && roomUpdates.length > 0
@@ -4391,12 +5290,14 @@ function normalizePriceJobRoomUpdates(jobData = {}) {
                 roomId: String(item.roomId),
                 roomName: item.roomName || null,
                 dates: item.dates,
+                cacheRoomIds: normalizeRoomIdList(item.cacheRoomIds || item.roomIds || [item.roomId]),
                 calendarUpdates: Array.isArray(item.calendarUpdates) ? item.calendarUpdates : buildBeds24CalendarUpdatesFromDates(item.dates)
             }))
         : (roomIds || []).map((rid) => ({
             roomId: String(rid),
             roomName: null,
             dates: dates || {},
+            cacheRoomIds: [String(rid)],
             calendarUpdates: Array.isArray(calendarUpdates) ? calendarUpdates : buildBeds24CalendarUpdatesFromDates(dates || {})
         }));
 }
@@ -4434,6 +5335,7 @@ function prunePriceJobRoomUpdates(roomUpdates = [], supersededKeySet = new Set()
                 roomId: rid,
                 roomName: item.roomName || null,
                 dates: nextDates,
+                cacheRoomIds: normalizeRoomIdList(item.cacheRoomIds || [rid]),
                 calendarUpdates: buildBeds24CalendarUpdatesFromDates(nextDates)
             };
         })
@@ -4444,6 +5346,7 @@ async function getSupersededPriceJobIntent({
     jobId,
     companyId,
     building,
+    jobType = "price",
     currentCreatedMs,
     roomUpdates = [],
     excludeJobIds = []
@@ -4468,8 +5371,9 @@ async function getSupersededPriceJobIntent({
     }
 
     const excludedIds = new Set([jobId, ...(excludeJobIds || []).map(String)]);
-    const comparableStatuses = new Set(["queued", "processing", "completed", "partial_failed", "failed"]);
+    const comparableStatuses = ["queued", "processing", "completed", "partial_failed", "failed"];
     const sameBuildingSnap = await db.collection("beds24_price_jobs")
+        .where("status", "in", comparableStatuses)
         .where("companyId", "==", companyId)
         .where("building", "==", building)
         .get();
@@ -4484,11 +5388,16 @@ async function getSupersededPriceJobIntent({
             data: docSnap.data() || {},
             createdMs: getPriceJobCreatedAtMs(docSnap.data() || {}, docSnap)
         }))
-        .filter((item) => item.createdMs > currentCreatedMs && comparableStatuses.has(item.data.status))
+        .filter((item) => getPriceJobType(item.data) === jobType)
+        .filter((item) => item.createdMs > currentCreatedMs)
         .sort((a, b) => a.createdMs - b.createdMs)
         .forEach((item) => {
             let hasOverlap = false;
-            normalizePriceJobRoomUpdates(item.data).forEach((update) => {
+            const candidateUpdates = normalizePriceJobRoomUpdates(item.data);
+            const comparableUpdates = jobType === "price"
+                ? normalizeBeds24PriceWriteRoomUpdates(building, candidateUpdates)
+                : candidateUpdates;
+            comparableUpdates.forEach((update) => {
                 const rid = String(update.roomId || "");
                 Object.keys(update.dates || {}).forEach((dateKey) => {
                     const key = `${rid}:${dateKey}`;
@@ -4509,6 +5418,238 @@ async function getSupersededPriceJobIntent({
         supersededByJobIds,
         supersededByJobId: supersededByJobIds.length > 0 ? supersededByJobIds[supersededByJobIds.length - 1] : null
     };
+}
+
+function getCalendarEntryForDate(calendar = [], dateStr) {
+    return (calendar || []).find((entry) => entry?.from <= dateStr && entry?.to >= dateStr) || null;
+}
+
+function getExpectedPriceValue(value) {
+    if (value === "REMOVE" || value === -1 || value === null) return null;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+        throw new Error(`Invalid price value for Beds24 verification: ${value}`);
+    }
+    return parsed;
+}
+
+/**
+ * 되읽기 검증 대상을 만든다.
+ *
+ * 가격 쓰기는 source 방 하나에만 POST하고 Beds24 Daily Price 링크가 연결 방에
+ * 전파해 주기를 기대한다. 그런데 연결 방의 실제 값은 지금까지 한 번도 확인하지 않았고,
+ * 캐시에는 "전파됐다"고 가정한 값을 써 왔다. 링크가 끊겨 있으면 평소엔 드러나지 않다가
+ * 듀얼 ID가 동시에 열리는 교차일에 값이 어긋나 보인다.
+ *
+ * → source 방은 보낸 값 전체를, 연결 방은 p1(전파돼야 하는 값)만 검증 대상으로 삼는다.
+ *   minStay는 활성 roomId별 설정이라 전파 대상이 아니므로 연결 방에서는 확인하지 않는다.
+ *
+ * @returns {{ targets: Object, siblingToSource: Map<string,string> }}
+ */
+function buildPriceWriteVerificationTargets(roomUpdateByRoomId, sourceRoomIds, jobType) {
+    const targets = {};
+    const siblingToSource = new Map();
+
+    (sourceRoomIds || []).forEach((sourceRid) => {
+        const roomUpdate = roomUpdateByRoomId[sourceRid];
+        if (!roomUpdate) return;
+        targets[sourceRid] = roomUpdate;
+
+        if (jobType !== "price") return;
+
+        normalizeRoomIdList(roomUpdate.cacheRoomIds || []).forEach((cacheRoomId) => {
+            const siblingRid = String(cacheRoomId);
+            if (siblingRid === sourceRid || targets[siblingRid]) return;
+
+            const p1OnlyDates = {};
+            Object.entries(roomUpdate.dates || {}).forEach(([dateKey, values]) => {
+                if (values?.p1 !== undefined) p1OnlyDates[dateKey] = { p1: values.p1 };
+            });
+            if (Object.keys(p1OnlyDates).length === 0) return;
+
+            targets[siblingRid] = { ...roomUpdate, roomId: siblingRid, dates: p1OnlyDates };
+            siblingToSource.set(siblingRid, sourceRid);
+        });
+    });
+
+    return { targets, siblingToSource };
+}
+
+/**
+ * @param {boolean} includeLinkedPrices
+ *   false — 그 방에 "직접" 설정된 값만 읽는다. 우리가 POST한 source 방 검증에 쓴다.
+ *           (연결된 Daily Price 쪽에 잘못 쓰인 요청을 성공으로 오인하지 않기 위함)
+ *   true  — 링크로 전파된 값까지 포함해 읽는다. 연결 방 검증에 쓴다.
+ *           연결 방의 가격은 링크를 통해서만 보이므로 false로 읽으면 항상 불일치로 나온다.
+ *           캐시(syncAllPrices)도 true로 만들어지므로 화면에 보이는 값과 기준이 일치한다.
+ */
+async function verifyBeds24PriceWrites(roomIds, roomUpdateByRoomId, attempts = 3, { includeLinkedPrices = false } = {}) {
+    const targetRoomIds = [...new Set((roomIds || []).map(String).filter(Boolean))];
+    const dateKeys = targetRoomIds.flatMap((roomId) => Object.keys(roomUpdateByRoomId[roomId]?.dates || {}));
+    if (targetRoomIds.length === 0 || dateKeys.length === 0) {
+        return { verifiedRoomIds: targetRoomIds, errorsByRoomId: {} };
+    }
+
+    const sortedDateKeys = [...new Set(dateKeys)].sort();
+    const fromKey = sortedDateKeys[0];
+    const toKey = sortedDateKeys[sortedDateKeys.length - 1];
+    const toV2Date = (dateKey) => `${dateKey.slice(0, 4)}-${dateKey.slice(4, 6)}-${dateKey.slice(6, 8)}`;
+    const fromDate = toV2Date(fromKey);
+    const toDate = toV2Date(toKey);
+    let latestErrorsByRoomId = {};
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        const roomDataById = new Map();
+        const VERIFY_BATCH_SIZE = 20;
+        let verifyTruncated = false;
+        for (let i = 0; i < targetRoomIds.length; i += VERIFY_BATCH_SIZE) {
+            const chunk = targetRoomIds.slice(i, i + VERIFY_BATCH_SIZE);
+            const pageResult = await beds24GetRoomCalendarAllPages({
+                roomId: chunk,
+                startDate: fromDate,
+                endDate: toDate,
+                includePrices: true,
+                includeLinkedPrices,
+                includeMinStay: true
+            }, { label: `verify [${chunk.join(",")}]` });
+            if (pageResult.truncated) verifyTruncated = true;
+            pageResult.roomsById.forEach((roomData, rid) => {
+                roomDataById.set(rid, roomData);
+            });
+        }
+
+        // 잘린 응답으로는 "일치한다"를 증명할 수 없다. 검증 실패로 처리해 재시도/실패 보고로 넘긴다.
+        if (verifyTruncated) {
+            const truncationError = "Beds24 verification readback truncated (paged response)";
+            return {
+                verifiedRoomIds: [],
+                errorsByRoomId: Object.fromEntries(targetRoomIds.map((roomId) => [roomId, truncationError]))
+            };
+        }
+
+        const errorsByRoomId = {};
+        targetRoomIds.forEach((roomId) => {
+            const roomData = roomDataById.get(roomId);
+            const mismatches = [];
+            Object.entries(roomUpdateByRoomId[roomId]?.dates || {}).forEach(([dateKey, values]) => {
+                const dateStr = toV2Date(dateKey);
+                const entry = getCalendarEntryForDate(roomData?.calendar || [], dateStr);
+
+                if (values?.p1 !== undefined) {
+                    const expected = getExpectedPriceValue(values.p1);
+                    const actual = entry?.price1 == null ? null : Number(entry.price1);
+                    const matches = expected === null ? actual === null : actual === expected;
+                    if (!matches) {
+                        mismatches.push({ field: "price1", date: dateStr, expected, actual });
+                    }
+                }
+
+                // minStay도 반드시 읽어 확인한다. Beds24는 값을 반영하지 않고도 success=true를 반환하므로
+                // 검증이 없으면 반영 실패가 그대로 로컬 캐시에 "성공"으로 기록된다.
+                // Beds24는 minStay 1을 빈칸으로 돌려주므로 양쪽 모두 1 기준으로 정규화해 비교한다.
+                if (values?.m !== undefined) {
+                    const expected = Number(normalizeBeds24MinStay(values.m));
+                    const actual = entry ? Number(normalizeBeds24MinStay(entry.minStay)) : null;
+                    if (actual !== expected) {
+                        mismatches.push({ field: "minStay", date: dateStr, expected, actual });
+                    }
+                }
+            });
+
+            if (mismatches.length > 0) {
+                const sample = mismatches.slice(0, 3)
+                    .map((item) => `${item.date} ${item.field}: expected=${item.expected}, actual=${item.actual}`)
+                    .join("; ");
+                errorsByRoomId[roomId] = `Beds24 readback mismatch (${mismatches.length} value(s)): ${sample}`;
+            }
+        });
+
+        latestErrorsByRoomId = errorsByRoomId;
+        if (Object.keys(errorsByRoomId).length === 0) break;
+        if (attempt < attempts) await sleep(attempt * 500);
+    }
+
+    return {
+        verifiedRoomIds: targetRoomIds.filter((roomId) => !latestErrorsByRoomId[roomId]),
+        errorsByRoomId: latestErrorsByRoomId
+    };
+}
+
+async function patchVerifiedPriceJobCache({
+    buildingRef,
+    building,
+    sourceRoomId,
+    roomUpdate,
+    jobData,
+    nowFormatted,
+    oldPricesByRoom,
+    skipCacheRoomIds = new Set()
+}) {
+    const roomDates = roomUpdate?.dates || {};
+    const isPriceJob = getPriceJobType(jobData) === "price";
+    const cacheRoomIds = (isPriceJob
+        ? [...new Set([sourceRoomId, ...normalizeRoomIdList(roomUpdate?.cacheRoomIds || [])])]
+        : [sourceRoomId]
+    // 전파가 확인되지 않은 연결 방은 캐시에 쓰지 않는다.
+    // 가정한 값을 써 버리면 Beds24와 어긋난 상태가 "정상"으로 굳는다.
+    ).filter((cacheRoomId) => cacheRoomId === sourceRoomId || !skipCacheRoomIds.has(String(cacheRoomId)));
+
+    await Promise.all(cacheRoomIds.map(async (cacheRoomId) => {
+        const roomDocRef = buildingRef.collection("rooms").doc(cacheRoomId);
+        const roomSnap = await roomDocRef.get();
+        const roomData = roomSnap.exists
+            ? roomSnap.data()
+            : { roomId: cacheRoomId, roomName: getRoomNameByRoomId(cacheRoomId), dates: {} };
+        if (!roomData.dates) roomData.dates = {};
+        roomData.lastManualUpdate = admin.firestore.FieldValue.serverTimestamp();
+
+        if (cacheRoomId === sourceRoomId) {
+            oldPricesByRoom[sourceRoomId] = {};
+            Object.keys(roomDates).forEach((dateKey) => {
+                oldPricesByRoom[sourceRoomId][dateKey] = parseFloat(roomData.dates[dateKey]?.p1) || 0;
+            });
+        }
+
+        Object.entries(roomDates).forEach(([dateKey, values]) => {
+            if (!roomData.dates[dateKey]) roomData.dates[dateKey] = {};
+            const valuesToCache = isPriceJob && cacheRoomId !== sourceRoomId
+                ? { p1: values.p1 }
+                : values;
+            const oldP1 = parseFloat(roomData.dates[dateKey].p1) || 0;
+            const newP1 = valuesToCache.p1 !== undefined ? parseFloat(valuesToCache.p1) : oldP1;
+
+            if (valuesToCache.p1 !== undefined) roomData.dates[dateKey].p1 = String(valuesToCache.p1);
+            if (valuesToCache.p2 !== undefined) roomData.dates[dateKey].p2 = String(valuesToCache.p2);
+            if (valuesToCache.p3 !== undefined) roomData.dates[dateKey].p3 = String(valuesToCache.p3);
+            if (valuesToCache.m !== undefined) roomData.dates[dateKey].m = String(valuesToCache.m);
+            if (valuesToCache.mx !== undefined) roomData.dates[dateKey].mx = String(valuesToCache.mx);
+            if (valuesToCache.na !== undefined) roomData.dates[dateKey].na = String(valuesToCache.na);
+            if (valuesToCache.ov !== undefined) roomData.dates[dateKey].ov = String(valuesToCache.ov);
+
+            if (valuesToCache.p1 !== undefined && oldP1 !== newP1) {
+                roomData.dates[dateKey].lm = {
+                    u: jobData.worker || "Admin",
+                    t: nowFormatted,
+                    o: oldP1,
+                    n: newP1,
+                    s: "system",
+                    ts: Date.now()
+                };
+            }
+        });
+
+        await roomDocRef.set(roomData, { merge: true });
+        const changedDatesForMonthCache = {};
+        Object.keys(roomDates).forEach((dateKey) => {
+            if (roomData.dates?.[dateKey]) changedDatesForMonthCache[dateKey] = roomData.dates[dateKey];
+        });
+        await mergePriceSyncMonthCache(
+            building,
+            cacheRoomId,
+            roomData.roomName || getRoomNameByRoomId(cacheRoomId),
+            changedDatesForMonthCache
+        );
+    }));
 }
 
 async function processPriceJob(jobId) {
@@ -4541,6 +5682,7 @@ async function processPriceJob(jobId) {
                 const preData = preSnap.data();
                 const cId = preData.companyId;
                 const cBuilding = preData.building;
+                const currentJobType = getPriceJobType(preData);
                 currentJobCreatedMs = getPriceJobCreatedAtMs(preData, preSnap);
                 if (cId && cBuilding) {
                     const secSnap = await db.collection("beds24_price_jobs")
@@ -4552,6 +5694,7 @@ async function processPriceJob(jobId) {
                     const nowMs = Date.now();
                     const secDocs = secSnap.docs.filter(d => {
                         if (d.id === jobId) return false;
+                        if (getPriceJobType(d.data() || {}) !== currentJobType) return false;
                         const secCreatedMs = getPriceJobCreatedAtMs(d.data(), d);
                         if (!secCreatedMs) return false;
                         if (currentJobCreatedMs > 0) {
@@ -4567,11 +5710,16 @@ async function processPriceJob(jobId) {
                         ].sort((a, b) => (a.data.createdAt?.toMillis?.() || 0) - (b.data.createdAt?.toMillis?.() || 0));
                         const dateValMap = {};
                         const roomNameMap = {};
+                        const cacheRoomIdsMap = {};
                         for (const { data } of allForMerge) {
                             for (const ru of (Array.isArray(data.roomUpdates) ? data.roomUpdates : [])) {
                                 if (!ru?.roomId || !ru?.dates) continue;
                                 const rid = String(ru.roomId);
                                 if (ru.roomName) roomNameMap[rid] = ru.roomName;
+                                if (!cacheRoomIdsMap[rid]) cacheRoomIdsMap[rid] = new Set();
+                                normalizeRoomIdList(ru.cacheRoomIds || [rid]).forEach((cacheRoomId) => {
+                                    cacheRoomIdsMap[rid].add(cacheRoomId);
+                                });
                                 Object.entries(ru.dates || {}).forEach(([dKey, val]) => {
                                     dateValMap[`${rid}:${dKey}`] = { roomId: rid, dateKey: dKey, values: val };
                                 });
@@ -4586,6 +5734,7 @@ async function processPriceJob(jobId) {
                             roomId: rid,
                             roomName: roomNameMap[rid] || null,
                             dates,
+                            cacheRoomIds: [...(cacheRoomIdsMap[rid] || new Set([rid]))],
                             calendarUpdates: buildBeds24CalendarUpdatesFromDates(dates)
                         }));
                         coalescedJobIds = secDocs.map(d => d.id);
@@ -4648,11 +5797,15 @@ async function processPriceJob(jobId) {
         }
 
         const { building, companyId: jobCompanyId, worker: jobWorker, workerEmail: jobWorkerEmail } = jobData;
-        const normalizedRoomUpdates = mergedRoomUpdates || normalizePriceJobRoomUpdates(jobData);
+        const originalRoomUpdates = mergedRoomUpdates || normalizePriceJobRoomUpdates(jobData);
+        const normalizedRoomUpdates = getPriceJobType(jobData) === "price"
+            ? normalizeBeds24PriceWriteRoomUpdates(building, originalRoomUpdates)
+            : originalRoomUpdates;
         const supersededIntent = await getSupersededPriceJobIntent({
             jobId,
             companyId: jobCompanyId,
             building,
+            jobType: getPriceJobType(jobData),
             currentCreatedMs: currentJobCreatedMs,
             roomUpdates: normalizedRoomUpdates,
             excludeJobIds: coalescedJobIds
@@ -4776,8 +5929,9 @@ async function processPriceJob(jobId) {
                     let batchSuccessCount = 0;
                     let batchFailCount = 0;
 
-                    // 1) 성공/실패 분류는 순차로 (results 배열 순서를 기존과 동일하게 보존)
-                    const successRids = [];
+                    // 1) Beds24 API 수락 여부를 먼저 확인한다.
+                    const acceptedRids = [];
+                    const apiErrorsByRoomId = {};
                     for (let ri = 0; ri < batchRoomIds.length; ri++) {
                         const rid = batchRoomIds[ri];
                         const item = respItems[ri];
@@ -4785,17 +5939,72 @@ async function processPriceJob(jobId) {
                         const itemSuccess = item?.success !== false && !itemHasErrors;
 
                         if (itemSuccess) {
-                            results.push({ roomId: rid, success: true });
-                            batchSuccessCount++;
-                            successRids.push(rid);
+                            acceptedRids.push(rid);
                         } else {
-                            const errMsg = item?.errors?.map(e => e.message).join("; ") || "Beds24 item-level failure";
-                            results.push({ roomId: rid, success: false, error: errMsg });
-                            batchFailCount++;
+                            apiErrorsByRoomId[rid] = item?.errors?.map(e => e.message).join("; ") || "Beds24 item-level failure";
                         }
                     }
 
-                    // 2) 성공 객실의 Firestore 캐시 패치를 동시성 제한 병렬로 처리.
+                    // 2) Price 작업은 실제 Beds24 값을 다시 읽어 일치할 때만 성공 처리한다.
+                    //    연결된 Daily Price에 잘못 쓴 요청도 Beds24가 success=true를 반환할 수 있기 때문이다.
+                    let verificationErrorsByRoomId = {};
+                    // 링크 전파가 확인되지 않은 연결 방 — 캐시에 "전파됐다"고 쓰면 안 된다.
+                    const unpropagatedSiblingRoomIds = new Set();
+                    if (acceptedRids.length > 0) {
+                        const { targets, siblingToSource } = buildPriceWriteVerificationTargets(
+                            roomUpdateByRoomId, acceptedRids, getPriceJobType(jobData)
+                        );
+                        const sourceRids = Object.keys(targets).filter((rid) => !siblingToSource.has(rid));
+                        const siblingRids = Object.keys(targets).filter((rid) => siblingToSource.has(rid));
+
+                        // source는 직접 설정값만(false), 연결 방은 링크 전파값까지(true) 읽어야 한다.
+                        // 기준이 다르므로 한 번의 조회로 합칠 수 없다.
+                        const [sourceVerification, siblingVerification] = await Promise.all([
+                            sourceRids.length > 0
+                                ? verifyBeds24PriceWrites(sourceRids, targets, 3, { includeLinkedPrices: false })
+                                : Promise.resolve({ errorsByRoomId: {} }),
+                            siblingRids.length > 0
+                                ? verifyBeds24PriceWrites(siblingRids, targets, 3, { includeLinkedPrices: true })
+                                : Promise.resolve({ errorsByRoomId: {} })
+                        ]);
+                        const mergedErrors = { ...sourceVerification.errorsByRoomId, ...siblingVerification.errorsByRoomId };
+
+                        Object.entries(mergedErrors).forEach(([rid, error]) => {
+                            if (siblingToSource.has(rid)) {
+                                // 연결 방 불일치 = Beds24 Daily Price 링크가 전파하지 않았다는 뜻.
+                                // source 쓰기 자체는 성공했으므로 job을 실패로 만들지 않는다.
+                                // 대신 크게 로그를 남기고, 그 방 캐시는 건드리지 않아 다음 sync가 실제 값으로 채우게 한다.
+                                unpropagatedSiblingRoomIds.add(rid);
+                                console.error(
+                                    `[PriceJob ${jobId}] Daily Price 링크 미전파 의심: source=${siblingToSource.get(rid)} → linked=${rid} — ${error}`
+                                );
+                            } else {
+                                verificationErrorsByRoomId[rid] = error;
+                            }
+                        });
+                    }
+
+                    const successRids = [];
+                    batchRoomIds.forEach((rid) => {
+                        const error = apiErrorsByRoomId[rid] || verificationErrorsByRoomId[rid] || null;
+                        if (error) {
+                            results.push({ roomId: rid, success: false, error });
+                            batchFailCount++;
+                        } else {
+                            const unpropagated = normalizeRoomIdList(roomUpdateByRoomId[rid]?.cacheRoomIds || [])
+                                .filter((cacheRoomId) => unpropagatedSiblingRoomIds.has(String(cacheRoomId)));
+                            results.push({
+                                roomId: rid,
+                                success: true,
+                                verified: true,
+                                ...(unpropagated.length > 0 ? { unpropagatedLinkedRoomIds: unpropagated } : {})
+                            });
+                            successRids.push(rid);
+                            batchSuccessCount++;
+                        }
+                    });
+
+                    // 3) 검증 성공 객실의 Firestore 캐시 패치를 동시성 제한 병렬로 처리.
                     //    각 rid는 서로 다른 room 문서(rooms.{rid})와 month 캐시(rooms.{rid})만 쓰므로 병렬 충돌 없음.
                     //    같은 배치 = 같은 논리적 시각이므로 lm.t용 시각은 배치당 1회만 계산.
                     const ROOM_WRITE_CONCURRENCY = 10;
@@ -4804,48 +6013,17 @@ async function processPriceJob(jobId) {
                         const chunk = successRids.slice(i, i + ROOM_WRITE_CONCURRENCY);
                         await Promise.all(chunk.map(async (rid) => {
                             try {
-                                const roomDocRef = buildingRef.collection("rooms").doc(rid);
-                                const roomSnap = await roomDocRef.get();
-                                let roomData = roomSnap.exists ? roomSnap.data() : { roomId: rid, dates: {} };
-                                if (!roomData.dates) roomData.dates = {};
                                 const roomUpdate = roomUpdateByRoomId[rid];
-                                const roomDates = roomUpdate?.dates || {};
-                                // 로그용 구 가격 수집 (패치 전)
-                                oldPricesByRoom[rid] = {};
-                                Object.keys(roomDates).forEach(dKey => { oldPricesByRoom[rid][dKey] = parseFloat(roomData.dates[dKey]?.p1) || 0; });
-                                roomData.lastManualUpdate = admin.firestore.FieldValue.serverTimestamp();
-
-                                Object.entries(roomDates).forEach(([dKey, values]) => {
-                                    if (!roomData.dates[dKey]) roomData.dates[dKey] = {};
-
-                                    // 이전 가격 수집 (p1 기준)
-                                    const oldP1 = parseFloat(roomData.dates[dKey].p1) || 0;
-                                    const newP1 = values.p1 !== undefined ? parseFloat(values.p1) : oldP1;
-
-                                    if (values.p1 !== undefined) roomData.dates[dKey].p1 = String(values.p1);
-                                    if (values.p2 !== undefined) roomData.dates[dKey].p2 = String(values.p2);
-                                    if (values.p3 !== undefined) roomData.dates[dKey].p3 = String(values.p3);
-
-                                    // 가격 변동이 있을 경우 상세 메타데이터(lm) 저장
-                                    if (values.p1 !== undefined && oldP1 !== newP1) {
-                                        roomData.dates[dKey].lm = {
-                                            u: jobData.worker || "Admin",
-                                            t: nowFormatted,
-                                            o: oldP1,
-                                            n: newP1,
-                                            s: "system",
-                                            ts: Date.now()
-                                        };
-                                    }
+                                await patchVerifiedPriceJobCache({
+                                    buildingRef,
+                                    building,
+                                    sourceRoomId: rid,
+                                    roomUpdate,
+                                    jobData,
+                                    nowFormatted,
+                                    oldPricesByRoom,
+                                    skipCacheRoomIds: unpropagatedSiblingRoomIds
                                 });
-                                await roomDocRef.set(roomData, { merge: true });
-                                const changedDatesForMonthCache = {};
-                                Object.keys(roomDates).forEach((dKey) => {
-                                    if (roomData.dates?.[dKey]) {
-                                        changedDatesForMonthCache[dKey] = roomData.dates[dKey];
-                                    }
-                                });
-                                await mergePriceSyncMonthCache(building, rid, roomData.roomName || getRoomNameByRoomId(rid), changedDatesForMonthCache);
                             } catch (cacheErr) {
                                 console.error(`[PriceJob ${jobId}] 캐시 패치 실패 roomId=${rid}:`, cacheErr.message);
                             }
@@ -5024,7 +6202,7 @@ async function processPriceJob(jobId) {
             } else {
                 const avgOldPrice = Math.round(priceSnapshot.reduce((s, p) => s + p.oldPrice, 0) / priceSnapshot.length);
                 const avgNewPrice = Math.round(priceSnapshot.reduce((s, p) => s + p.newPrice, 0) / priceSnapshot.length);
-                await db.collection("price_change_logs").add({
+                await writePriceChangeLogChunks({
                     companyId: jobCompanyId || null,
                     jobId,
                     building: building || "unknown",
@@ -5033,7 +6211,6 @@ async function processPriceJob(jobId) {
                     dateTo,
                     totalDays: sortedDateKeys.length,
                     dates: mergedDates,
-                    priceSnapshot,
                     oldPrice: avgOldPrice,
                     newPrice: avgNewPrice,
                     success: finalStatus === "completed",
@@ -5043,7 +6220,7 @@ async function processPriceJob(jobId) {
                     origin: "queue_worker",
                     timestamp: admin.firestore.FieldValue.serverTimestamp(),
                     details: results.map(r => ({ room: roomIdToName[String(r.roomId)] || String(r.roomId), success: r.success, error: r.error || null }))
-                });
+                }, priceSnapshot);
             }
         } catch (logErr) {
             console.error(`[PriceJob ${jobId}] 로그 저장 실패:`, logErr.message);
@@ -5086,7 +6263,9 @@ async function processPriceJob(jobId) {
 exports.scheduledPriceJobWorker = onSchedule({
     schedule: "every 1 minutes",
     timeoutSeconds: 540,
-    memory: "512MiB"
+    memory: "16GiB",
+    cpu: 4,
+    maxInstances: 1
 }, async () => {
     try {
         // 15분 이상 processing 상태인 stuck job 복구 (crash-safe)
@@ -5143,7 +6322,7 @@ exports.scheduledPriceJobWorker = onSchedule({
 });
 
 // job 상태 확인 endpoint (프론트 polling용)
-exports.getPriceJobStatus = onRequest({ cors: true }, async (req, res) => {
+exports.getPriceJobStatus = onRequest({ cors: true, timeoutSeconds: 60, memory: "2GiB", maxInstances: 20 }, async (req, res) => {
     try {
         const { jobId, companyId } = req.body;
         if (!jobId || !companyId) {
@@ -5206,7 +6385,7 @@ exports.scheduledPriceJobCleanup = onSchedule({
 // ==========================================
 // 최소 숙박일수 설정: Beds24 API V2
 // ==========================================
-exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, res) => {
+exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300, memory: "1GiB", cpu: 1, minInstances: 1, maxInstances: 4 }, async (req, res) => {
     try {
         const { companyId, building, roomName, roomNames: inputRoomNames, dateFrom, dateTo, minStayValue, dates, cells } = req.body;
         if (!companyId) return res.status(400).json({ success: false, error: "Missing companyId" });
@@ -5283,8 +6462,11 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, 
                 const activeRoomIds = [];
                 for (const info of roomInfos) {
                     const rid = String(info.roomId);
-                    const m = parseInt(roomCacheByRoomId[rid]?.dates?.[dateKey]?.m, 10);
-                    if (Number.isFinite(m) && m >= 1 && m < INACTIVE_MS_THRESHOLD) activeRoomIds.push(rid);
+                    // 날짜 데이터 자체가 없으면 판단 불가 → 비활성. 데이터는 있고 m만 비어 있으면 Beds24 기준 1박이다.
+                    const dateEntry = roomCacheByRoomId[rid]?.dates?.[dateKey];
+                    if (!dateEntry) continue;
+                    const m = parseInt(normalizeBeds24MinStay(dateEntry.m), 10);
+                    if (m >= 1 && m < INACTIVE_MS_THRESHOLD) activeRoomIds.push(rid);
                 }
                 if (activeRoomIds.length === 0) return null;
                 if (building === "가부키초" && rn === "803호" && activeRoomIds.includes("648398")) {
@@ -5334,75 +6516,48 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, 
             });
         }
 
-        // ★ 배치 POST: 1-step(minStay≠1)과 2-step(minStay=1)을 분리하여 일괄 전송
+        // 실제 Beds24 전송은 processPriceJob이 담당한다.
         const allTargetRoomIds = [];
         for (const [roomId, group] of Object.entries(groupByRoomId)) {
             group.calendar = consolidateCalendarRanges(group.calendar);
             allTargetRoomIds.push(roomId);
         }
-        const oneStepRoomIds = allTargetRoomIds;
-        const twoStepRoomIds = [];
+        const minStayRoomUpdates = Object.entries(groupByRoomId).map(([roomId, group]) => ({
+            roomId: String(roomId),
+            roomName: getRoomNameByRoomId(roomId),
+            dates: group.datesToUpdate,
+            calendarUpdates: group.calendar
+        }));
 
-        // 배치 응답에서 개별 roomId 에러 감지
-        const checkBatchResponse = (apiResp, roomIdList) => {
-            const itemResults = [];
-            const respItems = Array.isArray(apiResp.data) ? apiResp.data
-                : (Array.isArray(apiResp.data?.data) ? apiResp.data.data : null);
-            if (respItems && respItems.length === roomIdList.length) {
-                for (let ri = 0; ri < roomIdList.length; ri++) {
-                    const item = respItems[ri];
-                    const hasErrors = item?.errors && item.errors.length > 0;
-                    const ok = item?.success !== false && !hasErrors;
-                    itemResults.push({ roomId: roomIdList[ri], success: ok, error: ok ? null : (item?.errors?.map(e => e.message).join("; ") || "item-level failure") });
-                }
-            } else {
-                roomIdList.forEach(rid => itemResults.push({ roomId: rid, success: true, error: null }));
-            }
-            return itemResults;
-        };
-
-        const results = [];
-        if (allTargetRoomIds.length > 0) {
-            const payload = allTargetRoomIds.map(rid => ({
-                roomId: parseInt(rid),
-                calendar: groupByRoomId[rid].calendar
-            }));
-            console.log(`[setMinStay] 1-step 배치 POST: ${oneStepRoomIds.length}개 roomId`);
-            const resp = await beds24PostV2WithGuard("/inventory/rooms/calendar", payload);
-            results.push(...checkBatchResponse(resp, allTargetRoomIds));
-        }
-
-            console.log(`[setMinStay] 2-step 1단계(중간값 3): ${twoStepRoomIds.length}개 roomId`);
-            console.log(`[setMinStay] 2-step 2단계(목표값 1): ${twoStepRoomIds.length}개 roomId`);
-
-        const failedRoomIdSet = new Set(results.filter(r => !r.success).map(r => r.roomId));
-        if (failedRoomIdSet.size > 0) {
-            console.warn(`[setMinStay] ${failedRoomIdSet.size}개 roomId 개별 실패: ${[...failedRoomIdSet].join(", ")}`);
-        }
-
-        // 캐시 패치 (병렬, 성공한 roomId만)
-        const cachePatchPromises = Object.entries(groupByRoomId).filter(([roomId]) => !failedRoomIdSet.has(roomId)).map(async ([roomId, group]) => {
-            try {
-                const sRid = String(roomId);
-                const roomDocRef = buildingRef.collection("rooms").doc(sRid);
-                const roomSnap = await roomDocRef.get();
-                let roomData = roomSnap.exists ? roomSnap.data() : { roomId: sRid, dates: {} };
-                if (!roomData.dates) roomData.dates = {};
-                roomData.lastManualUpdate = admin.firestore.FieldValue.serverTimestamp();
-                Object.entries(group.datesToUpdate).forEach(([dKey, values]) => {
-                    if (!roomData.dates[dKey]) roomData.dates[dKey] = {};
-                    roomData.dates[dKey].m = String(values.m);
-                });
-                await roomDocRef.set(roomData, { merge: true });
-                await mergePriceSyncMonthCache(building, sRid, roomData.roomName || getRoomNameByRoomId(sRid), group.datesToUpdate);
-            } catch (err) {
-                console.error(`[setMinStay] 캐시 패치 실패 roomId=${roomId}:`, err.message);
-            }
+        const jobRef = await db.collection("beds24_price_jobs").add({
+            companyId,
+            building,
+            roomIds: allTargetRoomIds.map(String),
+            dates: null,
+            calendarUpdates: null,
+            roomUpdates: minStayRoomUpdates,
+            worker: "Min Stay Queue",
+            workerEmail: null,
+            status: "queued",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            startedAt: null,
+            completedAt: null,
+            progress: { processed: 0, total: allTargetRoomIds.length, results: [] },
+            failedRoomIds: [],
+            retryCount: 0,
+            error: null,
+            jobType: "min_stay"
         });
-        await Promise.all(cachePatchPromises);
-        console.log(`[setMinStay] 완료: ${results.length}개 roomId, API calls=${oneStepRoomIds.length > 0 ? 1 : 0}+${twoStepRoomIds.length > 0 ? 2 : 0}`);
 
-        res.json({ success: true, message: `MinStay 업데이트 완료`, results });
+        console.log(`[setMinStay] Job created: ${jobRef.id} (${allTargetRoomIds.length} roomId)`);
+        return res.json({
+            success: true,
+            queued: true,
+            jobId: jobRef.id,
+            message: "MinStay update queued",
+            roomIds: allTargetRoomIds.map(String),
+            results: allTargetRoomIds.map((rid) => ({ roomId: String(rid), success: true, queued: true }))
+        });
 
     } catch (e) {
         console.error("setMinStay Error:", e.response?.data || e.message);
@@ -5446,7 +6601,7 @@ async function fetchSingleRoomPriceCacheSnapshot(roomId) {
     const fromDate = tokyoNow.format("YYYY-MM-DD");
     const toDate = tokyoNow.add(12, "month").format("YYYY-MM-DD");
 
-    const response = await beds24GetV2WithGuard("/inventory/rooms/calendar", {
+    const pageResult = await beds24GetRoomCalendarAllPages({
         roomId: parseInt(roomId),
         startDate: fromDate,
         endDate: toDate,
@@ -5456,9 +6611,15 @@ async function fetchSingleRoomPriceCacheSnapshot(roomId) {
         includeMaxStay: true,
         includeNumAvail: true,
         includeOverride: true
-    });
+    }, { label: `room ${roomId}` });
 
-    const roomData = response.data?.data?.[0];
+    // 잘린 응답으로 캐시를 덮어쓰면 Beds24에 있는 날짜가 "없는 날짜"로 굳는다.
+    if (pageResult.truncated) {
+        console.error(`[fetchSingleRoomPriceCacheSnapshot] roomId=${roomId} 응답 잘림 — 캐시 갱신 skip`);
+        return { success: false, skipped: true, reason: "response_truncated" };
+    }
+
+    const roomData = pageResult.roomsById.get(String(roomId));
     if (!roomData || !Array.isArray(roomData.calendar)) {
         return { success: false, skipped: true };
     }
@@ -5473,7 +6634,7 @@ async function fetchSingleRoomPriceCacheSnapshot(roomId) {
                 p1: String(entry.price1 || ""),
                 p2: String(entry.price2 || ""),
                 p3: String(entry.price3 || ""),
-                m: String(entry.minStay || ""),
+                m: normalizeBeds24MinStay(entry.minStay),
                 mx: String(entry.maxStay || ""),
                 na: entry.numAvail !== undefined && entry.numAvail !== null ? String(entry.numAvail) : "",
                 ov: entry.override ? String(entry.override) : ""
@@ -5624,7 +6785,7 @@ async function syncSingleRoomPriceCache(building, roomId, roomName, { reason = "
 // ==========================================
 // 가격/재고 변경 웹훅: Beds24에서 발생한 변경 사항 감지
 // ==========================================
-exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
+exports.priceWebhook = onRequest({ cors: true, timeoutSeconds: 300, memory: "16GiB", cpu: 4, maxInstances: 4 }, async (req, res) => {
     try {
         // ★ Webhook 버전 감지 로직 추가
         const method = req.method;
@@ -5674,7 +6835,21 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
                 }
             }
 
-            const companyId = (PROPERTIES.find((prop) => prop.name === building)?.companyId) || DEFAULT_COMPANY_ID;
+            if (building === "Unknown") {
+                console.warn(`[priceWebhook] Unknown roomId=${roomId}; ignored without Beds24 API call`);
+                return res.status(200).send("OK");
+            }
+
+            const mappedProperty = PROPERTIES.find((prop) => prop.name === building && !prop.disabled);
+            const payloadPropertyId = data.propId || data.propertyId || data.propid;
+            if (!mappedProperty || (payloadPropertyId && String(mappedProperty.v2Id) !== String(payloadPropertyId))) {
+                console.warn(`[priceWebhook] Property mismatch for roomId=${roomId}; ignored without Beds24 API call`);
+                return res.status(200).send("OK");
+            }
+
+            const companyId = mappedProperty.companyId || DEFAULT_COMPANY_ID;
+            const roomIdStr = String(roomId);
+            const relatedRoomIds = getRelatedBeds24RoomIds(building, roomName, roomIdStr);
 
             // Read old cached prices before sync to detect price diffs
             let oldDates = null;
@@ -5686,13 +6861,12 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
             } catch (_) { /* cache miss is fine */ }
 
             // price_sync 캐시 무효화 (기본 — 즉시 sync 성공 시 제거됨)
-            const roomIdStr = String(roomId);
             const priceSyncDoc = db.collection("price_sync").doc(building);
             const snap = await priceSyncDoc.get();
             const priceSyncState = snap.data() || {};
             const existingIds = new Set((priceSyncState.invalidatedRoomIds || []).map(String));
             const invalidatedAt = priceSyncState.invalidatedAt?.toDate?.() || null;
-            const recentlyDuplicatedWhileInvalidated = existingIds.has(roomIdStr) &&
+            const recentlyDuplicatedWhileInvalidated = relatedRoomIds.every((id) => existingIds.has(id)) &&
                 invalidatedAt &&
                 (Date.now() - invalidatedAt.getTime()) < PRICE_WEBHOOK_INVALIDATION_DEBOUNCE_MS;
 
@@ -5717,7 +6891,7 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
                 return res.status(200).send("OK");
             }
 
-            existingIds.add(roomIdStr);
+            relatedRoomIds.forEach((id) => existingIds.add(id));
             await priceSyncDoc.set({
                 invalidatedRoomIds: Array.from(existingIds),
                 invalidatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -5742,7 +6916,32 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
                 console.log(`[priceWebhook] immediate sync skipped (${skipReason}) -> invalidation fallback`);
             } else if (lockState.acquired) {
                 try {
-                    syncResult = await syncSingleRoomPriceCache(building, roomIdStr, roomName, { reason: "webhook", companyId });
+                    const groupSyncResults = await Promise.allSettled(relatedRoomIds.map((relatedRoomId) =>
+                        syncSingleRoomPriceCache(
+                            building,
+                            relatedRoomId,
+                            getRoomNameByRoomId(relatedRoomId),
+                            { reason: "webhook_room_group", companyId }
+                        )
+                    ));
+                    const failedGroupSync = groupSyncResults.find((result) =>
+                        result.status === "rejected" || !result.value?.success
+                    );
+                    if (failedGroupSync) {
+                        const failureMessage = failedGroupSync.status === "rejected"
+                            ? failedGroupSync.reason?.message
+                            : failedGroupSync.value?.reason || "room group sync skipped";
+                        throw new Error(failureMessage || "room group sync failed");
+                    }
+                    const triggerRoomIndex = relatedRoomIds.indexOf(roomIdStr);
+                    const triggerRoomResult = triggerRoomIndex >= 0
+                        ? groupSyncResults[triggerRoomIndex]?.value
+                        : groupSyncResults[0]?.value;
+                    syncResult = {
+                        ...(triggerRoomResult || {}),
+                        success: true,
+                        syncedRoomIds: relatedRoomIds
+                    };
                 } catch (syncErr) {
                     syncError = syncErr;
                     console.error(`[priceWebhook] 즉시 동기화 실패, invalidation fallback: ${syncErr.message}`);
@@ -5804,7 +7003,7 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
                         const snap = await tx.get(priceSyncDoc);
                         const data = snap.data() || {};
                         const currentIds = new Set((data.invalidatedRoomIds || []).map(String));
-                        currentIds.delete(roomIdStr);
+                        relatedRoomIds.forEach((id) => currentIds.delete(id));
                         const remaining = [...currentIds];
                         const updates = {
                             invalidatedRoomIds: remaining,
@@ -5823,13 +7022,14 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
                         syncVariant: "immediate",
                         syncSource: "beds24_price_webhook",
                         companyId,
-                        fetchedCount: 1,
-                        upsertedCount: 1,
-                        note: `immediate sync: ${building} ${roomName} (${roomId}), priceDiffs=${priceDiffs.length}`,
+                        fetchedCount: relatedRoomIds.length,
+                        upsertedCount: relatedRoomIds.length,
+                        note: `immediate room-group sync: ${building} ${roomName} (${relatedRoomIds.join(",")}), priceDiffs=${priceDiffs.length}`,
                         metadata: {
                             building,
                             roomName,
                             roomId: roomIdStr,
+                            relatedRoomIds,
                             action: action || "UNKNOWN",
                             priceDiffCount: priceDiffs.length
                         }
@@ -5837,7 +7037,7 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
                 } else {
                     const fallbackVariant = skipReason ? "skipped" : (syncResult?.skipped ? "skipped" : (syncError ? "failed" : "queued"));
                     await db.collection("price_sync").doc(building).update({
-                        invalidatedRoomIds: admin.firestore.FieldValue.arrayUnion(roomIdStr),
+                        invalidatedRoomIds: admin.firestore.FieldValue.arrayUnion(...relatedRoomIds),
                         lastWebhookAt: admin.firestore.FieldValue.serverTimestamp()
                     });
                     await recordPriceSyncAudit({
@@ -5879,7 +7079,7 @@ exports.priceWebhook = onRequest({ cors: true }, async (req, res) => {
 // ==========================================
 // 설정: Beds24 > SETTINGS > PROPERTIES > ACCESS > Booking Webhook URL 에 이 함수 URL 입력
 // 동작: 변경된 예약만 수신 → Firestore 1건 upsert. 15분 풀 동기화보다 API 호출·처리 비용 대폭 절감
-exports.beds24BookingWebhook = onRequest({ cors: true, timeoutSeconds: 60 }, async (req, res) => {
+exports.beds24BookingWebhook = onRequest({ cors: true, timeoutSeconds: 120, memory: "16GiB", cpu: 4, maxInstances: 4 }, async (req, res) => {
     try {
         if (req.method !== "POST" || !req.body || typeof req.body !== "object") {
             res.status(400).send("POST JSON required");
@@ -5915,6 +7115,20 @@ exports.beds24BookingWebhook = onRequest({ cors: true, timeoutSeconds: 60 }, asy
             lastChangeSummary: mutationSummary.changes.slice(0, 20),
             lastEventAt: eventAt || new Date().toISOString()
         }, existingData, mutationSummary.eventType);
+        try {
+            await invalidatePriceCacheForReservationMutations(
+                [{ beforeData: existingData, afterData: normalized, mutationSummary }],
+                companyId,
+                "beds24_booking_webhook"
+            );
+        } catch (error) {
+            console.warn("[Booking Webhook] price cache invalidation failed:", error.message);
+            await sendSyncAlert("beds24BookingWebhook price cache invalidation failed", [
+                `companyId=${companyId}`,
+                `bookingId=${booking.id}`,
+                String(error.message || error)
+            ]);
+        }
         const upsertResult = await upsertReservations([normalized], {
             companyId,
             syncSource: "beds24_booking_webhook",
@@ -5954,6 +7168,28 @@ exports.beds24BookingWebhook = onRequest({ cors: true, timeoutSeconds: 60 }, asy
 
         // 당일 예약 알람: 오늘 예약 + 오늘 체크인(당일예약). 신규 확정, 금액>0, 다이쿄초 제외, 플랫폼 무관
         const todayKst = dayjs().tz("Asia/Tokyo").format("YYYY-MM-DD");
+        if (
+            normalized.building !== "다이쿄초" &&
+            shouldQueueSlackCleaningCorrection(existingData, normalized, mutationSummary.changedFields, todayKst)
+        ) {
+            try {
+                await queueSlackCleaningCorrection({
+                    companyId,
+                    bookingId: booking.id,
+                    targetDate: todayKst,
+                    changedFields: mutationSummary.changedFields.filter((field) => SLACK_CLEANING_CORRECTION_FIELDS.has(field))
+                });
+                console.log(`[Booking Webhook] 청소/셋팅 정정 작업 등록: ${booking.id} (${mutationSummary.changedFields.join(",")})`);
+            } catch (e) {
+                console.warn("[Booking Webhook] 청소/셋팅 정정 작업 등록 실패:", e.message);
+                await sendSyncAlert("Slack cleaning correction queue failed", [
+                    `bookingId=${booking.id}`,
+                    `targetDate=${todayKst}`,
+                    String(e.message || e)
+                ]);
+            }
+        }
+
         const amount = getBookingAmount(normalized);
         const isCreated = mutationSummary.eventType === "created";
         const isConfirmed = normalized.status === "confirmed";
@@ -5994,7 +7230,7 @@ exports.beds24BookingWebhook = onRequest({ cors: true, timeoutSeconds: 60 }, asy
             }
         }
 
-        // 당일 취소 알람: 취소 건 중 입실일이 오늘 기준 앞뒤 6개월 이내인 경우 당일취소알람 채널로 전송
+        // 당일 취소 알림: 취소 건은 기간/채널 제한 없이 당일취소알람 채널로 전송
         if (mutationSummary.eventType === "cancelled") {
             try {
                 await sendCancelAlert(normalized);
@@ -6016,6 +7252,68 @@ exports.beds24BookingWebhook = onRequest({ cors: true, timeoutSeconds: 60 }, asy
         });
         await sendSyncAlert("beds24BookingWebhook failed", [e.message]);
         res.status(500).send(e.message);
+    }
+});
+
+// ==========================================
+// 청소/셋팅 명단 정정 작업 처리
+// ==========================================
+exports.processSlackCleaningCorrectionJob = onDocumentWritten({
+    document: "slack_cleaning_correction_jobs/{jobId}",
+    timeoutSeconds: 540,
+    memory: "16GiB",
+    cpu: 4,
+    concurrency: 1,
+    maxInstances: 1,
+    secrets: HOTELSMART_SECRETS
+}, async (event) => {
+    const jobSnapshot = event.data?.after;
+    if (!jobSnapshot?.exists || jobSnapshot.data()?.status !== "queued") return;
+
+    const jobRef = jobSnapshot.ref;
+    let jobData = null;
+    const claimed = await db.runTransaction(async (transaction) => {
+        const freshSnapshot = await transaction.get(jobRef);
+        if (!freshSnapshot.exists || freshSnapshot.data()?.status !== "queued") return false;
+
+        jobData = freshSnapshot.data();
+        transaction.update(jobRef, {
+            status: "processing",
+            startedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        return true;
+    });
+
+    if (!claimed || !jobData) return;
+
+    try {
+        if (jobData.companyId !== DEFAULT_COMPANY_ID || !jobData.targetDate) {
+            await jobRef.update({
+                status: "skipped",
+                resultReason: "invalid_job_scope",
+                completedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            return;
+        }
+
+        const result = await sendSlackCleaningReportCorrectionIfSent(jobData.targetDate);
+        await jobRef.update({
+            status: result.sent ? "completed" : "skipped",
+            resultReason: result.reason || "unknown",
+            completedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+    } catch (e) {
+        await jobRef.update({
+            status: "failed",
+            error: String(e.message || e).slice(0, 1000),
+            completedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        await sendSyncAlert("Slack cleaning correction failed", [
+            `jobId=${event.params?.jobId || "-"}`,
+            `targetDate=${jobData.targetDate || "-"}`,
+            String(e.message || e)
+        ]);
+        throw e;
     }
 });
 
@@ -6092,8 +7390,12 @@ async function patchPriceSyncForBlackoutClear(building, roomId, arrival, departu
         const dateKey = d.format("YYYYMMDD");
         const dayKey = d.format("YYYY-MM-DD");
         if (currentDates[dateKey] !== undefined) {
-            updates[`dates.${dateKey}.ov`] = admin.firestore.FieldValue.delete();
-            datesPatch[dateKey] = { ov: admin.firestore.FieldValue.delete() };
+            // 키를 지우지 않고 ""로 덮어쓴다.
+            // 전체 동기화가 override 없는 날짜에 쓰는 값과 동일한 형태이며,
+            // 프론트 hasVisiblePriceCoverage는 na/ov 키의 "존재"로 캐시 완전성을 판단하므로
+            // 키를 지우면 그 날짜가 포함된 화면은 세션 캐시를 못 쓰고 매번 재조회하게 된다.
+            updates[`dates.${dateKey}.ov`] = "";
+            datesPatch[dateKey] = { ov: "" };
             const restoredNumAvail = parseInt(restoreNumAvailByDate?.[dayKey], 10);
             if (Number.isFinite(restoredNumAvail)) {
                 updates[`dates.${dateKey}.na`] = String(restoredNumAvail);
@@ -6904,8 +8206,13 @@ async function createDailySalesLog(targetDateStr, { overwrite = false } = {}) {
     // 총 객실 수 (사노시, 오쿠보A동 제외)
     // - 2026-01-25까지: 46실 (Araki A(11) + Araki B(8) + Daikyo(7) + Kabuki(10) + Takadano(8) + Okubo B/C(2))
     // - 2026-01-26부터: 39실 (다이쿄초 7실 제외)
-    const ROOM_COUNT_WITH_DAIKYO = 46;
-    const ROOM_COUNT_WITHOUT_DAIKYO = 39;
+    const salesLogExcludedBuildings = new Set(["사노시", "오쿠보A동"]);
+    const countSalesLogRooms = ({ includeDaikyo }) => Object.entries(BUILDING_ROOMS)
+        .filter(([building]) => !salesLogExcludedBuildings.has(building))
+        .filter(([building]) => includeDaikyo || building !== "다이쿄초")
+        .reduce((total, [, rooms]) => total + rooms.length, 0);
+    const ROOM_COUNT_WITH_DAIKYO = countSalesLogRooms({ includeDaikyo: true });
+    const ROOM_COUNT_WITHOUT_DAIKYO = countSalesLogRooms({ includeDaikyo: false });
     const DAIKYO_SOLD_DATE = "2026-01-26";
 
     Object.keys(stats).forEach(key => {
@@ -6977,7 +8284,7 @@ async function createDailySalesLog(targetDateStr, { overwrite = false } = {}) {
 
 // 스케줄러: 매일 자정 (일본 시간)
 exports.dailySalesSnapshot = onSchedule({
-    schedule: "0 0 * * *", // 매일 00:00
+    schedule: "30 0 * * *", // 예약 보정(00:05) 완료 후 스냅샷 생성
     timeZone: "Asia/Tokyo",
     timeoutSeconds: 540,
     memory: "1GiB"
@@ -7083,7 +8390,8 @@ exports.scheduledDailyReport = onSchedule({
     schedule: "45 8 * * *", // 매일 08:45 JST (9시 출근 전 안정 반영)
     timeZone: "Asia/Tokyo",
     timeoutSeconds: 540,
-    memory: "512MiB"
+    memory: "16GiB",
+    cpu: 4
 }, async () => {
     await runScheduledDailyReport();
 });
@@ -7215,6 +8523,7 @@ exports.scheduledNotionDashboardSync = onSchedule({
     memory: "1GiB"
 }, async () => {
     try {
+        await assertReservationDataReady("scheduledNotionDashboardSync");
         await runNotionDashboardSync();
         console.log("✅ [Notion] 매출·가동률 대시보드 동기화 완료");
     } catch (e) {
@@ -7225,8 +8534,11 @@ exports.scheduledNotionDashboardSync = onSchedule({
 exports.scheduledSlackDailyReport = scheduledSlackDailyReport;
 exports.scheduledSlackDailyReportRetry = scheduledSlackDailyReportRetry;
 exports.sendSlackDailyReportManual = sendSlackDailyReportManual;
+exports.scheduledHotelsmartCleaningPrefetch = scheduledHotelsmartCleaningPrefetch;
 exports.scheduledSlackCleaningReport = scheduledSlackCleaningReport;
+exports.scheduledSlackCleaningReportRetry = scheduledSlackCleaningReportRetry;
 exports.sendSlackCleaningReportManual = sendSlackCleaningReportManual;
+exports.collectHotelsmartCleaningAssignmentsManual = collectHotelsmartCleaningAssignmentsManual;
 
 exports.scheduledMonthlyNotionReport = scheduledMonthlyNotionReport;
 exports.sendNotionReport = sendNotionReport;

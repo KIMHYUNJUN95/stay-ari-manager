@@ -133,6 +133,13 @@ const getReplyText = (reply) => {
   return String(reply);
 };
 
+const hasReviewReply = (review) => Boolean(review?.hasReply || getReplyText(review?.reply));
+
+const getReplyDate = (review) => {
+  const value = review?.replyAt || review?.reply?.last_change_timestamp || review?.reply?.respondedAt;
+  return value ? formatDate(value) : null;
+};
+
 // encoding-fixed comment
 
 function computeBuildingStats(reviews) {
@@ -144,13 +151,13 @@ function computeBuildingStats(reviews) {
         building: r.building,
         buildingEn: getBuildingEn(r.building),
         booking: { scores: [], categories: {}, unanswered: 0 },
-        airbnb: { scores: [], categories: {} }
+        airbnb: { scores: [], categories: {}, unanswered: 0 }
       };
     }
     const s = stats[r.building];
     if (r.channel === "booking") {
       if (r.score > 0) s.booking.scores.push(r.score);
-      if (!r.hasReply) s.booking.unanswered++;
+      if (!hasReviewReply(r)) s.booking.unanswered++;
       if (r.categories) {
         for (const [k, v] of Object.entries(r.categories)) {
           if (v !== null && v !== undefined) {
@@ -160,6 +167,7 @@ function computeBuildingStats(reviews) {
         }
       }
     } else if (r.channel === "airbnb") {
+      if (!hasReviewReply(r)) s.airbnb.unanswered++;
       const airbnbScore = r.rawScore || (r.score > 0 ? r.score / 2 : 0);
       if (airbnbScore > 0) s.airbnb.scores.push(airbnbScore);
       if (r.categories) {
@@ -196,6 +204,7 @@ function computeBuildingStats(reviews) {
       airbnbCount: s.airbnb.scores.length,
       airbnbAvg, // 0-5 scale
       airbnbCatAvg, // 0-5 scale
+      airbnbUnanswered: s.airbnb.unanswered,
       totalCount,
       unanswered: s.booking.unanswered
     };
@@ -623,18 +632,13 @@ function OverviewTab({ buildingStats, reviews, channel }) {
   const overallAvg = isBooking
     ? avg(reviews.filter(r => r.score > 0).map(r => r.score))
     : avg(reviews.filter(r => r.rawScore > 0 || r.score > 0).map(r => r.rawScore || r.score / 2));
-  const unansweredTotal = isBooking ? reviews.filter(r => !r.hasReply).length : 0;
+  const unansweredTotal = reviews.filter(r => !hasReviewReply(r)).length;
 
   // encoding-fixed comment
   const highCount = reviews.filter(r => {
     const s = isBooking ? r.score : (r.rawScore || r.score / 2);
     return s >= (isBooking ? 9 : 4.5);
   }).length;
-  const lowCount = reviews.filter(r => {
-    const s = isBooking ? r.score : (r.rawScore || r.score / 2);
-    return s > 0 && s < (isBooking ? 7 : 3.5);
-  }).length;
-
   const summaryCards = isBooking ? [
     { label: "Total Reviews", value: totalReviews, icon: "📊", color: "#003580", bg: "rgba(0,53,128,0.08)" },
     { label: "Average Score", value: overallAvg > 0 ? overallAvg.toFixed(1) : "--", suffix: "/ 10", icon: "⭐", color: "#003580", bg: "rgba(0,53,128,0.08)" },
@@ -644,7 +648,7 @@ function OverviewTab({ buildingStats, reviews, channel }) {
     { label: "Total Reviews", value: totalReviews, icon: "📊", color: "#FF385C", bg: "rgba(255,56,92,0.08)" },
     { label: "Average Score", value: overallAvg > 0 ? overallAvg.toFixed(2) : "--", suffix: "/ 5", icon: "⭐", color: "#FF385C", bg: "rgba(255,56,92,0.08)" },
     { label: "5-Star Reviews", value: highCount, icon: "🏆", color: "#10B981", bg: "rgba(16,185,129,0.08)" },
-    { label: "Below 3.5", value: lowCount, icon: "⚠️", color: lowCount > 0 ? "#EF4444" : "#10B981", bg: lowCount > 0 ? "rgba(239,68,68,0.08)" : "rgba(16,185,129,0.08)" }
+    { label: "Unanswered", value: unansweredTotal, icon: "💬", color: unansweredTotal > 0 ? "#EF4444" : "#10B981", bg: unansweredTotal > 0 ? "rgba(239,68,68,0.08)" : "rgba(16,185,129,0.08)" }
   ];
 
   const sortedBuildings = BUILDING_ORDER;
@@ -687,13 +691,14 @@ function OverviewTab({ buildingStats, reviews, channel }) {
             color: getBuildingColor(building),
             bookingCount: 0, bookingAvg: 0, bookingCatAvg: {},
             airbnbCount: 0, airbnbAvg: 0, airbnbCatAvg: {},
-            unanswered: 0
+            unanswered: 0, airbnbUnanswered: 0
           };
           const count = isBooking ? s.bookingCount : s.airbnbCount;
           const scoreAvg = isBooking ? s.bookingAvg : s.airbnbAvg;
           const catAvg = isBooking ? s.bookingCatAvg : s.airbnbCatAvg;
           const categories = isBooking ? BOOKING_CATEGORIES : AIRBNB_CATEGORIES;
           const isEmpty = count === 0;
+          const propertyUnanswered = isBooking ? s.unanswered : s.airbnbUnanswered;
 
           return (
             <motion.div key={building}
@@ -725,7 +730,7 @@ function OverviewTab({ buildingStats, reviews, channel }) {
 
               {/* Category bars - hidden when no reviews */}
               {!isEmpty && (
-                <div style={{ marginBottom: isBooking && s.unanswered > 0 ? 12 : 0 }}>
+                <div style={{ marginBottom: propertyUnanswered > 0 ? 12 : 0 }}>
                   {categories.map(({ key, label }) => {
                     const val = catAvg[key];
                     if (val === undefined || val === null) return null;
@@ -734,14 +739,14 @@ function OverviewTab({ buildingStats, reviews, channel }) {
                 </div>
               )}
 
-              {/* Unanswered badge (Booking only, reviews > 0) */}
-              {!isEmpty && isBooking && s.unanswered > 0 && (
+              {/* Unanswered badge */}
+              {!isEmpty && propertyUnanswered > 0 && (
                 <div style={{
                   display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 10px",
                   background: "rgba(239,68,68,0.08)", borderRadius: 8, border: "1px solid rgba(239,68,68,0.2)"
                 }}>
                   <span style={{ fontSize: 11, color: "#EF4444", fontWeight: 600 }}>
-                    {s.unanswered} unanswered review{s.unanswered > 1 ? "s" : ""}
+                    {propertyUnanswered} unanswered review{propertyUnanswered > 1 ? "s" : ""}
                   </span>
                 </div>
               )}
@@ -1014,6 +1019,9 @@ function ReviewReservationModal({ isOpen, onClose, review, reservation, loading 
   const displayDeparture = reservation?.departure || review.linkedDeparture || "-";
   const displayPlatform = reservation?.platform || (review.channel === "booking" ? "Booking.com" : "Airbnb");
   const displayReference = reservation?.apiReference || review.reservationId || "-";
+  const replyText = getReplyText(review.reply);
+  const replyDate = getReplyDate(review);
+  const answered = hasReviewReply(review);
   const categoryDefs = review.channel === "booking" ? BOOKING_CATEGORIES : AIRBNB_CATEGORIES;
   const categoryMax = review.channel === "booking" ? 10 : 5;
   const categoryRows = categoryDefs
@@ -1086,6 +1094,17 @@ function ReviewReservationModal({ isOpen, onClose, review, reservation, loading 
                 <div style={{ fontSize: 12, color: "#334155", lineHeight: 1.5 }}>{review.content.text}</div>
               </div>
             )}
+
+            <div style={{ marginTop: 12, background: answered ? "#F0FDF4" : "#FFF7ED", border: `1px solid ${answered ? "#BBF7D0" : "#FED7AA"}`, borderRadius: 10, padding: "10px 12px" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: replyText ? 6 : 0 }}>
+                <div style={{ fontSize: 11, color: answered ? "#15803D" : "#C2410C", fontWeight: 800 }}>
+                  {answered ? "Answered" : "Unanswered"}
+                </div>
+                {replyDate && <div style={{ fontSize: 10, color: "#64748B" }}>Replied {replyDate}</div>}
+              </div>
+              {replyText && <div style={{ fontSize: 12, color: "#334155", lineHeight: 1.55 }}>{replyText}</div>}
+              {answered && !replyText && <div style={{ fontSize: 11, color: "#64748B" }}>Reply status received; reply text was not provided by the channel.</div>}
+            </div>
           </div>
         </motion.div>
       </motion.div>
@@ -1181,11 +1200,11 @@ function ReviewsTab({ reviews, channel: parentChannel, dateSearchReversed, hasDa
     let list = reviews.filter(r => {
       if (channel !== "all" && r.channel !== channel) return false;
       if (building !== "all" && r.building !== building) return false;
-      if (replyFilter === "unanswered" && r.hasReply) return false;
-      if (replyFilter === "answered" && !r.hasReply) return false;
+      if (replyFilter === "unanswered" && hasReviewReply(r)) return false;
+      if (replyFilter === "answered" && !hasReviewReply(r)) return false;
       if (search) {
         const q = search.toLowerCase();
-        const text = [r.content?.text, r.content?.positive, r.content?.negative, r.reviewerName, getBuildingEn(r.building)].join(" ").toLowerCase();
+        const text = [r.content?.text, r.content?.positive, r.content?.negative, getReplyText(r.reply), r.reviewerName, getBuildingEn(r.building)].join(" ").toLowerCase();
         if (!text.includes(q)) return false;
       }
       return true;
@@ -1215,14 +1234,12 @@ function ReviewsTab({ reviews, channel: parentChannel, dateSearchReversed, hasDa
             {buildings.map(b => <option key={b} value={b}>{b === "all" ? "All Properties" : getBuildingEn(b)}</option>)}
           </select>
 
-          {parentChannel === "booking" && (
-            <select value={replyFilter} onChange={e => { setReplyFilter(e.target.value); setPage(0); }}
-              style={{ padding: "8px 12px", borderRadius: 8, border: "1.5px solid #E2E8F0", fontSize: 13, color: "#1E293B", background: "white", cursor: "pointer" }}>
-              <option value="all">All Replies</option>
-              <option value="unanswered">Unanswered</option>
-              <option value="answered">Answered</option>
-            </select>
-          )}
+          <select value={replyFilter} onChange={e => { setReplyFilter(e.target.value); setPage(0); }}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1.5px solid #E2E8F0", fontSize: 13, color: "#1E293B", background: "white", cursor: "pointer" }}>
+            <option value="all">All Replies</option>
+            <option value="unanswered">Unanswered</option>
+            <option value="answered">Answered</option>
+          </select>
 
           <select value={sortBy} onChange={e => setSortBy(e.target.value)}
             style={{ padding: "8px 12px", borderRadius: 8, border: "1.5px solid #E2E8F0", fontSize: 13, color: "#1E293B", background: "white", cursor: "pointer" }}>
@@ -1279,11 +1296,17 @@ function ReviewsTab({ reviews, channel: parentChannel, dateSearchReversed, hasDa
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
                 <ScoreBadge score={r.channel === "airbnb" ? (r.rawScore || r.score / 2) : r.score} max={r.channel === "airbnb" ? 5 : 10} />
-                {!r.hasReply && r.channel === "booking" && (
-                  <span style={{ fontSize: 10, fontWeight: 600, color: "#EF4444", background: "rgba(239,68,68,0.1)", padding: "2px 7px", borderRadius: 6, border: "1px solid rgba(239,68,68,0.2)" }}>
-                    No reply
-                  </span>
-                )}
+                <span style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  color: hasReviewReply(r) ? "#15803D" : "#EF4444",
+                  background: hasReviewReply(r) ? "rgba(22,163,74,0.1)" : "rgba(239,68,68,0.1)",
+                  padding: "2px 7px",
+                  borderRadius: 6,
+                  border: `1px solid ${hasReviewReply(r) ? "rgba(22,163,74,0.2)" : "rgba(239,68,68,0.2)"}`
+                }}>
+                  {hasReviewReply(r) ? "Answered" : "Unanswered"}
+                </span>
               </div>
             </div>
 
@@ -1317,7 +1340,10 @@ function ReviewsTab({ reviews, channel: parentChannel, dateSearchReversed, hasDa
             {/* Reply */}
             {getReplyText(r.reply) && (
               <div style={{ marginTop: 10, padding: "10px 14px", background: "#F8FAFC", borderRadius: 8, borderLeft: "3px solid #4F46E5" }}>
-                <div style={{ fontSize: 11, color: "#4F46E5", fontWeight: 600, marginBottom: 4 }}>Host Reply</div>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 11, color: "#4F46E5", fontWeight: 600, marginBottom: 4 }}>
+                  <span>Host Reply</span>
+                  {getReplyDate(r) && <span style={{ color: "#94A3B8", fontWeight: 500 }}>{getReplyDate(r)}</span>}
+                </div>
                 <p style={{ fontSize: 12, color: "#374151", lineHeight: 1.5, margin: 0 }}>{getReplyText(r.reply)}</p>
               </div>
             )}
@@ -1481,11 +1507,15 @@ function RoomsTab({ roomStats, buildingStats, roomsLoading, channel }) {
 
 // encoding-fixed comment
 
-function UnansweredTab({ reviews }) {
+function UnansweredTab({ reviews, channel }) {
   const unanswered = useMemo(() =>
-    reviews.filter(r => r.channel === "booking" && !r.hasReply && r.score > 0)
-      .sort((a, b) => a.score - b.score),
-    [reviews]
+    reviews.filter(r => r.channel === channel && !hasReviewReply(r))
+      .sort((a, b) => {
+        const scoreA = a.channel === "airbnb" ? (a.rawScore || a.score / 2) : a.score;
+        const scoreB = b.channel === "airbnb" ? (b.rawScore || b.score / 2) : b.score;
+        return scoreA - scoreB;
+      }),
+    [reviews, channel]
   );
 
   const byBuilding = useMemo(() => {
@@ -1502,7 +1532,7 @@ function UnansweredTab({ reviews }) {
       <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} style={{ textAlign: "center", padding: "80px", color: "#10B981" }}>
         <div style={{ fontSize: 48, marginBottom: 16 }}>✅</div>
         <div style={{ fontSize: 18, fontWeight: 700, color: "#1E293B", marginBottom: 8 }}>All Caught Up!</div>
-        <div style={{ fontSize: 14, color: "#64748B" }}>No unanswered Booking.com reviews found.</div>
+        <div style={{ fontSize: 14, color: "#64748B" }}>No unanswered {channel === "booking" ? "Booking.com" : "Airbnb"} reviews found.</div>
       </motion.div>
     );
   }
@@ -1528,7 +1558,7 @@ function UnansweredTab({ reviews }) {
           <div style={{ width: 44, height: 44, borderRadius: 12, background: "rgba(245,158,11,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>⭐</div>
           <div>
             <div style={{ fontSize: 28, fontWeight: 800, color: "#F59E0B", letterSpacing: "-1px" }}>
-              {unanswered.length ? (unanswered.reduce((s, r) => s + r.score, 0) / unanswered.length).toFixed(1) : "--"}
+              {unanswered.length ? (unanswered.reduce((s, r) => s + (r.channel === "airbnb" ? (r.rawScore || r.score / 2) : r.score), 0) / unanswered.length).toFixed(1) : "--"}
             </div>
             <div style={{ fontSize: 12, color: "#94A3B8" }}>Avg score (unanswered)</div>
           </div>
@@ -1545,11 +1575,12 @@ function UnansweredTab({ reviews }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {buildingReviews.map(r => (
               <div key={r.id || r.reviewId} style={{ display: "flex", gap: 16, padding: "12px 14px", background: "#FFF8F6", borderRadius: 10, border: "1px solid rgba(239,68,68,0.15)", alignItems: "flex-start" }}>
-                <ScoreBadge score={r.score} size="sm" />
+                <ScoreBadge score={r.channel === "airbnb" ? (r.rawScore || r.score / 2) : r.score} max={r.channel === "airbnb" ? 5 : 10} size="sm" />
                 <div style={{ flex: 1 }}>
-                  {r.content?.positive && <p style={{ fontSize: 12, color: "#374151", margin: "0 0 4px" }}>👍 {r.content.positive}</p>}
-                  {r.content?.negative && <p style={{ fontSize: 12, color: "#374151", margin: 0 }}>👎 {r.content.negative}</p>}
-                  {!r.content?.positive && !r.content?.negative && <p style={{ fontSize: 12, color: "#94A3B8", fontStyle: "italic", margin: 0 }}>No written review</p>}
+                  {r.channel === "airbnb" && r.content?.text && <p style={{ fontSize: 12, color: "#374151", margin: 0, lineHeight: 1.5 }}>{r.content.text}</p>}
+                  {r.channel === "booking" && r.content?.positive && <p style={{ fontSize: 12, color: "#374151", margin: "0 0 4px" }}>Positive: {r.content.positive}</p>}
+                  {r.channel === "booking" && r.content?.negative && <p style={{ fontSize: 12, color: "#374151", margin: 0 }}>Negative: {r.content.negative}</p>}
+                  {!r.content?.text && !r.content?.positive && !r.content?.negative && <p style={{ fontSize: 12, color: "#94A3B8", fontStyle: "italic", margin: 0 }}>No written review</p>}
                 </div>
                 <div style={{ textAlign: "right", flexShrink: 0 }}>
                   {(r.channel === "airbnb" ? (r.linkedGuestName || r.reviewerName) : r.reviewerName) && (
@@ -1983,7 +2014,7 @@ export default function ReviewsDashboard() {
     () => activeRoomsByBuilding !== null ? computeRoomStats(dateFilteredReviews, activeRoomsByBuilding, activeChannel) : null,
     [dateFilteredReviews, activeRoomsByBuilding, activeChannel]
   );
-  const unansweredCount = dateFilteredReviews.filter(r => r.channel === "booking" && !r.hasReply).length;
+  const unansweredCount = channelReviews.filter(r => !hasReviewReply(r)).length;
 
   // encoding-fixed comment
   const BOOKING_TABS = [
@@ -2000,6 +2031,7 @@ export default function ReviewsDashboard() {
     { id: "insights", label: "Insights" },
     { id: "reviews", label: "Reviews" },
     { id: "rooms", label: "Room Scores" },
+    { id: "unanswered", label: "Unanswered", badge: unansweredCount },
   ];
 
   const TABS = activeChannel === "booking" ? BOOKING_TABS : AIRBNB_TABS;
@@ -2128,7 +2160,7 @@ export default function ReviewsDashboard() {
                 channel={activeChannel}
               />
             )}
-            {activeTab === "unanswered" && activeChannel === "booking" && <UnansweredTab reviews={reviews} />}
+            {activeTab === "unanswered" && <UnansweredTab reviews={channelReviews} channel={activeChannel} />}
           </motion.div>
         </AnimatePresence>
       )}

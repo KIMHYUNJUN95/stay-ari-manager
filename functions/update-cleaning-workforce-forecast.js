@@ -15,8 +15,7 @@ const { google } = require("googleapis");
 const dayjs = require("dayjs");
 const utc = require("dayjs/plugin/utc");
 const timezone = require("dayjs/plugin/timezone");
-const serviceAccount = require("./serviceAccountKey.json");
-const { createAttendanceAppClient } = require("./modules/attendanceAppClient");
+const { getGoogleServiceAccountCredentials } = require("./modules/googleCredentials");
 const {
     TOKYO_TZ,
     DEFAULT_BUILDING_RULES,
@@ -51,7 +50,6 @@ const DEFAULT_SPREADSHEET_ID = "1A9HyeH6j4TN2c7ITfzI5s1qQgQhyrqW4e-qLCrlafv0";
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID || DEFAULT_SPREADSHEET_ID;
 const SHEET_TITLE = "\uccad\uc18c\uc778\ub825\uc608\uce21";
 const MANUAL_INPUT_LABEL = "\uc6b4\uc601 \uc785\ub825\uac12"; // \uc6b4\uc601 \uc785\ub825\uac12
-const API_INPUT_LABEL = "API \uc785\ub825 \uc608\uc815 \ub370\uc774\ud130";
 const DEFAULT_COMPANY_ID = process.env.COMPANY_ID || "dGxlQyu47LbplLVCVXiV";
 const PRODUCTIVE_HOURS_PER_PERSON = 7;
 const BUFFER_RATE = 0.15;
@@ -62,7 +60,7 @@ const AVG_WORK_DAYS_PER_WEEK = 3;
 const MIN_FIXED_STAFF_FLOOR = 4;
 const FORECAST_PROFILE = String(process.env.FORECAST_PROFILE || "base").toLowerCase();
 
-const BUILDING_ORDER = ["arakichoA", "arakichoB", "kabukicho", "takadanobaba", "okuboA", "okuboB", "okuboC"];
+const BUILDING_ORDER = ["arakichoA", "arakichoB", "kabukicho", "takadanobaba", "okuboA", "okuboB", "okuboC", "stayAriApartmentHotel"];
 const BUILDING_DISPLAY = {
     arakichoA: "\uc544\ub77c\ud0a4\ucd08A",
     arakichoB: "\uc544\ub77c\ud0a4\ucd08B",
@@ -71,6 +69,7 @@ const BUILDING_DISPLAY = {
     okuboA: "\uc624\ucfe0\ubcf4A\ub3d9",
     okuboB: "\uc624\ucfe0\ubcf4B\ub3d9",
     okuboC: "\uc624\ucfe0\ubcf4C\ub3d9",
+    stayAriApartmentHotel: "STAY ARI Apartment Hotel",
 };
 const DEFAULT_INVENTORY_BY_BUILDING = {
     arakichoA: 11,
@@ -80,21 +79,22 @@ const DEFAULT_INVENTORY_BY_BUILDING = {
     okuboA: 1,
     okuboB: 1,
     okuboC: 1,
+    stayAriApartmentHotel: 26,
 };
 const INVENTORY_CONFIG_ENV_KEY = "CLEANING_FORECAST_INVENTORY_JSON";
 const API_OUTPUT_MAX_ROWS = Number(process.env.CLEANING_FORECAST_API_MAX_ROWS || 0); // 0 = unlimited
-const API_CLEAR_WINDOW_ROWS = Number(process.env.CLEANING_FORECAST_API_CLEAR_WINDOW_ROWS || 5000);
 const FORECAST_PROFILES = {
     conservative: { demandMultiplier: 0.85, pickupShift: -0.08 },
     base: { demandMultiplier: 1.0, pickupShift: 0.0 },
     aggressive: { demandMultiplier: 1.15, pickupShift: 0.08 },
 };
 
-// Hourly wages below this threshold are treated as test/invalid values and excluded from cost estimates.
-const MIN_VALID_HOURLY_WAGE = 1000;
-
 /** Upper bound for weekly summary rows (besides sheet layout limit through "건물별 3개월 요약"). */
 const MAX_WEEKLY_SUMMARY_ROWS_HARD_CAP = 52;
+const CALENDAR_DAY_NAMES = ["일", "월", "화", "수", "목", "금", "토"];
+const CALENDAR_KPI_ROW_COUNT = 3;
+const CALENDAR_WEEK_ROW_COUNT = 6;
+const CALENDAR_BLOCK_ROW_COUNT = CALENDAR_KPI_ROW_COUNT + 1 + 1 + CALENDAR_WEEK_ROW_COUNT + 1;
 
 function isExcludedBuilding(name) {
     const normalized = normalizeText(name);
@@ -428,6 +428,250 @@ function findRowByLabel(values, label) {
     return -1;
 }
 
+function findCalendarMonthRows(values = []) {
+    const monthRows = [];
+    for (let i = 0; i < values.length; i += 1) {
+        if (String(values[i]?.[0] || "").startsWith("\uc6d4\uac04 \uce98\ub9b0\ub354 | ")) monthRows.push(i);
+    }
+    return monthRows;
+}
+
+function parseCalendarMonthKey(title = "") {
+    const match = String(title || "").match(/(\d{4})\ub144 (\d{1,2})\uc6d4/);
+    if (!match) return null;
+    return `${match[1]}-${String(Number(match[2])).padStart(2, "0")}`;
+}
+
+function buildCalendarSkeletonMonth(monthKey, todayKey) {
+    const monthStart = dayjs.tz(`${monthKey}-01`, TOKYO_TZ).startOf("month");
+    const gridStart = monthStart.startOf("week");
+    const weeks = [];
+
+    for (let week = 0; week < 6; week += 1) {
+        const row = [];
+        for (let dayIndex = 0; dayIndex < 7; dayIndex += 1) {
+            const date = gridStart.add((week * 7) + dayIndex, "day");
+            const dateKey = date.format("YYYY-MM-DD");
+            const isInMonth = date.isSame(monthStart, "month");
+            if (!isInMonth) {
+                row.push("");
+                continue;
+            }
+            row.push(
+                `${date.format("M/D")} ${date.format("ddd")}${dateKey === todayKey ? "  TODAY" : ""}\n청소 0건\n체크아웃 가능 0건\n예측 체크인수 0건\n최소인원 0명\n¥0`
+            );
+        }
+        weeks.push(row);
+    }
+
+    return {
+        title: `월간 캘린더 | ${monthStart.format("YYYY년 M월")}`,
+        weeks,
+    };
+}
+
+function buildCalendarBlockRows(monthKey, todayKey) {
+    const month = buildCalendarSkeletonMonth(monthKey, todayKey);
+    const blankRow = () => ["", "", "", "", "", "", "", ""];
+    return [
+        ...Array.from({ length: CALENDAR_KPI_ROW_COUNT }, blankRow),
+        [month.title, "", "", "", "", "", "", ""],
+        [...CALENDAR_DAY_NAMES, ""],
+        ...month.weeks.map((week) => [...week, ""]),
+        blankRow(),
+    ];
+}
+
+async function ensureCalendarMonthCapacity(
+    sheets,
+    values,
+    targetMonthKeys = [],
+    todayKey = ""
+) {
+    const normalizedTargets = Array.isArray(targetMonthKeys) ? targetMonthKeys.filter(Boolean) : [];
+    const existingMonthRows = findCalendarMonthRows(values);
+    const missingCount = Math.max(0, normalizedTargets.length - existingMonthRows.length);
+    if (!normalizedTargets.length || missingCount === 0) return values;
+
+    const weeklyRow = findRowByLabel(values, "\uC8FC\uAC04 \uC694\uC57D");
+    if (weeklyRow < 0) {
+        throw new Error("Calendar expansion aborted: weekly summary anchor is missing");
+    }
+
+    const missingMonthKeys = normalizedTargets.slice(existingMonthRows.length);
+    const rowsToInsert = missingMonthKeys.flatMap((monthKey) => buildCalendarBlockRows(monthKey, todayKey));
+    const layoutSheetId = await getSheetIdByTitle(sheets, SPREADSHEET_ID, SHEET_TITLE);
+
+    await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: SPREADSHEET_ID,
+        resource: {
+            requests: [{
+                insertDimension: {
+                    range: {
+                        sheetId: layoutSheetId,
+                        dimension: "ROWS",
+                        startIndex: weeklyRow,
+                        endIndex: weeklyRow + rowsToInsert.length,
+                    },
+                    inheritFromBefore: false,
+                },
+            }],
+        },
+    });
+
+    await sheets.spreadsheets.values.update({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${SHEET_TITLE}!A${weeklyRow + 1}:H${weeklyRow + rowsToInsert.length}`,
+        valueInputOption: "RAW",
+        resource: { values: rowsToInsert },
+    });
+
+    const formatRequests = [];
+    missingMonthKeys.forEach((_, index) => {
+        const blockStart = weeklyRow + (index * CALENDAR_BLOCK_ROW_COUNT);
+        const titleRow = blockStart + CALENDAR_KPI_ROW_COUNT;
+        const weekdayRow = titleRow + 1;
+        const firstWeekRow = weekdayRow + 1;
+        const afterWeeksRow = firstWeekRow + CALENDAR_WEEK_ROW_COUNT;
+
+        formatRequests.push(
+            {
+                mergeCells: {
+                    range: { sheetId: layoutSheetId, startRowIndex: titleRow, endRowIndex: titleRow + 1, startColumnIndex: 0, endColumnIndex: 8 },
+                    mergeType: "MERGE_ALL",
+                },
+            },
+            {
+                repeatCell: {
+                    range: { sheetId: layoutSheetId, startRowIndex: blockStart, endRowIndex: titleRow, startColumnIndex: 0, endColumnIndex: 8 },
+                    cell: { userEnteredFormat: { backgroundColorStyle: { rgbColor: { red: 0.976, green: 0.984, blue: 0.996 } }, horizontalAlignment: "CENTER", verticalAlignment: "MIDDLE" } },
+                    fields: "userEnteredFormat.backgroundColorStyle,userEnteredFormat.horizontalAlignment,userEnteredFormat.verticalAlignment",
+                },
+            },
+            {
+                repeatCell: {
+                    range: { sheetId: layoutSheetId, startRowIndex: titleRow, endRowIndex: titleRow + 1, startColumnIndex: 0, endColumnIndex: 8 },
+                    cell: { userEnteredFormat: { backgroundColorStyle: { rgbColor: { red: 0.067, green: 0.545, blue: 0.510 } }, textFormat: { bold: true, fontSize: 12, foregroundColorStyle: { rgbColor: { red: 1, green: 1, blue: 1 } } }, horizontalAlignment: "LEFT", verticalAlignment: "MIDDLE" } },
+                    fields: "userEnteredFormat.backgroundColorStyle,userEnteredFormat.textFormat,userEnteredFormat.horizontalAlignment,userEnteredFormat.verticalAlignment",
+                },
+            },
+            {
+                repeatCell: {
+                    range: { sheetId: layoutSheetId, startRowIndex: weekdayRow, endRowIndex: weekdayRow + 1, startColumnIndex: 0, endColumnIndex: 7 },
+                    cell: { userEnteredFormat: { backgroundColorStyle: { rgbColor: { red: 0.05, green: 0.12, blue: 0.22 } }, textFormat: { bold: true, fontSize: 11, foregroundColorStyle: { rgbColor: { red: 1, green: 1, blue: 1 } } }, horizontalAlignment: "CENTER", verticalAlignment: "MIDDLE" } },
+                    fields: "userEnteredFormat.backgroundColorStyle,userEnteredFormat.textFormat,userEnteredFormat.horizontalAlignment,userEnteredFormat.verticalAlignment",
+                },
+            },
+            {
+                repeatCell: {
+                    range: { sheetId: layoutSheetId, startRowIndex: firstWeekRow, endRowIndex: afterWeeksRow, startColumnIndex: 0, endColumnIndex: 7 },
+                    cell: { userEnteredFormat: { backgroundColorStyle: { rgbColor: { red: 1, green: 1, blue: 1 } }, wrapStrategy: "WRAP", verticalAlignment: "TOP", horizontalAlignment: "LEFT" } },
+                    fields: "userEnteredFormat.backgroundColorStyle,userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment,userEnteredFormat.horizontalAlignment",
+                },
+            },
+            { updateDimensionProperties: { range: { sheetId: layoutSheetId, dimension: "ROWS", startIndex: blockStart, endIndex: titleRow }, properties: { pixelSize: 28 }, fields: "pixelSize" } },
+            { updateDimensionProperties: { range: { sheetId: layoutSheetId, dimension: "ROWS", startIndex: titleRow, endIndex: titleRow + 1 }, properties: { pixelSize: 32 }, fields: "pixelSize" } },
+            { updateDimensionProperties: { range: { sheetId: layoutSheetId, dimension: "ROWS", startIndex: weekdayRow, endIndex: weekdayRow + 1 }, properties: { pixelSize: 28 }, fields: "pixelSize" } },
+            { updateDimensionProperties: { range: { sheetId: layoutSheetId, dimension: "ROWS", startIndex: firstWeekRow, endIndex: afterWeeksRow }, properties: { pixelSize: 140 }, fields: "pixelSize" } }
+        );
+    });
+
+    if (formatRequests.length) {
+        await sheets.spreadsheets.batchUpdate({
+            spreadsheetId: SPREADSHEET_ID,
+            resource: { requests: formatRequests },
+        });
+    }
+
+    const refreshed = await sheets.spreadsheets.values.get({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${SHEET_TITLE}!A1:H400`,
+    });
+    const refreshedValues = refreshed.data.values || [];
+    console.log(`[forecast] calendar capacity expanded: ${existingMonthRows.length} -> ${findCalendarMonthRows(refreshedValues).length}`);
+    return refreshedValues;
+}
+
+async function refreshCalendarScaffoldingIfNeeded(
+    sheets,
+    calendarValues,
+    monthRows,
+    targetMonthKeys = [],
+    todayKey = ""
+) {
+    const normalizedTargets = Array.isArray(targetMonthKeys) ? targetMonthKeys.filter(Boolean) : [];
+    if (!normalizedTargets.length || !monthRows.length) {
+        return { calendarValues, monthRows };
+    }
+
+    if (monthRows.length < normalizedTargets.length) {
+        throw new Error(`Calendar refresh aborted: expected ${normalizedTargets.length} month blocks, found ${monthRows.length}`);
+    }
+
+    const activeMonthRows = monthRows.slice(0, normalizedTargets.length);
+    const effectiveTargets = normalizedTargets.slice(0, activeMonthRows.length);
+    const existingMonthKeys = activeMonthRows.map((rowIdx) => parseCalendarMonthKey(calendarValues[rowIdx]?.[0] || ""));
+    const needsRefresh = activeMonthRows.some((rowIdx, index) => {
+        if (!Number.isInteger(rowIdx)) return false;
+        return existingMonthKeys[index] !== effectiveTargets[index];
+    });
+
+    if (!needsRefresh) {
+        return { calendarValues, monthRows: activeMonthRows };
+    }
+
+    const updates = [];
+    activeMonthRows.forEach((rowIdx, index) => {
+        const monthKey = effectiveTargets[index];
+        if (!monthKey) return;
+        const month = buildCalendarSkeletonMonth(monthKey, todayKey);
+        updates.push({
+            range: `${SHEET_TITLE}!A${rowIdx + 1}:H${rowIdx + 1}`,
+            values: [[month.title, "", "", "", "", "", "", ""]],
+        });
+        updates.push({
+            range: `${SHEET_TITLE}!A${rowIdx + 2}:H${rowIdx + 2}`,
+            values: [[...CALENDAR_DAY_NAMES, ""]],
+        });
+        updates.push({
+            range: `${SHEET_TITLE}!A${rowIdx + 3}:G${rowIdx + 8}`,
+            values: month.weeks,
+        });
+        updates.push({
+            range: `${SHEET_TITLE}!H${rowIdx + 3}:H${rowIdx + 8}`,
+            values: Array.from({ length: 6 }, () => [""]),
+        });
+        updates.push({
+            range: `${SHEET_TITLE}!A${rowIdx + 9}:H${rowIdx + 9}`,
+            values: [["", "", "", "", "", "", "", ""]],
+        });
+    });
+
+    await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: SPREADSHEET_ID,
+        resource: {
+            valueInputOption: "RAW",
+            data: updates,
+        },
+    });
+
+    const refreshed = await sheets.spreadsheets.values.get({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${SHEET_TITLE}!A1:H400`,
+    });
+    const refreshedValues = refreshed.data.values || [];
+    const refreshedMonthRows = findCalendarMonthRows(refreshedValues).slice(0, activeMonthRows.length);
+
+    console.log(
+        `[forecast] calendar scaffolding refreshed: ${existingMonthKeys.join(", ")} -> ${effectiveTargets.join(", ")}`
+    );
+
+    return {
+        calendarValues: refreshedValues,
+        monthRows: refreshedMonthRows,
+    };
+}
+
 // Parse the 운영 입력값 manual input section. Returns:
 //   byMonth: Map<YYYY-MM, { confirmed_fixed_staff, avg_part_time_days_per_week, notes, rowIndex }>
 //   endRow: 0-indexed array position immediately after the last data row (for inserting new month rows).
@@ -483,16 +727,10 @@ async function ensureManualInputSection(sheets, months = [], preservedManualInpu
     const values = valuesRes.data.values || [];
     const layoutSheetId = await getSheetIdByTitle(sheets, SPREADSHEET_ID, SHEET_TITLE);
     const manualRow = findRowByLabel(values, MANUAL_INPUT_LABEL);
-    const apiRow = findRowByLabel(values, API_INPUT_LABEL);
 
     if (manualRow < 0) {
-        const insertAt = apiRow >= 0 ? apiRow : values.length;
-        const rows = apiRow >= 0
-            ? buildManualInputRows(months, preservedManualInputs)
-            : [
-                ...buildManualInputRows(months, preservedManualInputs),
-                [API_INPUT_LABEL, "", "", "", "", "", "", ""],
-            ];
+        const insertAt = values.length;
+        const rows = buildManualInputRows(months, preservedManualInputs);
         await sheets.spreadsheets.batchUpdate({
             spreadsheetId: SPREADSHEET_ID,
             resource: {
@@ -558,33 +796,6 @@ async function ensureManualInputSection(sheets, months = [], preservedManualInpu
         });
         console.log(`[forecast] manual input rows added: ${missing.join(", ")}`);
     }
-
-    if (apiRow < 0) {
-        const apiInsertAt = endRow + missing.length + 1;
-        await sheets.spreadsheets.batchUpdate({
-            spreadsheetId: SPREADSHEET_ID,
-            resource: {
-                requests: [{
-                    insertDimension: {
-                        range: {
-                            sheetId: layoutSheetId,
-                            dimension: "ROWS",
-                            startIndex: apiInsertAt,
-                            endIndex: apiInsertAt + 1,
-                        },
-                        inheritFromBefore: true,
-                    },
-                }],
-            },
-        });
-        await sheets.spreadsheets.values.update({
-            spreadsheetId: SPREADSHEET_ID,
-            range: `${SHEET_TITLE}!A${apiInsertAt + 1}:H${apiInsertAt + 1}`,
-            valueInputOption: "RAW",
-            resource: { values: [[API_INPUT_LABEL, "", "", "", "", "", "", ""]] },
-        });
-        console.log(`[forecast] API input anchor created at row ${apiInsertAt + 1}`);
-    }
 }
 
 function colToA1(colIndex) {
@@ -606,13 +817,6 @@ function isSectionTitleRow(row = []) {
         "\uc8fc\uac04 \uc694\uc57d",
         "\uac74\ubb3c\ubcc4 3\uac1c\uc6d4 \uc694\uc57d",
         "\uc6b4\uc601 \uc785\ub825\uac12",
-        "\ucd9c\ud1f4\uadfc\uc571 \uc5f0\ub3d9 \ud14c\uc2a4\ud2b8",
-        "\uc6d4\ubcc4 \uc2dc\uae09\uc81c \uc54c\ubc14 \uc778\uac74\ube44",
-        "\uc9c1\uc6d0\ubcc4 \uadfc\ubb34 \uc694\uc57d",
-        "\uac74\ubb3c/\uadfc\ubb34\uc9c0\ubcc4 \uadfc\ubb34 \uc694\uc57d",
-        "\uc9c1\uc6d0 \ubaa9\ub85d",
-        "\ucd5c\uadfc 3\uac1c\uc6d4 \uadfc\ud0dc",
-        "\ucd5c\uadfc 3\uac1c\uc6d4 \uae09\uc5ec \uc694\uc57d",
     ].includes(first);
 }
 
@@ -864,11 +1068,9 @@ function getConfidence(horizonDays) {
 }
 
 async function getSheetsClient() {
+    const credentials = getGoogleServiceAccountCredentials();
     const auth = new google.auth.GoogleAuth({
-        credentials: {
-            client_email: serviceAccount.client_email,
-            private_key: serviceAccount.private_key,
-        },
+        credentials,
         scopes: ["https://www.googleapis.com/auth/spreadsheets"],
     });
     const client = await auth.getClient();
@@ -884,9 +1086,7 @@ async function getSheetIdByTitle(sheets, spreadsheetId, title) {
 
 function initFirestore() {
     if (!admin.apps.length) {
-        admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount),
-        });
+        admin.initializeApp();
     }
     return admin.firestore();
 }
@@ -1565,17 +1765,22 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
         spreadsheetId: SPREADSHEET_ID,
         range: `${SHEET_TITLE}!A1:H400`,
     });
-    const values = valuesRes.data.values || [];
+    const targetMonthKeys = Array.isArray(opts.monthsToEnsure) ? opts.monthsToEnsure.filter(Boolean) : [];
+    const capacityTodayKey = dayjs().tz(TOKYO_TZ).format("YYYY-MM-DD");
+    const values = await ensureCalendarMonthCapacity(
+        sheets,
+        valuesRes.data.values || [],
+        targetMonthKeys,
+        capacityTodayKey
+    );
 
     const buildingRowInitial = findRowByLabel(values, "\uac74\ubb3c\ubcc4 3\uac1c\uc6d4 \uc694\uc57d");
     const weeklyRow = findRowByLabel(values, "\uc8fc\uac04 \uc694\uc57d");
     const monthlyMinRowInitial = findRowByLabel(values, "\uc6d4\ubcc4 \ucd5c\uc18c \uc778\ub825");
-    const apiRowInitial = findRowByLabel(values, API_INPUT_LABEL);
     const manualInputRowInitial = findRowByLabel(values, MANUAL_INPUT_LABEL);
 
     let buildingRow = buildingRowInitial;
     let monthlyMinRow = monthlyMinRowInitial;
-    let apiRow = apiRowInitial;
     let manualInputRow = manualInputRowInitial;
 
     const todayKeyForWeekly = dayjs().tz(TOKYO_TZ).format("YYYY-MM-DD");
@@ -1606,7 +1811,6 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
             const bump = (idx) => (idx >= buildingRowInitial ? idx + needInsert : idx);
             buildingRow = bump(buildingRowInitial);
             if (monthlyMinRowInitial >= 0) monthlyMinRow = bump(monthlyMinRowInitial);
-            if (apiRowInitial >= 0) apiRow = bump(apiRowInitial);
             if (manualInputRowInitial >= 0) manualInputRow = bump(manualInputRowInitial);
         }
     }
@@ -1617,10 +1821,7 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
 
     // Detect calendar title rows and run one-time migration to ensure 3 KPI rows above each.
     let calendarValues = values;
-    const monthRows = [];
-    for (let i = 0; i < calendarValues.length; i += 1) {
-        if (String(calendarValues[i]?.[0] || "").startsWith("\uc6d4\uac04 \uce98\ub9b0\ub354 | ")) monthRows.push(i);
-    }
+    const monthRows = findCalendarMonthRows(calendarValues);
 
     // Process from bottom to top so earlier row indices are not invalidated by insertions.
     const sortedForMigration = [...monthRows].sort((a, b) => b - a);
@@ -1656,11 +1857,20 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
         });
         calendarValues = refreshed.data.values || [];
         monthRows.length = 0;
-        for (let i = 0; i < calendarValues.length; i += 1) {
-            if (String(calendarValues[i]?.[0] || "").startsWith("\uc6d4\uac04 \uce98\ub9b0\ub354 | ")) monthRows.push(i);
-        }
+        monthRows.push(...findCalendarMonthRows(calendarValues));
         console.log(`[forecast] calendar migration: inserted ${migrationInsertions} KPI row(s), re-detected ${monthRows.length} calendars`);
     }
+
+    const refreshedCalendar = await refreshCalendarScaffoldingIfNeeded(
+        sheets,
+        calendarValues,
+        monthRows,
+        opts.monthsToEnsure || [],
+        todayKey
+    );
+    calendarValues = refreshedCalendar.calendarValues;
+    monthRows.length = 0;
+    monthRows.push(...refreshedCalendar.monthRows);
 
     const updates = [];
     const calendarLayoutRequests = [];
@@ -1668,12 +1878,22 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
     const peakCellPositions = [];
     const weeklyFormatRequests = [];
     const buildingSummaryFormatRequests = [];
-    const attendanceAppFormatRequests = [];
     const updateTs = dayjs().tz(TOKYO_TZ).format("YYYY-MM-DD HH:mm");
-    let staleApiRow = -1;
-    if (apiRow >= 0 && manualInputRow >= 0 && apiRow < manualInputRow) {
-        staleApiRow = apiRow;
-        apiRow = -1;
+    if (monthRows.length) {
+        const firstCalendarRow = Math.max(0, Math.min(...monthRows) - CALENDAR_KPI_ROW_COUNT);
+        const lastCalendarRowExclusive = Math.max(...monthRows) + 1 + 1 + CALENDAR_WEEK_ROW_COUNT + 1;
+        calendarLayoutRequests.push({
+            updateDimensionProperties: {
+                range: {
+                    sheetId: null,
+                    dimension: "ROWS",
+                    startIndex: firstCalendarRow,
+                    endIndex: lastCalendarRowExclusive,
+                },
+                properties: { hiddenByUser: false },
+                fields: "hiddenByUser",
+            },
+        });
     }
     monthRows.forEach((rowIdx) => {
         const title = String(calendarValues[rowIdx]?.[0] || "");
@@ -2338,7 +2558,7 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
 
         // Compact excessive blank rows before the next section.
         // Manual input section is treated as an anchor so its rows are never consumed.
-        const nextAnchors = [monthlyMinRow, apiRow, manualInputRow]
+        const nextAnchors = [monthlyMinRow, manualInputRow]
             .filter((idx) => Number.isInteger(idx) && idx >= bldEndExclusive + 1)
             .sort((a, b) => a - b);
         if (nextAnchors.length > 0) {
@@ -2363,7 +2583,6 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
                 });
                 const deleted = deleteEnd - deleteStart;
                 if (monthlyMinRow >= deleteEnd) monthlyMinRow -= deleted;
-                if (apiRow >= deleteEnd) apiRow -= deleted;
                 if (manualInputRow >= deleteEnd) manualInputRow -= deleted;
             }
         }
@@ -2405,215 +2624,6 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
         });
     }
 
-    if (apiRow < 0 && buildingRow >= 0) {
-        if (manualInputRow >= 0) {
-            const { endRow } = parseManualInputs(values, manualInputRow);
-            apiRow = endRow >= 0 ? endRow + 1 : manualInputRow + 6;
-        } else {
-            apiRow = buildingRow + 7 + 1 + BUILDING_ORDER.length + 1;
-        }
-    }
-
-    if (apiRow >= 0) {
-        if (staleApiRow >= 0) {
-            await sheets.spreadsheets.values.clear({
-                spreadsheetId: SPREADSHEET_ID,
-                range: `${SHEET_TITLE}!A${staleApiRow + 1}:H${staleApiRow + 1}`,
-            });
-        }
-        await sheets.spreadsheets.values.update({
-            spreadsheetId: SPREADSHEET_ID,
-            range: `${SHEET_TITLE}!A${apiRow + 1}:H${apiRow + 1}`,
-            valueInputOption: "RAW",
-            resource: { values: [[API_INPUT_LABEL, "", "", "", "", "", "", ""]] },
-        });
-        const attendanceAppData = await buildAttendanceAppSheetRows(dayjs().tz(TOKYO_TZ));
-        const start = apiRow + 2;
-        const end = start + Math.max(attendanceAppData.rows.length, 1) - 1;
-        const defaultClearEnd = start + Math.max(API_CLEAR_WINDOW_ROWS, attendanceAppData.rows.length + 10);
-        const safeClearEnd = manualInputRow > apiRow ? Math.min(defaultClearEnd, manualInputRow) : defaultClearEnd;
-        await sheets.spreadsheets.values.clear({
-            spreadsheetId: SPREADSHEET_ID,
-            range: `${SHEET_TITLE}!A${start}:H${safeClearEnd}`,
-        });
-        // Reset stale cell formats BEFORE writing values so DATE number formats from
-        // previous layouts cannot misinterpret incoming numbers as date serials.
-        await sheets.spreadsheets.batchUpdate({
-            spreadsheetId: SPREADSHEET_ID,
-            resource: {
-                requests: [{
-                    repeatCell: {
-                        range: {
-                            sheetId: layoutSheetId,
-                            startRowIndex: start - 1,
-                            endRowIndex: end + 1,
-                            startColumnIndex: 0,
-                            endColumnIndex: 8,
-                        },
-                        cell: {
-                            userEnteredFormat: {
-                                backgroundColorStyle: { rgbColor: { red: 1, green: 1, blue: 1 } },
-                                numberFormat: { type: "TEXT" },
-                                textFormat: {
-                                    fontFamily: "Arial",
-                                    fontSize: 10,
-                                    bold: false,
-                                    foregroundColorStyle: { rgbColor: { red: 0, green: 0, blue: 0 } },
-                                },
-                                horizontalAlignment: "CENTER",
-                                verticalAlignment: "MIDDLE",
-                                wrapStrategy: "WRAP",
-                            },
-                        },
-                        fields: "userEnteredFormat.backgroundColorStyle,userEnteredFormat.numberFormat,userEnteredFormat.textFormat.fontFamily,userEnteredFormat.textFormat.fontSize,userEnteredFormat.textFormat.bold,userEnteredFormat.textFormat.foregroundColorStyle,userEnteredFormat.horizontalAlignment,userEnteredFormat.verticalAlignment,userEnteredFormat.wrapStrategy",
-                    },
-                }],
-            },
-        });
-        // Write attendance app values with RAW so strings are never re-parsed as dates.
-        await sheets.spreadsheets.values.update({
-            spreadsheetId: SPREADSHEET_ID,
-            range: `${SHEET_TITLE}!A${start}:H${end}`,
-            valueInputOption: "RAW",
-            resource: {
-                values: attendanceAppData.rows.length
-                    ? attendanceAppData.rows
-                    : [["--", "--", "--", "--", "--", "--", "--", "--"]],
-            },
-        });
-        // Section-aware format helpers \u2014 applied after TEXT reset.
-        const makeNumFmt = (rowIdx, colStart, colEnd, pattern) => ({
-            repeatCell: {
-                range: { sheetId: layoutSheetId, startRowIndex: rowIdx, endRowIndex: rowIdx + 1, startColumnIndex: colStart, endColumnIndex: colEnd },
-                cell: { userEnteredFormat: { numberFormat: { type: "NUMBER", pattern } } },
-                fields: "userEnteredFormat.numberFormat",
-            },
-        });
-        const makeCurrFmt = (rowIdx, colStart, colEnd) => ({
-            repeatCell: {
-                range: { sheetId: layoutSheetId, startRowIndex: rowIdx, endRowIndex: rowIdx + 1, startColumnIndex: colStart, endColumnIndex: colEnd },
-                cell: { userEnteredFormat: { numberFormat: { type: "CURRENCY", pattern: "\u00a5#,##0" } } },
-                fields: "userEnteredFormat.numberFormat",
-            },
-        });
-        // Section title \u2192 section key mapping (Unicode escapes = Korean at runtime).
-        const ATTENDANCE_SECTION_TITLES = {
-            "\uc6d4\ubcc4 \uc2dc\uae09\uc81c \uc54c\ubc14 \uc778\uac74\ube44": "monthly",
-            "\uc9c1\uc6d0\ubcc4 \uadfc\ubb34 \uc694\uc57d": "employeeSummary",
-            "\uac74\ubb3c/\uadfc\ubb34\uc9c0\ubcc4 \uadfc\ubb34 \uc694\uc57d": "workplace",
-            "\uc9c1\uc6d0 \ubaa9\ub85d": "employeeList",
-            "\ucd5c\uadfc 3\uac1c\uc6d4 \uadfc\ud0dc": "attendance",
-            "\ucd5c\uadfc 3\uac1c\uc6d4 \uae09\uc5ec \uc694\uc57d": "payroll",
-        };
-        const titleRows = [];
-        const headerRows = [];
-        let attendanceSection = null;
-        let sectionDataMode = false;
-        attendanceAppData.rows.forEach((row, idx) => {
-            const first = String(row?.[0] || "");
-            const second = String(row?.[1] || "");
-            const rowIndex = start - 1 + idx;
-
-            if (ATTENDANCE_SECTION_TITLES[first]) {
-                attendanceSection = ATTENDANCE_SECTION_TITLES[first];
-                sectionDataMode = false;
-            }
-            const isHdr = ["\uc6d4", "ID", "\uadfc\ubb34\uc9c0", "\uadfc\ubb34\uc77c"].includes(first)
-                || (first === "\uae30\uc900" && second === "STAY ARI staging");
-            if (first && row.slice(1).every((cell) => String(cell || "") === "")) titleRows.push(rowIndex);
-            if (isHdr) headerRows.push(rowIndex);
-
-            // Apply section-specific number/currency formats for data rows.
-            if (sectionDataMode && attendanceSection && first) {
-                const n0 = (c) => attendanceAppFormatRequests.push(makeNumFmt(rowIndex, c, c + 1, "0"));
-                const n1 = (c) => attendanceAppFormatRequests.push(makeNumFmt(rowIndex, c, c + 1, "0.0"));
-                const cy = (c) => attendanceAppFormatRequests.push(makeCurrFmt(rowIndex, c, c + 1));
-                if (attendanceSection === "monthly") {
-                    // B\uc778\uc6d0 C\uadfc\ubb34\uc77c D\uadfc\ud0dc\uac74\uc218 E\uadfc\ubb34\ubd84: NUMBER 0; F\uadfc\ubb34\uc2dc\uac04: NUMBER 0.0; G\uc571\uc778\uac74\ube44 H\ucd94\uc815: CURRENCY
-                    n0(1); n0(2); n0(3); n0(4); n1(5); cy(6); cy(7);
-                } else if (attendanceSection === "employeeSummary") {
-                    // F\uadfc\ud0dc\uac74\uc218: NUMBER 0; G\uadfc\ubb34\uc2dc\uac04: NUMBER 0.0; H: CURRENCY only when numeric
-                    n0(5); n1(6);
-                    if (typeof row[7] === "number") cy(7);
-                } else if (attendanceSection === "workplace") {
-                    // B\uadfc\ud0dc\uac74\uc218 C\uc778\uc6d0 D\uadfc\ubb34\ubd84: NUMBER 0; E\uadfc\ubb34\uc2dc\uac04: NUMBER 0.0; F\ucd94\uc815: CURRENCY
-                    n0(1); n0(2); n0(3); n1(4); cy(5);
-                } else if (attendanceSection === "attendance") {
-                    // E\uadfc\ubb34\ubd84: NUMBER 0; F\uadfc\ubb34\uc2dc\uac04: NUMBER 0.0; H\ucd94\uc815: CURRENCY (G wage stays TEXT)
-                    n0(4); n1(5); cy(7);
-                } else if (attendanceSection === "payroll") {
-                    // E\uadfc\ubb34\ubd84: NUMBER 0; F\uc571\uc778\uac74\ube44 G\ucd94\uc815: CURRENCY
-                    n0(4); cy(5); cy(6);
-                }
-            }
-            if (isHdr) sectionDataMode = true;
-            if (!first) sectionDataMode = false;
-        });
-        titleRows.forEach((rowIndex) => {
-            attendanceAppFormatRequests.push({
-                repeatCell: {
-                    range: {
-                        sheetId: layoutSheetId,
-                        startRowIndex: rowIndex,
-                        endRowIndex: rowIndex + 1,
-                        startColumnIndex: 0,
-                        endColumnIndex: 8,
-                    },
-                    cell: {
-                        userEnteredFormat: {
-                            backgroundColorStyle: { rgbColor: { red: 0.05, green: 0.55, blue: 0.49 } },
-                            textFormat: {
-                                bold: true,
-                                foregroundColorStyle: { rgbColor: { red: 1, green: 1, blue: 1 } },
-                            },
-                            horizontalAlignment: "LEFT",
-                        },
-                    },
-                    fields: "userEnteredFormat.backgroundColorStyle,userEnteredFormat.textFormat,userEnteredFormat.horizontalAlignment",
-                },
-            });
-        });
-        headerRows.forEach((rowIndex) => {
-            attendanceAppFormatRequests.push({
-                repeatCell: {
-                    range: {
-                        sheetId: layoutSheetId,
-                        startRowIndex: rowIndex,
-                        endRowIndex: rowIndex + 1,
-                        startColumnIndex: 0,
-                        endColumnIndex: 8,
-                    },
-                    cell: {
-                        userEnteredFormat: {
-                            backgroundColorStyle: { rgbColor: { red: 0.90, green: 0.94, blue: 0.98 } },
-                            textFormat: { bold: true },
-                            horizontalAlignment: "CENTER",
-                        },
-                    },
-                    fields: "userEnteredFormat.backgroundColorStyle,userEnteredFormat.textFormat.bold,userEnteredFormat.horizontalAlignment",
-                },
-            });
-        });
-        attendanceAppFormatRequests.push({
-            updateBorders: {
-                range: {
-                    sheetId: layoutSheetId,
-                    startRowIndex: start - 1,
-                    endRowIndex: end,
-                    startColumnIndex: 0,
-                    endColumnIndex: 8,
-                },
-                top: { style: "SOLID", width: 1, color: { red: 0.75, green: 0.8, blue: 0.88 } },
-                bottom: { style: "SOLID", width: 1, color: { red: 0.75, green: 0.8, blue: 0.88 } },
-                left: { style: "SOLID", width: 1, color: { red: 0.75, green: 0.8, blue: 0.88 } },
-                right: { style: "SOLID", width: 1, color: { red: 0.75, green: 0.8, blue: 0.88 } },
-                innerHorizontal: { style: "SOLID", width: 1, color: { red: 0.75, green: 0.8, blue: 0.88 } },
-                innerVertical: { style: "SOLID", width: 1, color: { red: 0.75, green: 0.8, blue: 0.88 } },
-            },
-        });
-        console.log(`[forecast] attendance app section prepared: ${JSON.stringify(attendanceAppData.meta)}`);
-    }
-
     await sheets.spreadsheets.values.batchUpdate({
         spreadsheetId: SPREADSHEET_ID,
         resource: {
@@ -2653,13 +2663,6 @@ async function updateSheetWithForecast(sheets, model, monthlyData, opts = {}) {
         await sheets.spreadsheets.batchUpdate({
             spreadsheetId: SPREADSHEET_ID,
             resource: { requests: buildingSummaryFormatRequests },
-        });
-    }
-
-    if (attendanceAppFormatRequests.length) {
-        await sheets.spreadsheets.batchUpdate({
-            spreadsheetId: SPREADSHEET_ID,
-            resource: { requests: attendanceAppFormatRequests },
         });
     }
 

@@ -14,12 +14,14 @@
   "main": "index.js",
   "dependencies": {
     "@notionhq/client": "^5.12.0",
+    "@sparticuz/chromium": "^149.0.0",
     "axios": "^1.13.2",
     "cors": "^2.8.5",
     "dayjs": "^1.11.19",
     "firebase-admin": "^13.6.1",
     "firebase-functions": "^7.2.5",
     "googleapis": "^144.0.0",
+    "playwright-core": "^1.61.1",
     "sharp": "^0.33.5"
   },
   "devDependencies": {

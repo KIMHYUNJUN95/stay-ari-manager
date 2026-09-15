@@ -8,7 +8,8 @@ function createNotionReportModule({
     db,
     dayjs,
     DEFAULT_COMPANY_ID,
-    BUILDING_ROOMS
+    BUILDING_ROOMS,
+    assertReservationDataReady
 }) {
     function getNotionClient() {
         const token = process.env.NOTION_API_SECRET || process.env.NOTION_TOKEN;
@@ -263,6 +264,7 @@ function createNotionReportModule({
         timeoutSeconds: 120,
         memory: "256MiB"
     }, async () => {
+        await assertReservationDataReady("scheduledMonthlyNotionReport");
         const notion = getNotionClient();
         const parentPageId = process.env.NOTION_REPORT_PAGE_ID;
         if (!parentPageId || parentPageId === "YOUR_NOTION_PAGE_ID_HERE") {
@@ -286,6 +288,7 @@ function createNotionReportModule({
             try {
                 const { companyId, yearMonth } = req.body;
                 if (!companyId) return res.status(400).json({ error: "companyId 필수" });
+                await assertReservationDataReady("sendNotionReport", { companyId });
 
                 const targetMonth = yearMonth || dayjs().tz("Asia/Tokyo").format("YYYY-MM");
                 const notion = getNotionClient();

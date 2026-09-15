@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(node:*)"
+      "Bash(node:*)",
+      "Bash(npx firebase deploy:*)",
+      "Bash(npx firebase functions:log:*)"
     ]
   }
 }

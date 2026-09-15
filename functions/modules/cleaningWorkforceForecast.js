@@ -56,6 +56,20 @@ const DEFAULT_BUILDING_RULES = {
         hoursPerWorker: 5 + (46 / 60),
         maxUnitsPerWorker: 1,
     },
+    stayAriApartmentHotel: {
+        type: "room",
+        label: "STAY ARI Apartment Hotel",
+        aliases: [
+            "stayAriApartmentHotel", "stay ari apartment hotel", "STAY ARI Apartment Hotel",
+            "stay ari", "STAY ARI", "sky", "SKY",
+        ],
+        minWorkers: 1,
+        recommendedWorkers: 1,
+        // No measured baseline yet: use the most conservative existing
+        // room-building duration until STAY ARI operating data is available.
+        hoursPerWorker: 6.5,
+        maxUnitsPerWorker: 1,
+    },
     okuboA: {
         type: "okubo",
         label: "Okubo A",

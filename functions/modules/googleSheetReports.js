@@ -1,8 +1,17 @@
 const { google } = require("googleapis");
-const serviceAccount = require("../serviceAccountKey.json");
+const { getGoogleServiceAccountCredentials } = require("./googleCredentials");
 const { runPaxOccupancyReport } = require("./paxOccupancyReport");
 const { NOTION_PAGES, syncNotionDailyLog, syncNotionCancelLog, syncNotionSalesLog, syncNotionPlatformAnalysis, syncNotionPaxOccupancy } = require("./notionReportSync");
 const { updateFutureTargetGoalsSheet } = require("./targetGoalsSheet");
+
+async function createSheetsClient() {
+    const credentials = getGoogleServiceAccountCredentials();
+    const auth = new google.auth.GoogleAuth({
+        credentials,
+        scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+    });
+    return google.sheets({ version: "v4", auth: await auth.getClient() });
+}
 
 // ── 브리핑 시트 디자인 요청 빌더 ────────────────────────────────────────────
 function buildBriefingDesignRequests(sheetId, titleText, subtitleText, buttons) {
@@ -63,7 +72,11 @@ function createGoogleSheetReportModule({
         const SHEET_TITLE = `플랫폼분석_${year}_${String(month).padStart(2, "0")}`;
         const DAIKYO_SOLD_DATE = "2026-01-26";
         const EXCLUDED_BUILDINGS = new Set(["다이쿄초"]);
-        const BUILDING_ORDER = ["아라키초A", "아라키초B", "가부키초", "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동", "사노시"];
+        const BUILDING_ORDER = ["아라키초A", "아라키초B", "가부키초", "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동", "STAY ARI Apartment Hotel", "사노시"];
+        const PLATFORM_SHEET_BUILDING_LABELS = {
+            "STAY ARI Apartment Hotel": "SKY"
+        };
+        const formatPlatformSheetBuildingLabel = (building) => PLATFORM_SHEET_BUILDING_LABELS[building] || building;
         const parseLocalDate = (dateStr) => {
             if (!dateStr) return null;
             const [y, m, d] = dateStr.split("-").map(Number);
@@ -208,7 +221,7 @@ function createGoogleSheetReportModule({
             const bOccBuilding = rooms.reduce((sum, room) => sum + stats[building][room].occBooking, 0);
             sectionRowIdx.push(values.length);
             values.push([
-                `■ ${building}`,
+                `■ ${formatPlatformSheetBuildingLabel(building)}`,
                 `${rooms.length}개 객실`,
                 "—",
                 occBuildingTotal,
@@ -249,7 +262,7 @@ function createGoogleSheetReportModule({
                 else if (aOccPct > 60 && occTotal >= 5) flag = "Booking.com 비중 낮음(기준밖)";
 
                 values.push([
-                    building,
+                    formatPlatformSheetBuildingLabel(building),
                     room,
                     suppressInflowRatio ? "" : sharePct / 100,
                     occTotal,
@@ -1510,12 +1523,7 @@ function createGoogleSheetReportModule({
             const companyDocs = filterDocsToCompany(allDocs, DEFAULT_COMPANY_ID);
             console.log(`   Firestore ${companyDocs.length}건 로드 완료 (bookDate:${bookedSnap.size}, cancelTime:${cancelSnap.size}, modified:${modifiedSnap.size})`);
 
-            const auth = new google.auth.GoogleAuth({
-                credentials: { client_email: serviceAccount.client_email, private_key: serviceAccount.private_key },
-                scopes: ["https://www.googleapis.com/auth/spreadsheets"]
-            });
-            const client = await auth.getClient();
-            const sheets = google.sheets({ version: "v4", auth: client });
+            const sheets = await createSheetsClient();
 
             const meta = await sheets.spreadsheets.get({ spreadsheetId });
             let targetSheet = meta.data.sheets.find((s) => s.properties.title === sheetTitle);
@@ -1654,7 +1662,8 @@ function createGoogleSheetReportModule({
         schedule: "0 * * * *",
         timeZone: "Asia/Tokyo",
         timeoutSeconds: 540,
-        memory: "1GiB"
+        memory: "16GiB",
+        cpu: 4
     }, async () => {
         const SPREADSHEET_ID = "1A9HyeH6j4TN2c7ITfzI5s1qQgQhyrqW4e-qLCrlafv0";
         const tokyoNow = dayjs().tz("Asia/Tokyo");
@@ -1693,15 +1702,10 @@ function createGoogleSheetReportModule({
                 .get();
             const allDocs = filterDocsToCompany(snap.docs.map((d) => d.data()), DEFAULT_COMPANY_ID);
 
-            const auth = new google.auth.GoogleAuth({
-                credentials: { client_email: serviceAccount.client_email, private_key: serviceAccount.private_key },
-                scopes: ["https://www.googleapis.com/auth/spreadsheets"]
-            });
-            const client = await auth.getClient();
-            const sheets = google.sheets({ version: "v4", auth: client });
+            const sheets = await createSheetsClient();
 
             const platformData = await generatePlatformAnalysisTab(sheets, SPREADSHEET_ID, year, month, allDocs, { reportEndDate });
-            if (platformData && NOTION_PAGES.platformAnalysis) {
+            if (process.env.SKIP_NOTION_SYNC !== "true" && platformData && NOTION_PAGES.platformAnalysis) {
                 const tokyoNow = dayjs().tz("Asia/Tokyo");
                 await syncNotionPlatformAnalysis(NOTION_PAGES.platformAnalysis, { year, month, tokyoNow, platformData });
             }
@@ -1720,7 +1724,8 @@ function createGoogleSheetReportModule({
         schedule: "50 8 * * *",
         timeZone: "Asia/Tokyo",
         timeoutSeconds: 540,
-        memory: "1GiB"
+        memory: "16GiB",
+        cpu: 4
     }, async () => {
         try {
             await assertReservationDataReady("scheduledPaxOccupancyReport");
@@ -1746,7 +1751,8 @@ function createGoogleSheetReportModule({
         schedule: "0 6 1 * *", // 매월 1일 06:00 JST
         timeZone: "Asia/Tokyo",
         timeoutSeconds: 300,
-        memory: "256MiB"
+        memory: "16GiB",
+        cpu: 4
     }, async () => {
         try {
             const spreadsheetId = "1A9HyeH6j4TN2c7ITfzI5s1qQgQhyrqW4e-qLCrlafv0";
@@ -1758,11 +1764,7 @@ function createGoogleSheetReportModule({
 
             console.log(`📅 [Monthly Briefing] ${year}년 ${month}월 브리핑 시트 자동 생성 시작...`);
 
-            const auth = new google.auth.GoogleAuth({
-                credentials: { client_email: serviceAccount.client_email, private_key: serviceAccount.private_key },
-                scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-            });
-            const sheets = google.sheets({ version: "v4", auth: await auth.getClient() });
+            const sheets = await createSheetsClient();
 
             const meta = await sheets.spreadsheets.get({ spreadsheetId });
             const allSheets = meta.data.sheets;

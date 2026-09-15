@@ -202,10 +202,6 @@ function buildSheetModel() {
     });
     values.push([]);
 
-    values.push(["API \uc785\ub825 \uc608\uc815 \ub370\uc774\ud130"]);
-    values.push(["date", "building", "confirmed_cleaning", "projected_cleaning", "setting", "min_headcount", "estimated_labor_cost", "confidence"]);
-    values.push(["--", "--", "--", "--", "--", "--", "--", "\ud655\uc815+\uc608\uc0c1 \ubd84\ub9ac \ud45c\uc2dc"]);
-
     return { values, monthMeta };
 }
 
@@ -465,7 +461,6 @@ async function applyLayout(sheets, sheetId) {
             "\uac74\ubb3c\ubcc4 3\uac1c\uc6d4 \uc694\uc57d",
             "\uc124\uc815 | \uac74\ubb3c\ubcc4 \uccad\uc18c \uae30\uc900",
             "\uc6b4\uc601 \uc785\ub825\uac12",
-            "API \uc785\ub825 \uc608\uc815 \ub370\uc774\ud130",
         ].includes(title);
 
         if (title === "\uc6b4\uc601 \uc785\ub825\uac12") manualInputTitleRow = idx;

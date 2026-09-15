@@ -216,6 +216,10 @@ export function buildPriceAttributionResult({
   const _dbgBeds24Count = _dbgAfterSuccess.filter((log) => String(log?.origin || "").toLowerCase().includes("beds24")).length;
   console.debug(`[Attribution] input=${_dbgTotal} | success_pass=${_dbgAfterSuccess.length} | beds24=${_dbgBeds24Count}`);
 
+  // 제외 사유별 건수와 사유당 샘플 1건 (아래에서 한 줄로 요약 출력)
+  const beds24DropReasonCounts = {};
+  const beds24DropSamples = {};
+
   const normalizedInterventions = _dbgAfterSuccess
     // Beds24 직접 ?�정분도 ?�일 attribution 규칙 ?�용 (origin ?�한 ?�음)
     .map((log) => {
@@ -237,7 +241,9 @@ export function buildPriceAttributionResult({
         windowHours,
         windowMs: windowHours * 60 * 60 * 1000
       };
-      // Beds24 로그가 ?�드 부족으�??�롭?�는 경우 경고
+      // 필드가 부족해 attribution에서 제외되는 Beds24 로그를 집계한다.
+      // 대부분 dateFrom을 기록하지 않던 옛 버전이 남긴 legacy 문서이며,
+      // 건별로 찍으면 콘솔을 뒤덮으므로 사유별 건수만 모아 아래에서 한 줄로 요약한다.
       const isBeds24 = String(log?.origin || "").toLowerCase().includes("beds24");
       if (isBeds24) {
         const dropReason = !Number.isFinite(appliedAtMs) ? "no_timestamp"
@@ -247,9 +253,10 @@ export function buildPriceAttributionResult({
           : roomSet.size === 0 ? "no_rooms"
           : null;
         if (dropReason) {
-          console.warn(`[Attribution] Beds24 log DROPPED (${dropReason}):`, { id: log.id, building: log.building, origin: log.origin, dateFrom: log.dateFrom, dateTo: log.dateTo, rooms: log.rooms });
-        } else {
-          console.debug(`[Attribution] Beds24 log OK ??building=${item.building} dateFrom=${dateFrom} dateTo=${dateTo} rooms=${[...roomSet]} fallbackDates=${[...item.fallbackTargetDates].length}`);
+          beds24DropReasonCounts[dropReason] = (beds24DropReasonCounts[dropReason] || 0) + 1;
+          if (!beds24DropSamples[dropReason]) {
+            beds24DropSamples[dropReason] = { id: log.id, building: log.building, origin: log.origin, dateFrom: log.dateFrom, dateTo: log.dateTo, rooms: log.rooms };
+          }
         }
       }
       return item;
@@ -257,6 +264,12 @@ export function buildPriceAttributionResult({
     .filter((item) => Number.isFinite(item.appliedAtMs) && item.building && item.dateFrom && item.dateTo && item.roomSet.size > 0)
     .filter((item) => !Number.isFinite(minInterventionMs) || item.appliedAtMs >= minInterventionMs)
     .sort((a, b) => a.appliedAtMs - b.appliedAtMs);
+
+  const beds24DropTotal = Object.values(beds24DropReasonCounts).reduce((sum, n) => sum + n, 0);
+  if (beds24DropTotal > 0) {
+    const breakdown = Object.entries(beds24DropReasonCounts).map(([reason, n]) => `${reason}:${n}`).join(", ");
+    console.warn(`[Attribution] Beds24 로그 ${beds24DropTotal}건 제외 (${breakdown}) — 사유별 샘플:`, beds24DropSamples);
+  }
 
   const _dbgNormBeds24 = normalizedInterventions.filter((i) => String(i.log?.origin || "").toLowerCase().includes("beds24")).length;
   console.debug(`[Attribution] normalizedInterventions=${normalizedInterventions.length} | beds24_passed=${_dbgNormBeds24} | minInterventionDate=${minInterventionDate}`);

@@ -23,6 +23,11 @@ export const BUILDING_DATA = {
   ],
   "사노시": [
     "독채"
+  ],
+  "STAY ARI Apartment Hotel": [
+    "101", "102", "103", "105", "106", "107", "108", "109", "110",
+    "201", "202", "203", "205", "206", "207", "208", "209", "210",
+    "302", "303", "305", "306", "307", "308", "309", "310"
   ]
 };
 
@@ -40,6 +45,7 @@ export const BUILDING_NAMES_EN = {
   "오쿠보A": "Okubo A",
   "오쿠보B": "Okubo B",
   "오쿠보C": "Okubo C",
+  "STAY ARI Apartment Hotel": "STAY ARI Apartment Hotel",
   "사노시": "Sano",
   "사노": "Sano",
   "사노시 사노": "Sano"
@@ -48,7 +54,8 @@ export const BUILDING_NAMES_EN = {
 // 건물 정렬 순서 (전체 — 다이쿄초 포함)
 export const BUILDING_ORDER = [
   "아라키초A", "아라키초B", "다이쿄초", "가부키초",
-  "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동", "사노시"
+  "다카다노바바", "오쿠보A동", "오쿠보B동", "오쿠보C동",
+  "STAY ARI Apartment Hotel", "사노시"
 ];
 
 // 다이쿄초: DB 보존, 화면에서는 항상 제외

@@ -3,12 +3,12 @@ const dayjs = require("dayjs");
 const utc = require("dayjs/plugin/utc");
 const timezone = require("dayjs/plugin/timezone");
 const { google } = require("googleapis");
-const serviceAccount = require("../serviceAccountKey.json");
+const { getGoogleServiceAccountCredentials } = require("./googleCredentials");
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
 if (!admin.apps.length) {
-  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+  admin.initializeApp();
 }
 
 const db = admin.firestore();
@@ -23,6 +23,7 @@ const ALL_BUILDINGS = [
   "오쿠보B동",
   "오쿠보C동",
   "다카다노바바",
+  "STAY ARI Apartment Hotel",
 ];
 let START = "";
 let END = "";
@@ -174,11 +175,9 @@ async function createOrReplaceSheet(sheets) {
 }
 
 async function uploadSheet(buildingData) {
+  const credentials = getGoogleServiceAccountCredentials();
   const auth = new google.auth.GoogleAuth({
-    credentials: {
-      client_email: serviceAccount.client_email,
-      private_key: serviceAccount.private_key,
-    },
+    credentials,
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
   const client = await auth.getClient();

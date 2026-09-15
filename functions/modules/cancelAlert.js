@@ -1,8 +1,8 @@
 /**
- * 당일 취소 알람: 취소 발생 시 입실일이 오늘 기준 앞뒤 6개월 이내인 예약만 Slack(당일취소알람 채널)로 전송.
- * - 일일보고서 취소 건수와 동일 기준(입실일 ±6개월).
- * - 채널 필터: 에어비엔비·부킹닷컴만 알람 전송 (그 외 채널은 건너뜀).
- * - 알람 형식은 당일 예약 알람과 동일한 톤으로 전송.
+ * 당일 취소 알람: 취소 발생 시 기간/채널 제한 없이 모든 취소 예약을 Slack(당일취소알람 채널)로 전송.
+ * - 예약일, 취소일, 입실일 제한 없음.
+ * - 채널 필터 없음: 모든 플랫폼 취소 알림 전송.
+ * - 알람 형식은 기존 취소 알림 양식을 유지.
  */
 const axios = require("axios");
 const dayjs = require("dayjs");
@@ -59,30 +59,6 @@ function formatCancelAlertMessage(booking) {
 }
 
 /**
- * 에어비엔비·부킹닷컴 채널만 허용 (당일취소알람 채널 필터).
- */
-function isAirbnbOrBooking(booking) {
-    const ref = String(booking.referer || booking.platform || "").toLowerCase();
-    if (ref.includes("airbnb")) return true;
-    if (ref.includes("booking")) return true;
-    return false;
-}
-
-/**
- * 입실일이 오늘 기준 앞뒤 6개월 이내인지 여부 (일일보고서 취소 건수와 동일 기준).
- */
-function isArrivalWithinSixMonths(booking) {
-    const arrival = booking.arrival;
-    if (!arrival) return false;
-    const tokyoNow = dayjs().tz("Asia/Tokyo");
-    const arrDate = dayjs(arrival).tz("Asia/Tokyo");
-    const sixMonthsAgo = tokyoNow.subtract(6, "month");
-    const sixMonthsLater = tokyoNow.add(6, "month");
-    return (arrDate.isAfter(sixMonthsAgo) || arrDate.isSame(sixMonthsAgo, "day"))
-        && (arrDate.isBefore(sixMonthsLater) || arrDate.isSame(sixMonthsLater, "day"));
-}
-
-/**
  * 당일 취소 알람을 Slack 웹훅으로 전송.
  * URL이 비어 있으면 전송하지 않음.
  * @param {Object} booking - 취소된 예약 문서 (normalized)
@@ -97,14 +73,6 @@ async function sendCancelAlert(booking) {
         console.warn("[CancelAlert] SLACK_CANCEL_ALERT_WEBHOOK_URL 미설정 — 알람 건너뜀");
         return;
     }
-    if (!isArrivalWithinSixMonths(booking)) {
-        console.log("[CancelAlert] 입실일이 ±6개월 이외 — 건너뜀", { arrival: booking.arrival, bookId: booking.bookId || booking.id });
-        return;
-    }
-    if (!isAirbnbOrBooking(booking)) {
-        console.log("[CancelAlert] 에어/부킹 외 채널 — 건너뜀", { referer: booking.referer, platform: booking.platform, bookId: booking.bookId || booking.id });
-        return;
-    }
     const text = formatCancelAlertMessage(booking);
     console.log("[CancelAlert] 전송 시도", { bookId: booking.bookId || booking.id, building: booking.building, arrival: booking.arrival });
     await axios.post(webhookUrl, { text }, {
@@ -116,6 +84,5 @@ async function sendCancelAlert(booking) {
 
 module.exports = {
     sendCancelAlert,
-    formatCancelAlertMessage,
-    isArrivalWithinSixMonths
+    formatCancelAlertMessage
 };

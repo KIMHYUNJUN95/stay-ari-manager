@@ -7,7 +7,7 @@
 | `SLACK_DAILY_REPORT_WEBHOOK_URL` | 일일 운영 리포트 | 필수. 08:00 JST + 변동 시 재전송 |
 | `SLACK_CLEANING_REPORT_WEBHOOK_URL` | 청소/셋팅 알림 | 08:50 JST, 당일 기준 |
 | `SLACK_SAME_DAY_BOOKING_WEBHOOK_URL` | 당일 예약 알람 | Beds24 웹훅 → 당일 예약 시 1건씩 |
-| `SLACK_CANCEL_ALERT_WEBHOOK_URL` | 당일 취소 알람 | 에어/부킹만, 입실일 ±6개월 |
+| `SLACK_CANCEL_ALERT_WEBHOOK_URL` | 당일 취소 알림 | 기간/채널 제한 없이 모든 취소 |
 | `SLACK_SYNC_ALERT_WEBHOOK_URL` | 동기화/리포트 실패 알람 | 미설정 시 일일→청소 URL로 fallback |
 
 ## 발송 경로
@@ -25,9 +25,9 @@
    - **트리거**: Beds24 예약 웹훅에서 `eventType===created` + 당일 예약+당일 체크인 + 확정 + 금액>0 + 다이쿄초 제외
    - 플랫폼 무관(에어/부킹/수기 등 전체)
 
-4. **당일 취소 알람** (`cancelAlert.js`)
+4. **당일 취소 알림** (`cancelAlert.js`)
    - **트리거**: Beds24 예약 웹훅에서 `eventType===cancelled`
-   - **필터**: 에어비엔비·부킹닷컴만, 입실일이 오늘 기준 앞뒤 6개월 이내
+   - **필터**: 없음. 예약일, 취소일, 입실일, 플랫폼과 관계없이 모든 취소 전송
 
 5. **동기화 알람** (`sendSyncAlert`)
    - **호출처**: `assertReservationDataReady` 실패, `scheduledBeds24Sync` 실패, `beds24BookingWebhook` 500, 일일/청소 스케줄 실패
