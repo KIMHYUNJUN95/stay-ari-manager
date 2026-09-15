@@ -146,6 +146,23 @@ function clearPriceCacheSession(companyId, building) {
   try { window.sessionStorage.removeItem(getPriceCacheSessionKey(companyId, building)); } catch (_) { /* noop */ }
 }
 
+// 일괄 삭제 대상 판정.
+//
+// 이 패널의 Delete Beds24 Blocks는 전 건물의 blackout/maintenance 문서를 한 번에
+// 취소 + 하드 삭제한다. 앱에서 캘린더로 건 블락(isInventoryOverrideBlock)도 source가
+// Beds24 Inventory라서 예전에는 여기에 전부 휩쓸렸다. 의도적으로 건 블락이 클릭 한
+// 번에 사라지면 복구할 기록이 없으므로 일괄 대상에서 제외한다.
+// (개별 Delete 버튼과 캘린더의 블락 해제는 그대로 동작한다.)
+function isManualBlockEntry(block) {
+  return block?.source === "Direct";
+}
+function isAppCreatedBlockEntry(block) {
+  return block?.isInventoryOverrideBlock === true;
+}
+function isBulkDeletableBlockEntry(block) {
+  return !isManualBlockEntry(block) && !isAppCreatedBlockEntry(block);
+}
+
 // 비활성 계정 minStay 기준값 (50 이상 = 비활성 판단)
 const INACTIVE_MINSTAY_THRESHOLD = 50;
 const PREFERRED_DUAL_ROOM_IDS = {
@@ -161,6 +178,8 @@ const PRICE_HISTORY_DISPLAY_LIMIT = 5;
 const PRICE_HISTORY_MAX_PER_CELL = 10;
 // 전체 이력 엔트리 상한. 로그는 최신순으로 처리되므로 초과분은 오래된 이력부터 잘린다.
 const PRICE_HISTORY_TOTAL_BUDGET = 100000;
+// 낙관적 가격(pending job)의 절대 만료. 정리 신호를 놓쳐도 이 시간이 지나면 실제 값이 보인다.
+const PENDING_PRICE_JOB_MAX_AGE_MS = 10 * 60 * 1000;
 const CALENDAR_NUMERIC_FONT_FAMILY = '"Bahnschrift", "DIN Alternate", "Inter", "Aptos", "Segoe UI", sans-serif';
 const EMPTY_CELL_STATE = { hasReservation: false, hasBlockingReservation: false, isFullyOccupied: false, isGap: false };
 
@@ -2177,6 +2196,11 @@ function ManualBookingModal({ initialBuilding, initialRoom, initialDates, onClos
         isBlock: isBlackout
       };
 
+      // 이 경로는 모달이 열린 채로 응답을 기다리므로 버튼을 잠가야 한다.
+      // setLoading(true)가 없어서 disabled={loading}이 사실상 항상 false였고,
+      // 느린 네트워크에서 두 번 누르면 Beds24에 같은 예약이 중복 생성됐다.
+      setLoading(true);
+
       const response = await axios.post(`${API_BASE_URL}/createBooking`, payload);
 
       if (response.data.success) {
@@ -3591,8 +3615,15 @@ function BuildingCalendar() {
     : null;
   const pendingPriceCellMap = useMemo(() => {
     const cellMap = {};
+    // 오래된 pending job은 무시한다.
+    //
+    // 낙관적 가격은 job이 정리될 때 사라지는데, 정리 신호를 놓치면(요청 취소, 스냅샷
+    // 유실) 새로고침 전까지 실제 가격을 영구히 덮어썼다. 절대 만료를 둬서 최악의 경우에도
+    // 스스로 풀리게 한다. 정상 job은 수 초~수십 초에 끝나므로 이 상한에 닿지 않는다.
+    const staleBefore = Date.now() - PENDING_PRICE_JOB_MAX_AGE_MS;
     pendingPriceJobList
       .filter((job) => job.building === calendarBuilding)
+      .filter((job) => !job.createdAtMs || job.createdAtMs >= staleBefore)
       .sort((a, b) => (a.createdAtMs || 0) - (b.createdAtMs || 0))
       .forEach((job) => {
         Object.entries(job.pendingCells || {}).forEach(([cellKey, cellData]) => {
@@ -4482,7 +4513,8 @@ function BuildingCalendar() {
       }
     } catch (err) {
       if (err.name === "AbortError") {
-        // 의도적 취소 — pricesError를 건드리지 않음 (finally는 여전히 실행됨)
+        // 의도적 취소 — pricesError를 건드리지 않음
+        // (onSettled는 아래 finally 바깥의 가드에서 호출된다)
         return;
       }
       console.error("Price fetch error:", err);
@@ -4499,9 +4531,15 @@ function BuildingCalendar() {
           priceFetchControllerRef.current = null;
           priceFetchRequestKeyRef.current = "";
         }
-        // 콜백에 적용 여부를 전달 — 콜백 내부에서 didApplyFreshPriceData로 분기
-        if (onSettled) onSettled(didApplyFreshPriceData); // always called so retry logic can run
       }
+      // onSettled는 이 가드 밖에서 호출한다.
+      //
+      // 예전에는 위 if 안에 있어서, 요청이 abort되면(다른 재조회가 끼어들면) 콜백이
+      // 아예 안 불렸다. price job 완료 직후 price_sync 신호가 겹치면 정확히 그 상황이
+      // 되어 clearPendingPriceJob이 실행되지 않고, pendingPriceJobs에 절대 만료가 없어
+      // pendingPriceCellMap이 새로고침 전까지 실제 가격을 영구히 덮어썼다.
+      // 취소된 요청은 새 데이터를 적용하지 못했으므로 false를 넘긴다.
+      if (onSettled) onSettled(didApplyFreshPriceData);
     }
   }, [companyId, gapCoverageDays, hasVisiblePriceCoverage, updatePriceCache, clearPriceRetry, schedulePriceRetry]);
 
@@ -6669,13 +6707,6 @@ function BuildingCalendar() {
             onClose={() => setSelectedReservation(null)}
             onRefresh={fetchReservations}
             isMobile={isMobile}
-            onOptimisticBlockStart={(blocks) => {
-              setOptimisticInventoryBlocks((prev) => [...prev, ...blocks]);
-            }}
-            onOptimisticBlockRollback={(blockIds) => {
-              const rollbackSet = new Set(blockIds || []);
-              setOptimisticInventoryBlocks((prev) => prev.filter((block) => !rollbackSet.has(block.id)));
-            }}
             companyId={companyId}
           />
         )}
@@ -7213,6 +7244,15 @@ function BuildingCalendar() {
               fetchPrices(true);
             }}
             companyId={companyId}
+            /* 낙관적 블락 바. 예전에는 이 두 콜백이 ReservationDetailModal에 붙어 있었는데
+               그 컴포넌트는 두 prop을 받지 않아서, 블락을 걸어도 바가 전혀 뜨지 않았다. */
+            onOptimisticBlockStart={(blocks) => {
+              setOptimisticInventoryBlocks((prev) => [...prev, ...blocks]);
+            }}
+            onOptimisticBlockRollback={(blockIds) => {
+              const rollbackSet = new Set(blockIds || []);
+              setOptimisticInventoryBlocks((prev) => prev.filter((block) => !rollbackSet.has(block.id)));
+            }}
           />
         )}
 
@@ -7559,6 +7599,14 @@ function BuildingCalendar() {
                           label: `${cell.roomName} ${cell.date}`,
                           error: batchResult.error
                         }));
+                        // 아무것도 적용되지 않았으므로 낙관적 패치를 되돌린다.
+                        //
+                        // 예전에는 복원이 catch 블록에만 있었는데, fetch는 .catch로,
+                        // 타임아웃은 Promise.race로 이미 resolve되어 catch에 도달하지 않았다.
+                        // 그래서 서버가 실패해도 minStay 값이 화면과 priceCacheRef에 남아
+                        // 건물을 바꿨다 돌아와도 되살아났다.
+                        setRoomPrices(backupRoomPrices);
+                        updatePriceCache(() => backupPriceCache);
                       }
 
                       const elapsedTime = ((Date.now() - startTime) / 1000).toFixed(2);
@@ -7583,7 +7631,14 @@ function BuildingCalendar() {
                       closeMinStayModal();
 
                       // ✅ 4단계: 최신 서버에서 최종 가격 새로고침 (Beds24 실제 상태 반영)
+                      //
+                      // 주석만 있고 실제 재조회가 없어서, 화면은 낙관적 값만 보고 있었다.
+                      // queued인 경우에도 pendingPriceCellMap이 위에 덮이므로 안전하다.
                       setLastPriceSyncByBuilding(prev => ({ ...prev, [calendarBuilding]: new Date() }));
+                      if (calendarBuilding && calendarBuilding !== "전체") {
+                        clearPriceCacheSession(companyId, calendarBuilding);
+                        fetchPrices(true, calendarBuilding);
+                      }
 
                     } catch (error) {
                       console.error("[Gap Apply] Fatal error:", error);
@@ -7718,7 +7773,8 @@ function BuildingCalendar() {
                       fontSize: "13px",
                       color: "#DC2626"
                     }}>
-                      Found <strong>{blockData.filter(b => b.source !== "Direct").length}</strong> Beds24 synced blocks. (Excluding {blockData.filter(b => b.source === "Direct").length} manual entries)
+                      Found <strong>{blockData.filter(isBulkDeletableBlockEntry).length}</strong> Beds24 synced blocks.
+                      (Excluding {blockData.filter(isManualBlockEntry).length} manual entries and {blockData.filter(isAppCreatedBlockEntry).length} blocks created here)
                     </div>
 
                     <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
@@ -7734,7 +7790,8 @@ function BuildingCalendar() {
                       </thead>
                       <tbody>
                         {blockData.map((block, idx) => {
-                          const isManual = block.source === "Direct";
+                          const isManual = isManualBlockEntry(block);
+                          const isAppBlock = isAppCreatedBlockEntry(block);
                           return (
                             <tr key={block.id} style={{
                               borderBottom: "1px solid #F3F4F6",
@@ -7754,7 +7811,7 @@ function BuildingCalendar() {
                                   background: isManual ? "#DBEAFE" : "#F3F4F6",
                                   color: isManual ? "#1D4ED8" : "#6B7280"
                                 }}>
-                                  {isManual ? "Direct" : block.source || "Beds24"}
+                                  {isManual ? "Direct" : isAppBlock ? "Calendar Block" : block.source || "Beds24"}
                                 </span>
                               </td>
                               <td style={{ padding: "10px 12px", textAlign: "center" }}>
@@ -7834,11 +7891,12 @@ function BuildingCalendar() {
                 </button>
 
                 {/* 수동입력(Direct) 제외한 Beds24 동기화 블록만 삭제 */}
-                {blockData.filter(b => b.source !== "Direct").length > 0 && (
+                {blockData.filter(isBulkDeletableBlockEntry).length > 0 && (
                   <button
                     onClick={() => {
-                      const deletableBlocks = blockData.filter(b => b.source !== "Direct");
-                      if (window.confirm(`Are you sure you want to delete ${deletableBlocks.length} Beds24 synced blocks?\n(${blockData.filter(b => b.source === "Direct").length} manual entries will be protected)`)) {
+                      const deletableBlocks = blockData.filter(isBulkDeletableBlockEntry);
+                      const protectedCount = blockData.filter(isManualBlockEntry).length + blockData.filter(isAppCreatedBlockEntry).length;
+                      if (window.confirm(`Are you sure you want to delete ${deletableBlocks.length} Beds24 synced blocks?\n(${protectedCount} manual entries and calendar-created blocks will be protected)`)) {
                         deleteBlockData(deletableBlocks.map(b => b.id));
                       }
                     }}
@@ -7855,7 +7913,7 @@ function BuildingCalendar() {
                       boxShadow: "0 4px 12px rgba(239, 68, 68, 0.3)"
                     }}
                   >
-                    {blockDeleting ? "Deleting..." : `Delete Beds24 Blocks (${blockData.filter(b => b.source !== "Direct").length})`}
+                    {blockDeleting ? "Deleting..." : `Delete Beds24 Blocks (${blockData.filter(isBulkDeletableBlockEntry).length})`}
                   </button>
                 )}
               </div>
@@ -10354,9 +10412,10 @@ function BuildingCalendar() {
                         const hasLastModMarker = !!(lastModInfo || latestSourceEntry);
                         const lastModMarkerColor = resolvedLastModSource === 'beds24'
                           ? "#EF4444"
-                          : resolvedLastModSource === 'system'
-                            ? "#2563EB"
-                            : "#94A3B8";
+                          // 확정 룰: beds24만 빨강, 그 외(system 및 s 없는 legacy)는 전부 파랑.
+                          // 회색은 이 프로젝트에 존재하지 않는다. legacy lm은 s가 없어서
+                          // resolvedLastModSource가 null이 되는데, 예전에는 그때 회색으로 칠했다.
+                          : "#2563EB";
                         // 이 셀의 가격 변경 이력 전체 (최신순). 라벨·시각·변동액이 모두 같은 로그에서 나온다.
                         const cellHistoryBucket = calendarBuilding && calendarBuilding !== "전체"
                           ? priceHistoryByRoomDate[`${calendarBuilding}__${roomSourceKey}__${dateStr}`]

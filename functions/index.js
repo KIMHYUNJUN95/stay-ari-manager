@@ -2324,9 +2324,14 @@ async function releasePriceSyncLock() {
     }
 }
 
-const PRICE_JOB_EXECUTION_LOCK_TTL_MS = 5 * 60 * 1000;
+// TTL은 job의 최대 실행시간(triggerPriceJobNow의 timeoutSeconds 540초)보다 길어야 한다.
+// 5분이던 시절에는 rate limit 백오프 + 검증 재시도로 6분 넘게 도는 job의 락이 만료되어
+// 두 번째 job이 같은 roomId에 동시에 POST하고, 캐시를 read-modify-write로 덮어썼다.
+// stuck job 복구 임계값(15분)과 같은 값으로 맞춘다.
+const PRICE_JOB_EXECUTION_LOCK_TTL_MS = 15 * 60 * 1000;
 async function acquirePriceJobExecutionLock(lockedBy = "priceJobWorker") {
     const lockRef = db.collection("sync_status").doc("price_job_execution_lock");
+    const lockId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     try {
         let acquired = false;
         let ageMinutes = null;
@@ -2344,21 +2349,108 @@ async function acquirePriceJobExecutionLock(lockedBy = "priceJobWorker") {
             tx.set(lockRef, {
                 lockedAt: admin.firestore.FieldValue.serverTimestamp(),
                 status: "running",
-                lockedBy
+                lockedBy,
+                lockId
             });
             acquired = true;
         });
-        return { acquired, ageMinutes };
+        return { acquired, ageMinutes, lockId: acquired ? lockId : null };
     } catch (e) {
         console.error(`[PriceJobLock] acquire failed (${lockedBy}):`, e.message);
-        return { acquired: false, ageMinutes: null, error: e };
+        return { acquired: false, ageMinutes: null, lockId: null, error: e };
     }
 }
-async function releasePriceJobExecutionLock() {
+/**
+ * 소유자 확인 후 해제.
+ *
+ * 예전에는 소유 여부를 보지 않고 무조건 삭제해서, TTL 만료로 락을 뺏긴 job이 뒤늦게
+ * 끝나며 후속 job의 락까지 지워버렸다. lockId가 주어지면 내 것일 때만 지운다.
+ */
+async function releasePriceJobExecutionLock(lockId = null) {
+    const lockRef = db.collection("sync_status").doc("price_job_execution_lock");
     try {
-        await db.collection("sync_status").doc("price_job_execution_lock").delete();
+        if (!lockId) {
+            await lockRef.delete();
+            return;
+        }
+        await db.runTransaction(async (tx) => {
+            const snap = await tx.get(lockRef);
+            if (!snap.exists) return;
+            if (snap.data()?.lockId && snap.data().lockId !== lockId) {
+                console.warn("[PriceJobLock] release skipped — 락 소유자가 바뀌었다");
+                return;
+            }
+            tx.delete(lockRef);
+        });
     } catch (e) {
         console.warn("[PriceJobLock] release failed:", e.message);
+    }
+}
+
+/**
+ * price_sync 건물 문서를 건드려 프론트 실시간 구독을 깨운다.
+ *
+ * 프론트는 price_sync/{building} 부모 문서를 구독한다. rooms/{roomId}와 월 캐시만 쓰는
+ * 경로(가격 job의 캐시 패치, syncMinStayOnly)는 이 문서를 안 바꿔서, 다른 사용자에게
+ * 변경이 전달되지 않았다. 실패해도 본 작업에 영향이 없도록 조용히 삼킨다.
+ *
+ * @param {string|null} building 건물명. 없으면 아무것도 하지 않는다.
+ * @param {string} source 디버깅용 출처 표기
+ */
+async function touchPriceSyncBuildingSignal(building, source = "unknown") {
+    if (!building || building === "전체") return;
+    try {
+        await db.collection("price_sync").doc(building).set({
+            lastChangeAt: admin.firestore.FieldValue.serverTimestamp(),
+            lastChangeBy: source
+        }, { merge: true });
+    } catch (e) {
+        console.warn(`[PriceSyncSignal] touch 실패 (${building}/${source}):`, e.message);
+    }
+}
+
+/**
+ * price_sync 건물 문서의 무효화 목록을 트랜잭션으로 정리한다.
+ *
+ * 동기화 중에 도착한 웹훅의 arrayUnion을 잃지 않도록, 스냅샷 기반 배열 치환 대신
+ * "현재 문서를 다시 읽고 이번에 동기화한 roomId만 제거"하는 방식으로 쓴다.
+ *
+ * @param {FirebaseFirestore.DocumentReference} buildingRef price_sync/{building}
+ * @param {{syncedRoomIds: Set<string>, extraInvalidatedRoomIds?: string[]}} options
+ */
+async function withInvalidationCleanupTransaction(buildingRef, { syncedRoomIds, extraInvalidatedRoomIds = [] } = {}) {
+    const syncedSet = new Set([...(syncedRoomIds || [])].map(String));
+    const extras = [...new Set((extraInvalidatedRoomIds || []).map(String).filter(Boolean))];
+    try {
+        await db.runTransaction(async (tx) => {
+            const snap = await tx.get(buildingRef);
+            const data = snap.exists ? snap.data() : {};
+
+            const nextInvalidated = [...new Set([
+                ...((data.invalidatedRoomIds || []).map(String)),
+                ...extras
+            ])].filter((id) => !syncedSet.has(id) || extras.includes(id));
+            const nextReservationInvalidated = ((data.reservationInvalidatedRoomIds || []).map(String))
+                .filter((id) => !syncedSet.has(id));
+
+            tx.set(buildingRef, {
+                invalidatedRoomIds: nextInvalidated,
+                pendingInvalidationCount: nextInvalidated.length,
+                reservationInvalidatedRoomIds: nextReservationInvalidated,
+                pendingReservationInvalidationCount: nextReservationInvalidated.length,
+                invalidatedAt: nextInvalidated.length > 0
+                    ? (data.invalidatedAt || admin.firestore.FieldValue.serverTimestamp())
+                    : admin.firestore.FieldValue.delete(),
+                invalidatedBy: nextInvalidated.length > 0
+                    ? (data.invalidatedBy || "priceWebhook")
+                    : admin.firestore.FieldValue.delete(),
+                reservationInvalidatedAt: nextReservationInvalidated.length > 0
+                    ? (data.reservationInvalidatedAt || admin.firestore.FieldValue.serverTimestamp())
+                    : admin.firestore.FieldValue.delete()
+            }, { merge: true });
+        });
+    } catch (e) {
+        console.warn("[Price Sync] 무효화 목록 정리 실패:", e.message);
     }
 }
 
@@ -3009,8 +3101,6 @@ async function syncAllPrices({
             const remainingInvalidatedRoomIds = runFullSync
                 ? roomsToFetch.map((room) => String(room.roomId)).filter((id) => !syncedRoomIds.has(id))
                 : [...invalidatedRoomIds].filter((id) => !syncedRoomIds.has(String(id)));
-            const remainingReservationInvalidatedRoomIds = [...reservationInvalidatedRoomIds]
-                .filter((id) => !syncedRoomIds.has(String(id)));
 
             // 건물 요약 정보 업데이트
             await buildingRef.set({
@@ -3024,21 +3114,21 @@ async function syncAllPrices({
                 targetRoomCount: roomsToFetch.length,
                 dateFrom: fromDate,
                 dateTo: toDate,
-                outputImpact: buildPriceOutputImpact({ building: buildingName, fromDate, toDate }),
-                invalidatedRoomIds: remainingInvalidatedRoomIds,
-                pendingInvalidationCount: remainingInvalidatedRoomIds.length,
-                reservationInvalidatedRoomIds: remainingReservationInvalidatedRoomIds,
-                pendingReservationInvalidationCount: remainingReservationInvalidatedRoomIds.length,
-                invalidatedAt: remainingInvalidatedRoomIds.length > 0
-                    ? (buildingCache.invalidatedAt || admin.firestore.FieldValue.serverTimestamp())
-                    : admin.firestore.FieldValue.delete(),
-                invalidatedBy: remainingInvalidatedRoomIds.length > 0
-                    ? (buildingCache.invalidatedBy || "priceWebhook")
-                    : admin.firestore.FieldValue.delete(),
-                reservationInvalidatedAt: remainingReservationInvalidatedRoomIds.length > 0
-                    ? (buildingCache.reservationInvalidatedAt || admin.firestore.FieldValue.serverTimestamp())
-                    : admin.firestore.FieldValue.delete()
+                outputImpact: buildPriceOutputImpact({ building: buildingName, fromDate, toDate })
             }, { merge: true });
+
+            // 무효화 목록은 트랜잭션으로 따로 정리한다.
+            //
+            // 예전에는 위 set에 배열을 통째로 넣었는데, 그 배열의 기준값(buildingCache)은
+            // 건물 처리 "시작 시점" 스냅샷이다. 처리 중에 Beds24 웹훅이 도착해
+            // arrayUnion으로 roomId를 추가해도, 끝날 때 옛 배열로 덮어써서 그 무효화가
+            // 통째로 사라졌다. 웹훅은 이미 소비되어 재시도도 없으므로 다음 풀 대사까지
+            // 옛 가격이 남았다. 여기서는 "이번에 실제로 동기화한 roomId만 제거"한다.
+            await withInvalidationCleanupTransaction(buildingRef, {
+                syncedRoomIds,
+                // 풀 싱크는 실패한 방을 새로 무효화 대상으로 올리므로 그 목록도 함께 넘긴다.
+                extraInvalidatedRoomIds: runFullSync ? remainingInvalidatedRoomIds : []
+            });
 
             syncResults[buildingName] = {
                 success: runFullSync ? buildingFullComplete : successInBuilding === roomsToFetch.length,
@@ -3270,6 +3360,11 @@ async function syncMinStayOnly({ reason = "scheduled", targetBuildings = null } 
             }
 
             console.log(`[MinStay Reconcile] ${buildingName}: ${updatedInBuilding}개 방 갱신`);
+            // rooms/{roomId}만 고쳐서는 프론트 실시간 구독이 안 걸린다.
+            // minStay는 듀얼 ID 중 어느 방의 가격을 보여줄지를 좌우하므로 신호가 필요하다.
+            if (updatedInBuilding > 0) {
+                await touchPriceSyncBuildingSignal(buildingName, `minStayReconcile:${reason}`);
+            }
             await new Promise(r => setTimeout(r, 1000));
         }
 
@@ -4696,10 +4791,56 @@ function mergeArakichoA501PriceRoomIds(roomIds = []) {
     return [...new Set([...normalizeRoomIdList(roomIds), ...ARAKICHO_A_501_DUAL_ROOM_IDS])];
 }
 
+/**
+ * 가격/재고 입력값 검증.
+ *
+ * buildBeds24CalendarUpdatesFromDates는 p1을 parseFloat로 넘기는데, 숫자가 아니면 NaN이
+ * 되고 JSON.stringify가 이를 null로 직렬화한다. Beds24는 price1: null을 "가격 삭제"로
+ * 처리하므로, 빈 입력 하나가 실제 판매가를 지워버린다. 그래서 큐에 넣기 전에 막는다.
+ *
+ * @returns {string|null} 오류 메시지. 문제 없으면 null.
+ */
+function validatePriceDateValues(datesObj) {
+    if (!datesObj || typeof datesObj !== "object") return null;
+    for (const [dateKey, value] of Object.entries(datesObj)) {
+        if (!value || typeof value !== "object") continue;
+        for (const field of ["p1", "p2", "p3"]) {
+            const raw = value[field];
+            if (raw === undefined || raw === null) continue;
+            // 'REMOVE' / -1은 의도적인 가격 삭제 신호라 그대로 허용한다.
+            if (raw === "REMOVE" || raw === -1 || raw === "-1") continue;
+            const parsed = parseFloat(raw);
+            if (!Number.isFinite(parsed) || parsed < 0) {
+                return `Invalid ${field} for ${dateKey}: ${JSON.stringify(raw)}`;
+            }
+        }
+        for (const field of ["m", "mx", "na"]) {
+            const raw = value[field];
+            if (raw === undefined || raw === null || raw === "") continue;
+            const parsed = parseInt(raw, 10);
+            if (!Number.isFinite(parsed)) {
+                return `Invalid ${field} for ${dateKey}: ${JSON.stringify(raw)}`;
+            }
+        }
+    }
+    return null;
+}
+
 exports.setRoomPrices = onRequest({ cors: true, timeoutSeconds: 120, memory: "1GiB", cpu: 1, minInstances: 1, maxInstances: 4 }, async (req, res) => {
     try {
         const { companyId, roomId, roomIds, dates, building, worker, workerEmail, roomUpdates } = req.body;
         if (!companyId) return res.status(400).json({ success: false, error: "Missing companyId" });
+
+        const datesToValidate = Array.isArray(roomUpdates) && roomUpdates.length > 0
+            ? roomUpdates.map((roomUpdate) => roomUpdate?.dates)
+            : [dates];
+        for (const candidate of datesToValidate) {
+            const validationError = validatePriceDateValues(candidate);
+            if (validationError) {
+                console.warn(`[setRoomPrices] 입력 거부: ${validationError}`);
+                return res.status(400).json({ success: false, error: validationError });
+            }
+        }
 
         let effectiveBuilding = building || null;
         let normalizedRoomUpdates = [];
@@ -5387,7 +5528,13 @@ async function getSupersededPriceJobIntent({
     }
 
     const excludedIds = new Set([jobId, ...(excludeJobIds || []).map(String)]);
-    const comparableStatuses = ["queued", "processing", "completed", "partial_failed", "failed"];
+    // "failed"는 제외한다.
+    //
+    // 예전에는 실패한 job도 superseding으로 쳐서, 나중 job이 Beds24 검증에 실패했는데도
+    // 앞선 job이 "이미 덮어써졌다"며 전 날짜를 건너뛰고 completed로 마감했다. 결과적으로
+    // Beds24에는 어느 가격도 반영되지 않았는데 프론트는 성공 토스트를 받았다.
+    // (partial_failed는 일부 성공분이 실제로 존재하므로 남겨 둔다.)
+    const comparableStatuses = ["queued", "processing", "completed", "partial_failed"];
     const sameBuildingSnap = await db.collection("beds24_price_jobs")
         .where("status", "in", comparableStatuses)
         .where("companyId", "==", companyId)
@@ -5670,6 +5817,7 @@ async function patchVerifiedPriceJobCache({
 
 async function processPriceJob(jobId) {
     const jobRef = db.collection("beds24_price_jobs").doc(jobId);
+    let signalBuilding = null;
     const apiGuard = await getBeds24ApiGuardState();
     if (apiGuard.active) {
         console.log(`[PriceJob ${jobId}] Beds24 API cooldown active (${apiGuard.remainingSec}s remaining)`);
@@ -5680,11 +5828,26 @@ async function processPriceJob(jobId) {
         };
     }
 
-    // 기존 price sync lock 재사용 (scheduled/webhook sync와 동시 write 방지)
-    const { acquired } = await acquirePriceJobExecutionLock("priceJobWorker");
+    // job 간 직렬화
+    const { acquired, lockId: jobLockId } = await acquirePriceJobExecutionLock("priceJobWorker");
     if (!acquired) {
         console.log(`[PriceJob ${jobId}] 락 점유 중 — 스킵`);
         return { skipped: true, reason: "lock_busy" };
+    }
+
+    // scheduled/webhook sync와의 상호 배제.
+    //
+    // 주석만 "기존 price sync lock 재사용"이라고 되어 있었을 뿐 실제로는 별개 문서라
+    // 배타가 전혀 없었다. 그래서 job이 POST 후 검증 재시도를 도는 사이 15분 주기
+    // scheduled sync가 Beds24에서 옛 가격을 읽어 캐시를 덮고, lm에 "Beds24가 되돌렸다"는
+    // 허위 이력까지 남겼다. 여기서 실제로 같은 락을 잡는다.
+    // 못 잡으면 job은 queued로 남고 1분 뒤 워커가 다시 집는다. (sync 쪽은 queued job이
+    // 있으면 shouldYieldToQueuedPriceJob으로 스스로 양보하므로 서로 굶지 않는다.)
+    const { acquired: syncLockAcquired } = await acquirePriceSyncLock(`priceJob:${jobId}`);
+    if (!syncLockAcquired) {
+        console.log(`[PriceJob ${jobId}] price sync 진행 중 — 스킵 (다음 워커 주기에 재시도)`);
+        await releasePriceJobExecutionLock(jobLockId);
+        return { skipped: true, reason: "price_sync_lock_busy" };
     }
 
     try {
@@ -5698,6 +5861,7 @@ async function processPriceJob(jobId) {
                 const preData = preSnap.data();
                 const cId = preData.companyId;
                 const cBuilding = preData.building;
+                signalBuilding = cBuilding || signalBuilding;
                 const currentJobType = getPriceJobType(preData);
                 currentJobCreatedMs = getPriceJobCreatedAtMs(preData, preSnap);
                 if (cId && cBuilding) {
@@ -6271,7 +6435,14 @@ async function processPriceJob(jobId) {
         console.error(`[PriceJob ${jobId}] 처리 중 오류:`, e.message);
         throw e;
     } finally {
-        await releasePriceJobExecutionLock();
+        // 다른 사용자에게 실시간 신호를 보낸다.
+        //
+        // job은 rooms/{roomId}와 월 캐시만 써서 price_sync 건물 문서가 안 바뀌었다.
+        // 프론트의 실시간 구독은 그 건물 문서를 보므로, A가 가격을 바꿔도 같은 건물을
+        // 열어둔 B의 캘린더는 문서화된 경로로는 아무 신호도 못 받았다.
+        await touchPriceSyncBuildingSignal(signalBuilding, `priceJob:${jobId}`);
+        await releasePriceSyncLock();
+        await releasePriceJobExecutionLock(jobLockId);
     }
 }
 
@@ -6881,10 +7052,17 @@ exports.priceWebhook = onRequest({ cors: true, timeoutSeconds: 300, memory: "16G
             const snap = await priceSyncDoc.get();
             const priceSyncState = snap.data() || {};
             const existingIds = new Set((priceSyncState.invalidatedRoomIds || []).map(String));
-            const invalidatedAt = priceSyncState.invalidatedAt?.toDate?.() || null;
+            // 중복 웹훅 합치기 판정은 "웹훅이 만든 무효화"만 기준으로 해야 한다.
+            //
+            // 예전에는 공용 invalidatedAt을 봤는데, 예약 생성/취소로 도는
+            // invalidatePriceCacheForReservationMutations가 같은 invalidatedRoomIds와
+            // invalidatedAt을 쓴다. 그래서 예약 변경 직후 5분 안에 Beds24에서 진짜 가격을
+            // 바꾸면, 그 웹훅이 "중복"으로 간주되어 통째로 버려졌다 — 즉시 sync도, 이력도,
+            // 프론트 신호도 없이. 웹훅 전용 타임스탬프를 따로 본다.
+            const webhookInvalidatedAt = priceSyncState.priceWebhookInvalidatedAt?.toDate?.() || null;
             const recentlyDuplicatedWhileInvalidated = relatedRoomIds.every((id) => existingIds.has(id)) &&
-                invalidatedAt &&
-                (Date.now() - invalidatedAt.getTime()) < PRICE_WEBHOOK_INVALIDATION_DEBOUNCE_MS;
+                webhookInvalidatedAt &&
+                (Date.now() - webhookInvalidatedAt.getTime()) < PRICE_WEBHOOK_INVALIDATION_DEBOUNCE_MS;
 
             if (recentlyDuplicatedWhileInvalidated) {
                 console.log(`[priceWebhook] duplicate webhook coalesced for ${building}/${roomName} (${roomIdStr})`);
@@ -6911,6 +7089,8 @@ exports.priceWebhook = onRequest({ cors: true, timeoutSeconds: 300, memory: "16G
             await priceSyncDoc.set({
                 invalidatedRoomIds: Array.from(existingIds),
                 invalidatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                // 중복 웹훅 합치기 판정 전용. 예약발 무효화와 섞이지 않게 분리해 둔다.
+                priceWebhookInvalidatedAt: admin.firestore.FieldValue.serverTimestamp(),
                 invalidatedBy: "priceWebhook (external change)",
                 pendingInvalidationCount: existingIds.size,
                 outputImpact: buildPriceOutputImpact({
@@ -7531,9 +7711,28 @@ async function createBeds24BlackoutOverrideBatch(roomIds, arrival, departure) {
 
     const response = await beds24PostV2WithGuard("/inventory/rooms/calendar", payload);
 
+    // roomId를 2개 이상 보냈으면 응답도 같은 길이의 배열이어야 한다.
+    //
+    // getBeds24BatchResult는 data가 배열이 아니면 모든 index에 같은 값을 돌려주고,
+    // 배열이 짧으면 undefined를 돌려준다. 예전에는 undefined도 "오류 없음"으로 읽어
+    // 성공 처리했다. 그러면 Beds24엔 블락이 없는데 Firestore 문서·ov·가상 바는 다 생겨
+    // 화면상 막힌 방이 실제로는 계속 팔린다. 확인 불가능한 응답은 실패로 본다.
+    const batchData = Array.isArray(response?.data)
+        ? response.data
+        : (Array.isArray(response?.data?.data) ? response.data.data : null);
+    if (ids.length > 1 && (!batchData || batchData.length !== ids.length)) {
+        const detail = `Beds24 응답을 roomId와 대응시킬 수 없습니다 (요청 ${ids.length}건, 응답 ${batchData ? batchData.length : "비배열"})`;
+        console.error(`[createBeds24BlackoutOverrideBatch] ${detail}`);
+        return Object.fromEntries(ids.map((rid) => [rid, { success: false, error: detail }]));
+    }
+
     const resultByRoomId = {};
     ids.forEach((rid, index) => {
         const item = getBeds24BatchResult(response, index);
+        if (item === undefined || item === null) {
+            resultByRoomId[rid] = { success: false, error: "Beds24 응답에 해당 roomId 결과가 없습니다" };
+            return;
+        }
         const itemErrors = item?.errors && item.errors.length > 0
             ? item.errors.map((e) => e.message).join(", ")
             : null;
@@ -7640,6 +7839,26 @@ exports.createBooking = onRequest({ cors: true, memory: "1GiB", timeoutSeconds: 
                         .catch(cacheErr => console.warn("[createBooking] Segment cache sync failed:", cacheErr.message));
                 } catch (segErr) {
                     console.error(`[createBooking] Segment failed (roomId=${seg.roomId} ${seg.arrival}~${seg.departure}):`, segErr.message);
+
+                    // Beds24에는 이미 blackout이 걸렸는데 Firestore 단계에서 실패한 경우,
+                    // 그대로 두면 "캘린더에는 아무것도 안 보이는데 방은 판매 정지"인 고아
+                    // 블락이 된다. 해제할 문서도 ov도 없어 UI로는 손댈 수 없다.
+                    // 프론트에는 "아직 예약 가능하니 재시도하라"고 안내하므로, 그 안내가
+                    // 사실이 되도록 Beds24 쪽을 되돌린다.
+                    if (overrideResultBySegment.get(seg)?.success) {
+                        try {
+                            await clearBeds24BlackoutOverride({
+                                roomId: seg.roomId,
+                                arrival: seg.arrival,
+                                departure: seg.departure,
+                                restoreNumAvailByDate: numAvailSnapshots.get(seg) || null
+                            });
+                            console.log(`[createBooking] Segment 보상 롤백 완료 (roomId=${seg.roomId})`);
+                        } catch (rollbackErr) {
+                            console.error(`[createBooking] Segment 보상 롤백 실패 (roomId=${seg.roomId}):`, rollbackErr.message);
+                        }
+                    }
+
                     results.push({ success: false, error: segErr.message, roomId: String(seg.roomId || ""), room: seg.room || "", arrival: seg.arrival, departure: seg.departure });
                 }
             }
@@ -7975,6 +8194,18 @@ exports.cancelBooking = onRequest({ cors: true, memory: "1GiB", timeoutSeconds: 
         if (!bookId) return res.status(400).json({ error: "Missing bookId" });
         let existingSnap = await db.collection("reservations").doc(String(bookId)).get();
         let existingData = existingSnap.exists ? existingSnap.data() : {};
+
+        // 테넌트 격리. updateBooking에는 있던 검증이 여기엔 빠져 있었다.
+        // 블락 문서 ID는 inventory-blackout:<roomId>:<arrival>:<departure>로 완전히 추측
+        // 가능하므로 노출도가 특히 높다. 문서가 없을 때(Beds24에만 있는 예약)는 기존처럼
+        // 그대로 진행해서 현재 동작을 바꾸지 않는다.
+        if (existingSnap.exists) {
+            const effectiveCompanyId = getEffectiveCompanyId(existingData);
+            if (effectiveCompanyId && effectiveCompanyId !== companyId) {
+                return res.status(403).json({ success: false, error: "companyId mismatch" });
+            }
+        }
+
         const isInventoryOverrideBlock = existingData?.isInventoryOverrideBlock === true;
 
         // V2 취소: status: "cancelled" (문자열)
