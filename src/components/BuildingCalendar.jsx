@@ -2645,17 +2645,102 @@ const filterBtnStyle = {
   color: "#1D1D1F"
 };
 
-const dayBtnStyle = {
-  padding: "6px 10px",
-  borderRadius: "6px",
-  border: "1px solid #E5E5EA",
-  background: "#F2F2F7",
-  fontSize: "11px",
-  cursor: "pointer",
-  color: "#86868B"
+
+// ── 선택 범위 패널 스타일 ─────────────────────────────────────────────
+// 축이 3개라 칩을 한 줄에 몰아넣으면 줄바꿈이 뒤엉켜 읽기 어렵다.
+// 라벨 열을 고정하고 축마다 한 줄씩, 넘치면 가로 스크롤한다.
+const scopePanelStyle = {
+  border: "1px solid #E5E7EB",
+  borderRadius: "12px",
+  background: "#FFFFFF",
+  boxShadow: "0 1px 3px rgba(16, 24, 40, 0.06)",
+  overflow: "hidden",
+  width: "100%"
 };
 
-// 건물/객실 분석 데이터 계산 (순수 함수 형태로 컴포넌트 바깥에서 정의하여 최적화)
+const scopePanelHeaderStyle = {
+  display: "flex",
+  alignItems: "center",
+  gap: "10px",
+  padding: "9px 14px",
+  background: "linear-gradient(180deg, #FAFAFF 0%, #F5F5FB 100%)",
+  borderBottom: "1px solid #EEF0F4"
+};
+
+const scopeRowStyle = {
+  display: "flex",
+  alignItems: "center",
+  gap: "10px",
+  padding: "8px 14px",
+  borderTop: "1px solid #F5F6F8",
+  minWidth: 0
+};
+
+const scopeAxisLabelStyle = {
+  flexShrink: 0,
+  width: "52px",
+  fontSize: "10px",
+  fontWeight: "800",
+  color: "#8A94A6",
+  letterSpacing: "0.7px",
+  textTransform: "uppercase"
+};
+
+// 칩은 전부 보이게 줄바꿈한다.
+// 가로 스크롤로 감추면 객실이 11개인 건물에서 뒤쪽 객실을 놓친다.
+// 축마다 라벨 열이 따로 있어서, 줄바꿈이 생겨도 어느 축인지 헷갈리지 않는다.
+const scopeTrackStyle = {
+  display: "flex",
+  alignItems: "center",
+  gap: "6px",
+  flex: 1,
+  minWidth: 0,
+  flexWrap: "wrap",
+  rowGap: "6px"
+};
+
+const scopeChipStyle = (active) => ({
+  flexShrink: 0,
+  padding: "6px 12px",
+  borderRadius: "8px",
+  border: active ? "1px solid #4F46E5" : "1px solid #DFE3EA",
+  background: active ? "#4F46E5" : "#FFFFFF",
+  color: active ? "#FFFFFF" : "#475467",
+  fontSize: "12px",
+  fontWeight: active ? "700" : "500",
+  cursor: "pointer",
+  whiteSpace: "nowrap",
+  lineHeight: 1.3,
+  transition: "background 0.15s ease, border-color 0.15s ease, color 0.15s ease"
+});
+
+// 금·토·일처럼 실제로 자주 쓰는 묶음은 크게 두고, 개별 요일은 작게 뒤에 붙인다.
+const scopePresetChipStyle = (active) => ({
+  ...scopeChipStyle(active),
+  padding: "6px 14px",
+  fontWeight: "700",
+  border: active ? "1px solid #4F46E5" : "1px solid #C7D2FE",
+  background: active ? "#4F46E5" : "#EEF2FF",
+  color: active ? "#FFFFFF" : "#4338CA"
+});
+
+const scopeMiniChipStyle = (active) => ({
+  ...scopeChipStyle(active),
+  padding: "5px 8px",
+  fontSize: "11px",
+  minWidth: "30px",
+  textAlign: "center"
+});
+
+const scopeDividerStyle = {
+  flexShrink: 0,
+  width: "1px",
+  height: "18px",
+  background: "#E5E7EB",
+  margin: "0 4px"
+};
+
+// 건물/객실 분석 데이터 계산// 건물/객실 분석 데이터 계산 (순수 함수 형태로 컴포넌트 바깥에서 정의하여 최적화)
 function calculateBuildingMetrics(targetReservations, targetRooms, daysInMonth, year, month) {
   const uniqueRoomNames = [...new Set(targetRooms.map(r => r.name))];
 
@@ -3024,8 +3109,22 @@ function BuildingCalendar() {
   const [showPriceInsightModal, setShowPriceInsightModal] = useState(false);
   const [insightSelectedBuilding, setInsightSelectedBuilding] = useState(null); // 모달 내 건물 선택
   const [gapEditMode, setGapEditMode] = useState(false); // Gap 설정 모드
-  // 대량 선택 모드 — 가격/Gap 편집 중일 때만 날짜 열 클릭·주간 칩이 동작한다.
+  // 대량 선택 모드 — 가격/Gap 편집 중일 때만 축 스트립·날짜 열 클릭이 동작한다.
   const isBulkSelectMode = priceMode || gapEditMode;
+
+  // ── 선택 축 (2축 교차 모델) ──────────────────────────────────────────
+  //
+  //   선택 = 객실축 × (기간축 ∩ 요일축) − 예약·블락  ± 캘린더 직접 조작
+  //
+  // 각 축은 "비어 있으면 전체"다. 세 축이 전부 비면 축 기여는 0이고
+  // 드래그로 찍은 셀만 남는다. 예전 필터 버튼은 눌린 셀을 자루에 넣기만 해서
+  // 재클릭 해제도, 기간∩요일 교차("다음 주 금토일")도 표현할 수 없었다.
+  const [scopeRooms, setScopeRooms] = useState([]);   // [] = 전체 객실
+  const [scopeWeeks, setScopeWeeks] = useState([]);   // [] = 전체 기간 (월요일 시작일 문자열)
+  const [scopeDows, setScopeDows] = useState([]);     // [] = 전 요일 (0=일 ~ 6=토)
+  const scopeActive = scopeRooms.length > 0 || scopeWeeks.length > 0 || scopeDows.length > 0;
+  // 축이 현재 기여하고 있는 셀 키. 축이 바뀌면 이 몫만 교체하고 수동 선택은 보존한다.
+  const scopeCellKeysRef = useRef(new Set());
   // 선택 요약용. 선택에 실제로 포함된 객실 수 (선택된 날짜 수와 곱해 보여준다)
   const selectedRoomCountInSelection = useMemo(
     () => new Set(selectedCells.map((c) => c.room)).size,
@@ -3248,7 +3347,12 @@ function BuildingCalendar() {
     clearQueuedCellSelection();
     selectionGenerationRef.current += 1; // 세대 증가 → 진행 중인 rAF flush 무효화
     selectedCellKeySetRef.current = new Set();
+    scopeCellKeysRef.current = new Set();
+    setScopeRooms([]);
+    setScopeWeeks([]);
+    setScopeDows([]);
     setSelectedCells([]);
+    setBulkSelectMsg('');
   }, [clearQueuedCellSelection]);
 
   const queueCellSelection = useCallback((roomName, dateStr, action) => {
@@ -4160,79 +4264,50 @@ function BuildingCalendar() {
     setHoveredRoom(null);
   }, [clearCellSelection]);
 
-  // 객실 선택 토글
+  // 객실 축 토글
   const toggleRoomSelection = (room) => {
-    if (selectedRooms.includes(room)) {
-      // 이미 선택된 방이면 제거
-      setSelectedCells(prev => prev.filter(c => c.room !== room));
-      const remaining = selectedRooms.filter(r => r !== room);
-      setSelectedRoom(remaining.length > 0 ? remaining[remaining.length - 1] : null);
-    } else {
-      // 날짜가 없으면 현재 뷰의 전체 날짜 사용
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-
-      const datesToUse = selectedDates.length > 0
-        ? selectedDates
-        : displayDays
-          .filter(d => d.date >= today)
-          .map(d => d.dateStr);
-
-      const newCells = [];
-      let skipped = 0;
-      datesToUse.forEach((date) => {
-        if (priceMode && isCellPriceBlocked(room, date)) { skipped++; return; }
-        if (selectedCellKeySet.has(getSelectedCellKey(room, date))) return;
-        newCells.push({ room, date });
-      });
-      setSelectedCells(prev => [...prev, ...newCells]);
-      setSelectedRoom(room);
-      if (newCells.length === 0) {
-        setBulkSelectMsg('No vacant cells available for selected scope');
-      } else {
-        setBulkSelectMsg(skipped > 0 ? `${skipped} occupied cell${skipped > 1 ? 's' : ''} excluded` : '');
-      }
-    }
+    setScopeRooms((prev) => prev.includes(room)
+      ? prev.filter((r) => r !== room)
+      : [...prev, room]);
+    setSelectedRoom(room);
   };
 
   // Price Mode 대량 선택 시 안내 메시지
   const [bulkSelectMsg, setBulkSelectMsg] = useState('');
 
-  // 전체 객실 선택
+  // 전체 객실 토글 (축)
   const toggleSelectAllRooms = () => {
-    if (allSelectableRoomsSelected) {
-      const selectableRoomSet = new Set(selectableRooms);
-      setSelectedCells(prev => prev.filter(c => !selectableRoomSet.has(c.room)));
-      const remaining = selectedRooms.filter(r => !selectableRoomSet.has(r));
-      setSelectedRoom(remaining.length > 0 ? remaining[remaining.length - 1] : null);
-      setBulkSelectMsg('');
-    } else {
-      // 모든 방 × 현재 선택된 날짜들 (예약 있는 셀 제외)
-      const newCells = [];
-      let skipped = 0;
-      selectableRooms.forEach(room => {
-        selectedDates.forEach(date => {
-          if (selectedCellKeySet.has(getSelectedCellKey(room, date))) return;
-          const blocked = priceMode ? isCellPriceBlocked(room, date) : isCellOccupied(room, date);
-          if (blocked) { skipped++; return; }
-          newCells.push({ room, date });
-        });
-      });
-      setSelectedCells(prev => [...prev, ...newCells]);
-      setSelectedRoom(selectableRooms[0] || null);
-      if (newCells.length === 0) {
-        setBulkSelectMsg('No vacant cells available for selected scope');
-      } else {
-        setBulkSelectMsg(skipped > 0 ? `${skipped} occupied cell${skipped > 1 ? 's' : ''} excluded` : '');
-      }
-    }
+    setScopeRooms((prev) => (prev.length >= selectableRooms.length ? [] : [...selectableRooms]));
   };
 
-  // ── 대량 선택 헬퍼 ────────────────────────────────────────────────
-  //
-  // 필터·주간·날짜열 선택은 전부 '누적'이다. 예전에는 필터가 setSelectedCells(newCells)로
-  // 기존 선택을 버려서 "주말 전부 + 특정 3일"처럼 쌓아 올리는 게 불가능했다.
-  // 비우기는 Clear 버튼(clearCellSelection)으로 명확히 분리한다.
+  // 기간 축 토글 (주 단위, 월요일 시작)
+  const toggleScopeWeek = (weekStart) => {
+    setScopeWeeks((prev) => prev.includes(weekStart)
+      ? prev.filter((w) => w !== weekStart)
+      : [...prev, weekStart]);
+  };
+
+  // 요일 축 토글 (기간에 걸리는 마스크)
+  const toggleScopeDow = (dow) => {
+    setScopeDows((prev) => prev.includes(dow)
+      ? prev.filter((d) => d !== dow)
+      : [...prev, dow]);
+  };
+
+  // 프리셋이 현재 그대로 켜져 있는지 (칩 하이라이트용)
+  const isScopeDowPreset = (dows) =>
+    scopeDows.length === dows.length && dows.every((d) => scopeDows.includes(d));
+
+  // 프리셋: 금·토·일(사내 주말가) / 월~목. 같은 프리셋을 다시 누르면 해제된다.
+  const setScopeDowPreset = (dows) => {
+    setScopeDows((prev) => {
+      const same = prev.length === dows.length && dows.every((d) => prev.includes(d));
+      return same ? [] : [...dows];
+    });
+  };
+
+  // ── 캘린더 직접 조작용 헬퍼 ──────────────────────────────────────────
+  // 축(스트립)과 별개로, 날짜 열 클릭·Shift 범위가 셀을 직접 더하고 뺄 때 쓴다.
 
   // 현재 뷰에서 고를 수 있는 날짜 (과거 제외)
   const getVisibleFutureDates = () => {
@@ -4249,7 +4324,7 @@ function BuildingCalendar() {
   // 날짜 × 객실 조합에서 예약/블락 셀을 제외한 선택 가능 셀
   const buildSelectableCells = (dateStrs, roomsOverride = null) => {
     const roomsToUse = roomsOverride
-      || (selectedRooms.length > 0 ? selectedRooms : selectableRooms);
+      || (scopeRooms.length > 0 ? selectableRooms.filter((r) => scopeRooms.includes(r)) : selectableRooms);
     const cells = [];
     let skipped = 0;
     roomsToUse.forEach((room) => {
@@ -4289,7 +4364,7 @@ function BuildingCalendar() {
     }
   };
 
-  // 선택된 셀 묶음을 토글한다 (전부 선택돼 있으면 해제, 아니면 추가)
+  // 셀 묶음 토글 (전부 선택돼 있으면 해제, 아니면 추가)
   const toggleCellGroup = (cells, skipped) => {
     if (cells.length === 0) {
       setBulkSelectMsg('No vacant cells available for selected scope');
@@ -4302,27 +4377,7 @@ function BuildingCalendar() {
     }
     const added = addCellsToSelection(cells);
     reportBulkSelection(added, skipped);
-    if (cells.length > 0) setSelectedRoom(cells[0].room);
-  };
-
-  // 요일별 날짜 선택 (누적)
-  const selectDatesByFilter = (filterType) => {
-    const newDates = getVisibleFutureDates()
-      .filter((d) => {
-        const dayOfWeek = d.date.getDay(); // 0(일) ~ 6(토)
-        if (filterType === 'all') return true;
-        // 금·토·일을 주말가로 본다 (기존 정의 유지)
-        if (filterType === 'weekend') return dayOfWeek === 5 || dayOfWeek === 6 || dayOfWeek === 0;
-        if (filterType === 'weekday') return dayOfWeek >= 1 && dayOfWeek <= 4;
-        if (typeof filterType === 'number') return dayOfWeek === filterType;
-        return false;
-      })
-      .map((d) => d.dateStr);
-
-    const { cells, skipped, roomsToUse } = buildSelectableCells(newDates);
-    const added = addCellsToSelection(cells);
-    reportBulkSelection(added, skipped);
-    if (roomsToUse.length > 0) setSelectedRoom(roomsToUse[0]);
+    setSelectedRoom(cells[0].room);
   };
 
   // 날짜 열 토글 — 그 날짜의 선택 가능한 전 객실
@@ -4331,18 +4386,6 @@ function BuildingCalendar() {
     today.setHours(0, 0, 0, 0);
     if (dayjs(dateStr).toDate() < today) return;
     const { cells, skipped } = buildSelectableCells([dateStr]);
-    toggleCellGroup(cells, skipped);
-  };
-
-  // 주 단위 토글 (월요일 시작 7일, 현재 뷰에 보이는 날짜만)
-  const toggleWeekSelection = (weekStartDateStr) => {
-    const visible = new Set(getVisibleFutureDates().map((d) => d.dateStr));
-    const target = [];
-    for (let i = 0; i < 7; i++) {
-      const ds = dayjs(weekStartDateStr).add(i, 'day').format('YYYY-MM-DD');
-      if (visible.has(ds)) target.push(ds);
-    }
-    const { cells, skipped } = buildSelectableCells(target);
     toggleCellGroup(cells, skipped);
   };
 
@@ -5815,7 +5858,64 @@ function BuildingCalendar() {
         label: `${dayjs(start).format('M/D')}–${dayjs(start).add(6, 'day').format('M/D')}`
       }));
   }, [priceMode, gapEditMode, stableDisplayDays]);
-  const allSelectableRoomsSelected = selectableRooms.length > 0 && selectableRooms.every((room) => selectedRooms.includes(room));
+
+  // 축이 만들어내는 셀 목록
+  const scopeCells = useMemo(() => {
+    if (!isBulkSelectMode || !scopeActive) return [];
+    const today = dayjs().startOf('day');
+    const weekSet = new Set(scopeWeeks);
+    const dowSet = new Set(scopeDows);
+    const dates = stableDisplayDays
+      .filter((d) => {
+        const day = dayjs(d.dateStr);
+        if (day.isBefore(today, 'day')) return false;
+        if (dowSet.size > 0 && !dowSet.has(day.day())) return false;
+        if (weekSet.size > 0) {
+          const weekStart = day.subtract((day.day() + 6) % 7, 'day').format('YYYY-MM-DD');
+          if (!weekSet.has(weekStart)) return false;
+        }
+        return true;
+      })
+      .map((d) => d.dateStr);
+
+    const rooms = scopeRooms.length > 0
+      ? selectableRooms.filter((r) => scopeRooms.includes(r))
+      : selectableRooms;
+
+    const cells = [];
+    rooms.forEach((room) => {
+      dates.forEach((date) => {
+        const blocked = priceMode ? isCellPriceBlocked(room, date) : isCellOccupied(room, date);
+        if (blocked) return;
+        cells.push({ room, date });
+      });
+    });
+    return cells;
+  }, [isBulkSelectMode, scopeActive, scopeRooms, scopeWeeks, scopeDows, stableDisplayDays,
+      selectableRooms, priceMode, isCellPriceBlocked, isCellOccupied]);
+
+  // 축 몫만 교체하고 캘린더에서 직접 찍은 셀은 보존한다.
+  //
+  // selectedCells를 통째로 덮어쓰면 드래그로 미세조정한 내용이 축을 건드릴 때마다
+  // 날아간다. 직전 축이 기여했던 키(scopeCellKeysRef)만 걷어내고 새 축을 얹는다.
+  useEffect(() => {
+    const nextKeys = new Set(scopeCells.map((c) => getSelectedCellKey(c.room, c.date)));
+    const prevKeys = scopeCellKeysRef.current;
+    if (prevKeys.size === 0 && nextKeys.size === 0) return;
+
+    setSelectedCells((prev) => {
+      const kept = prev.filter((c) => {
+        const key = getSelectedCellKey(c.room, c.date);
+        return !prevKeys.has(key) || nextKeys.has(key);
+      });
+      const keptKeys = new Set(kept.map((c) => getSelectedCellKey(c.room, c.date)));
+      const added = scopeCells.filter((c) => !keptKeys.has(getSelectedCellKey(c.room, c.date)));
+      if (added.length === 0 && kept.length === prev.length) return prev;
+      return [...kept, ...added];
+    });
+    scopeCellKeysRef.current = nextKeys;
+  }, [scopeCells, getSelectedCellKey]);
+  const allSelectableRoomsSelected = selectableRooms.length > 0 && selectableRooms.every((room) => scopeRooms.includes(room));
 
   // Gap detection helper: check-in on this date → only 1 sellable night → minStay 2 → red gap.
   // Row-level vacancy uses roomReservationsMap (same source as cell renderer isFullyOccupied).
@@ -9041,98 +9141,107 @@ function BuildingCalendar() {
 
                 {/* 상단 버튼 그룹 (Row 1: 좌측 상단) - Premium Design */}
                 <div style={{ display: "flex", gap: "14px", flexWrap: "wrap", alignItems: "center" }}>
-                  <div style={{ display: "flex", gap: "8px" }}>
-                    <button
-                      onClick={toggleSelectAllRooms}
-                      style={{
-                        padding: "8px 14px",
-                        borderRadius: "8px",
-                        border: allSelectableRoomsSelected ? "none" : "1px solid #D1D5DB",
-                        background: allSelectableRoomsSelected
-                          ? "linear-gradient(135deg, #1F2937 0%, #111827 100%)"
-                          : "white",
-                        color: allSelectableRoomsSelected ? "white" : "#374151",
-                        fontSize: "12px",
-                        cursor: "pointer",
-                        fontWeight: "600",
-                        display: "flex",
-                        alignItems: "center",
-                        gap: "6px",
-                        transition: "all 0.2s",
-                        boxShadow: allSelectableRoomsSelected ? "0 2px 8px rgba(31, 41, 55, 0.3)" : "none"
-                      }}
-                    >
-                      {allSelectableRoomsSelected && (
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
-                          <polyline points="20 6 9 17 4 12" />
-                        </svg>
-                      )}
-                      {allSelectableRoomsSelected ? "Deselect All" : "Select All Rooms"}
-                    </button>
-                  </div>
-                  <div style={{ width: "1px", height: "24px", background: "#E5E7EB" }}></div>
-                  <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
-                    {/* 필터는 누적이다. 비우기는 이 버튼으로만 한다. */}
-                    <button
-                      onClick={clearCellSelection}
-                      disabled={selectedCells.length === 0}
-                      style={{
-                        ...filterBtnStyle,
-                        borderColor: selectedCells.length === 0 ? "#E5E7EB" : "#FCA5A5",
-                        color: selectedCells.length === 0 ? "#9CA3AF" : "#DC2626",
-                        cursor: selectedCells.length === 0 ? "not-allowed" : "pointer"
-                      }}
-                    >
-                      Clear
-                    </button>
-                    <button onClick={() => selectDatesByFilter('all')} style={filterBtnStyle}>All Days</button>
-                    <button onClick={() => selectDatesByFilter('weekday')} style={filterBtnStyle}>Weekdays</button>
-                    <button onClick={() => selectDatesByFilter('weekend')} style={filterBtnStyle}>Weekends</button>
-                  </div>
+                  <div style={scopePanelStyle}>
+                    <div style={scopePanelHeaderStyle}>
+                      <span style={{ fontSize: "12px", fontWeight: "800", color: "#1F2937", letterSpacing: "-0.1px" }}>
+                        Scope
+                      </span>
+                      <span style={{
+                        fontSize: "11px",
+                        fontWeight: "700",
+                        color: selectedCells.length > 0 ? "#4338CA" : "#98A2B3",
+                        background: selectedCells.length > 0 ? "#EEF2FF" : "transparent",
+                        border: selectedCells.length > 0 ? "1px solid #C7D2FE" : "1px solid transparent",
+                        borderRadius: "999px",
+                        padding: "3px 10px",
+                        whiteSpace: "nowrap"
+                      }}>
+                        {selectedCells.length > 0
+                          ? `${selectedRoomCountInSelection} rooms × ${selectedDates.length} dates = ${selectedCells.length} cells`
+                          : "Nothing selected"}
+                      </span>
+                      {/* 초기화 버튼은 두지 않는다. 아래 Apply Price 옆의 Clear Selection이
+                          축까지 함께 리셋하므로, 여기에 또 두면 같은 화면에 두 개가 된다. */}
+                    </div>
 
-                  {selectableWeeks.length > 0 && (
-                    <>
-                      <div style={{ width: "1px", height: "24px", background: "#E5E7EB" }}></div>
-                      <div style={{ display: "flex", gap: "4px", alignItems: "center", flexWrap: "wrap" }}>
-                        <span style={{ fontSize: "10px", fontWeight: "700", color: "#6B7280", letterSpacing: "0.3px" }}>WEEK</span>
+                    {/* ── 객실 축 ── 비어 있으면 전 객실. 캘린더 객실 행 클릭과 같은 상태다. */}
+                    <div style={scopeRowStyle}>
+                      <span style={scopeAxisLabelStyle}>Rooms</span>
+                      <div style={scopeTrackStyle}>
+                        <button onClick={() => setScopeRooms([])} style={scopeChipStyle(scopeRooms.length === 0)}>
+                          All rooms
+                        </button>
+                        <div style={scopeDividerStyle} />
+                        {selectableRooms.map((room) => (
+                          <button
+                            key={room}
+                            onClick={() => toggleRoomSelection(room)}
+                            style={scopeChipStyle(scopeRooms.includes(room))}
+                          >
+                            {getRoomNameEN(room)}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* ── 기간 축 ── 비어 있으면 전 기간 */}
+                    <div style={scopeRowStyle}>
+                      <span style={scopeAxisLabelStyle}>Period</span>
+                      <div style={scopeTrackStyle}>
+                        <button onClick={() => setScopeWeeks([])} style={scopeChipStyle(scopeWeeks.length === 0)}>
+                          All dates
+                        </button>
+                        <div style={scopeDividerStyle} />
                         {selectableWeeks.map((w) => (
                           <button
                             key={w.start}
-                            onClick={() => toggleWeekSelection(w.start)}
-                            title={`Select ${w.label}`}
-                            style={{ ...dayBtnStyle, width: "auto", padding: "4px 8px", fontSize: "10px", whiteSpace: "nowrap" }}
+                            onClick={() => toggleScopeWeek(w.start)}
+                            style={scopeChipStyle(scopeWeeks.includes(w.start))}
                           >
                             {w.label}
                           </button>
                         ))}
                       </div>
-                    </>
-                  )}
-
-                  <div style={{ width: "1px", height: "24px", background: "#E5E7EB" }}></div>
-                  <div style={{ display: "flex", gap: "4px" }}>
-                    {["S", "M", "T", "W", "T", "F", "S"].map((d, idx) => (
-                      <button key={`day-${idx}`} onClick={() => selectDatesByFilter(idx)} style={dayBtnStyle}>{d}</button>
-                    ))}
-                  </div>
-
-                  {selectedCells.length > 0 && (
-                    <div style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "5px",
-                      padding: "4px 10px",
-                      borderRadius: "6px",
-                      background: "#EEF2FF",
-                      color: "#4338CA",
-                      fontSize: "11px",
-                      fontWeight: "700",
-                      border: "1px solid #C7D2FE",
-                      whiteSpace: "nowrap"
-                    }}>
-                      {selectedRoomCountInSelection} rooms × {selectedDates.length} dates = {selectedCells.length} cells
                     </div>
-                  )}
+
+                    {/* ── 요일 축 ── 기간에 걸리는 마스크. 금·토·일이 주말가라 앞에 크게 둔다. */}
+                    <div style={scopeRowStyle}>
+                      <span style={scopeAxisLabelStyle}>Days</span>
+                      <div style={scopeTrackStyle}>
+                        <button onClick={() => setScopeDows([])} style={scopeChipStyle(scopeDows.length === 0)}>
+                          Every day
+                        </button>
+                        <div style={scopeDividerStyle} />
+                        {/* 사내 기준: 주말가 = 금·토·일, 평일가 = 월~목 */}
+                        <button
+                          onClick={() => setScopeDowPreset([5, 6, 0])}
+                          style={scopePresetChipStyle(isScopeDowPreset([5, 6, 0]))}
+                        >
+                          Weekend · Fri–Sun
+                        </button>
+                        <button
+                          onClick={() => setScopeDowPreset([1, 2, 3, 4])}
+                          style={scopePresetChipStyle(isScopeDowPreset([1, 2, 3, 4]))}
+                        >
+                          Weekday · Mon–Thu
+                        </button>
+                        <div style={scopeDividerStyle} />
+                        {[
+                          { dow: 1, label: "M" }, { dow: 2, label: "T" }, { dow: 3, label: "W" },
+                          { dow: 4, label: "T" }, { dow: 5, label: "F" }, { dow: 6, label: "S" },
+                          { dow: 0, label: "S" }
+                        ].map((d) => (
+                          <button
+                            key={d.dow}
+                            onClick={() => toggleScopeDow(d.dow)}
+                            style={scopeMiniChipStyle(scopeDows.includes(d.dow))}
+                          >
+                            {d.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
 
                   {bulkSelectMsg && (
                     <div style={{
@@ -9312,32 +9421,37 @@ function BuildingCalendar() {
               {allSelectableRoomsSelected ? "Deselect All Rooms" : "Select All Rooms"}
             </button>
             <button
+              onClick={() => setScopeWeeks([])}
+              style={{ ...scopeChipStyle(scopeWeeks.length === 0), fontSize: "10px" }}
+            >
+              All weeks
+            </button>
+            {selectableWeeks.slice(0, 5).map((w) => (
+              <button
+                key={w.start}
+                onClick={() => toggleScopeWeek(w.start)}
+                style={{ ...scopeChipStyle(scopeWeeks.includes(w.start)), fontSize: "10px" }}
+              >
+                {w.label}
+              </button>
+            ))}
+            <button onClick={() => setScopeDowPreset([5, 6, 0])} style={{ ...scopeChipStyle(scopeDows.length === 3 && [5, 6, 0].every((d) => scopeDows.includes(d))), fontSize: "10px" }}>Fri–Sun</button>
+            <button onClick={() => setScopeDowPreset([1, 2, 3, 4])} style={{ ...scopeChipStyle(scopeDows.length === 4 && [1, 2, 3, 4].every((d) => scopeDows.includes(d))), fontSize: "10px" }}>Mon–Thu</button>
+            <button
               onClick={clearCellSelection}
-              disabled={selectedCells.length === 0}
+              disabled={selectedCells.length === 0 && !scopeActive}
               style={{
                 ...filterBtnStyle,
                 padding: "6px 10px",
                 borderRadius: "7px",
                 fontSize: "11px",
-                borderColor: selectedCells.length === 0 ? "#E5E7EB" : "#FCA5A5",
-                color: selectedCells.length === 0 ? "#9CA3AF" : "#DC2626",
-                cursor: selectedCells.length === 0 ? "not-allowed" : "pointer"
+                borderColor: (selectedCells.length === 0 && !scopeActive) ? "#E5E7EB" : "#FCA5A5",
+                color: (selectedCells.length === 0 && !scopeActive) ? "#9CA3AF" : "#DC2626",
+                cursor: (selectedCells.length === 0 && !scopeActive) ? "not-allowed" : "pointer"
               }}
             >
               Clear
             </button>
-            <button onClick={() => selectDatesByFilter('all')} style={{ ...filterBtnStyle, padding: "6px 10px", borderRadius: "7px", fontSize: "11px" }}>All Days</button>
-            <button onClick={() => selectDatesByFilter('weekday')} style={{ ...filterBtnStyle, padding: "6px 10px", borderRadius: "7px", fontSize: "11px" }}>Weekdays</button>
-            <button onClick={() => selectDatesByFilter('weekend')} style={{ ...filterBtnStyle, padding: "6px 10px", borderRadius: "7px", fontSize: "11px" }}>Weekends</button>
-            {selectableWeeks.slice(0, 6).map((w) => (
-              <button
-                key={w.start}
-                onClick={() => toggleWeekSelection(w.start)}
-                style={{ ...filterBtnStyle, padding: "6px 8px", borderRadius: "7px", fontSize: "10px", whiteSpace: "nowrap" }}
-              >
-                {w.label}
-              </button>
-            ))}
             {selectedCells.length > 0 && (
               <div style={{
                 padding: "4px 8px",
@@ -10423,9 +10537,9 @@ function BuildingCalendar() {
                             e.stopPropagation();
                             toggleRoomSelection(room);
                           }) : undefined}
-                          title={priceMode ? `${selectedRooms.includes(room) ? "Deselect" : "Select"} ${getRoomNameEN(room)}` : undefined}
+                          title={priceMode ? `${scopeRooms.includes(room) ? "Deselect" : "Select"} ${getRoomNameEN(room)}` : undefined}
                           onMouseEnter={priceMode ? (e => {
-                            e.currentTarget.style.background = selectedRooms.includes(room)
+                            e.currentTarget.style.background = scopeRooms.includes(room)
                               ? "linear-gradient(180deg, rgba(219,234,254,0.92) 0%, rgba(239,246,255,0.96) 100%)"
                               : "linear-gradient(180deg, rgba(248,250,252,1) 0%, rgba(241,245,249,0.98) 100%)";
                           }) : undefined}
@@ -10436,7 +10550,7 @@ function BuildingCalendar() {
                             {priceMode && (
                               <input
                                 type="checkbox"
-                                checked={selectedRooms.includes(room)}
+                                checked={scopeRooms.includes(room)}
                                 readOnly
                                 tabIndex={-1}
                                 style={{
@@ -10499,7 +10613,7 @@ function BuildingCalendar() {
                             e.stopPropagation();
                             toggleRoomSelection(room);
                           }) : undefined}
-                          title={priceMode ? `${selectedRooms.includes(room) ? "Deselect" : "Select"} ${getRoomNameEN(room)}` : undefined}
+                          title={priceMode ? `${scopeRooms.includes(room) ? "Deselect" : "Select"} ${getRoomNameEN(room)}` : undefined}
                           onMouseEnter={priceMode ? (e => {
                             e.currentTarget.style.background = "rgba(241,245,249,0.95)";
                           }) : undefined}
@@ -10510,7 +10624,7 @@ function BuildingCalendar() {
                           {priceMode && (
                             <input
                               type="checkbox"
-                              checked={selectedRooms.includes(room)}
+                              checked={scopeRooms.includes(room)}
                               readOnly
                               tabIndex={-1}
                               style={{
