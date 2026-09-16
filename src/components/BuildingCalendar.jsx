@@ -306,18 +306,8 @@ function formatJstShortDateTime(ms) {
  * 라벨·시각·변동액이 모두 같은 로그 문서 하나에서 나오므로 서로 다른 이벤트가 섞이지 않는다.
  * ts(epoch)로 시각을 직접 포맷하므로 lm.t("MM-DD HH:mm")의 연도 누락 문제도 없다.
  */
-function formatPriceHistoryLine(entry) {
-  const at = Number.isFinite(entry?.ts) && entry.ts > 0
-    ? formatJstShortDateTime(entry.ts)
-    : "";
-  const who = entry?.source === "beds24" ? "Beds24" : (entry?.worker || "System");
-  const hasPrices = Number.isFinite(entry?.oldPrice) && Number.isFinite(entry?.newPrice)
-    && entry.oldPrice !== entry.newPrice;
-  const change = hasPrices
-    ? `¥${entry.oldPrice.toLocaleString()} -> ¥${entry.newPrice.toLocaleString()}`
-    : "";
-  return [at, change, who].filter(Boolean).join(" · ");
-}
+// 툴팁 폭. 위치 계산(clamp)과 실제 렌더가 같은 값을 써야 오른쪽 끝에서 안 눌린다.
+const PRICE_TOOLTIP_WIDTH = 268;
 
 function getLogSource(log) {
   const origin = String(log?.origin || "").toLowerCase();
@@ -6891,34 +6881,168 @@ function BuildingCalendar() {
         );
       })()}
 
-      {priceCellTooltip?.text && (
-        <div
-          style={{
-            position: 'fixed',
-            left: `${priceCellTooltip.x}px`,
-            top: `${priceCellTooltip.y}px`,
-            zIndex: 999999,
-            pointerEvents: 'none',
-            background: '#FFFFFF',
-            border: '1px solid #A3A3A3',
-            boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
-            padding: '6px 8px',
-            maxWidth: '320px',
-            fontSize: '12px',
-            lineHeight: 1.3,
-            color: '#1F2937',
-            whiteSpace: 'pre-wrap',
-            // 이력이 여러 건이면 툴팁이 길어진다. 화면 하단/우측에서 잘리지 않도록 반대쪽으로 뒤집는다.
-            transform: `translate(${
-              priceCellTooltip.x > window.innerWidth - 340 ? 'calc(-100% - 28px)' : '0'
-            }, ${
-              priceCellTooltip.y > window.innerHeight * 0.55 ? 'calc(-100% - 28px)' : '0'
-            })`
-          }}
-        >
-          {priceCellTooltip.text}
-        </div>
-      )}
+      {priceCellTooltip && (priceCellTooltip.message || priceCellTooltip.airbnbPrice !== undefined) && (() => {
+        // 가로 위치는 left가 아니라 transform으로 준다.
+        //
+        // 예전에는 left: x 로 두고 넘칠 때만 transform으로 뒤집었는데, fixed 요소의
+        // 가용 폭이 (뷰포트 − left)로 줄어드는 탓에 오른쪽 날짜로 갈수록 상자가 좁아져
+        // 글자가 세로로 길게 늘어졌다. left를 0으로 고정하면 폭은 항상 온전히 계산되고,
+        // 위치만 옮기면 된다.
+        const TOOLTIP_W = PRICE_TOOLTIP_WIDTH;
+        const clampedX = Math.max(8, Math.min(priceCellTooltip.x, window.innerWidth - TOOLTIP_W - 12));
+        const flipUp = priceCellTooltip.y > window.innerHeight * 0.55;
+        const rows = priceCellTooltip.history || [];
+        const moreCount = (priceCellTooltip.historyTotal || 0) - rows.length;
+
+        return (
+          <div
+            style={{
+              position: 'fixed',
+              left: 0,
+              top: 0,
+              width: `${TOOLTIP_W}px`,
+              zIndex: 999999,
+              pointerEvents: 'none',
+              background: '#FFFFFF',
+              border: '1px solid #E4E7EC',
+              borderRadius: '10px',
+              boxShadow: '0 8px 24px rgba(16, 24, 40, 0.14), 0 2px 6px rgba(16, 24, 40, 0.08)',
+              overflow: 'hidden',
+              color: '#101828',
+              transform: `translate(${clampedX}px, ${priceCellTooltip.y}px)${flipUp ? ' translateY(calc(-100% - 28px))' : ''}`
+            }}
+          >
+            {priceCellTooltip.message ? (
+              <div style={{ padding: '10px 12px', fontSize: '12px', color: '#667085' }}>
+                {priceCellTooltip.message}
+              </div>
+            ) : (
+              <>
+                {/* 헤더: 객실 · 날짜 */}
+                <div style={{
+                  padding: '8px 12px 0',
+                  fontSize: '11px',
+                  fontWeight: '600',
+                  color: '#98A2B3',
+                  letterSpacing: '0.1px'
+                }}>
+                  {getRoomNameEN(priceCellTooltip.room)} · {dayjs(priceCellTooltip.dateStr).format('M/D (ddd)')}
+                </div>
+
+                {/* 가격 + 최소 숙박 */}
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'baseline',
+                  gap: '8px',
+                  padding: '2px 12px 10px',
+                  borderBottom: rows.length > 0 ? '1px solid #F2F4F7' : 'none'
+                }}>
+                  <span style={{
+                    fontSize: '19px',
+                    fontWeight: '800',
+                    letterSpacing: '-0.4px',
+                    fontFamily: CALENDAR_NUMERIC_FONT_FAMILY
+                  }}>
+                    ¥{(priceCellTooltip.airbnbPrice || 0).toLocaleString()}
+                  </span>
+                  {priceCellTooltip.minStay > 0 && (
+                    <span style={{
+                      fontSize: '10px',
+                      fontWeight: '700',
+                      color: '#3538CD',
+                      background: '#EEF4FF',
+                      border: '1px solid #C7D7FE',
+                      borderRadius: '999px',
+                      padding: '2px 7px'
+                    }}>
+                      MIN {priceCellTooltip.minStay}N
+                    </span>
+                  )}
+                  {priceCellTooltip.pending && (
+                    <span style={{
+                      fontSize: '10px',
+                      fontWeight: '700',
+                      color: '#B54708',
+                      background: '#FFFAEB',
+                      border: '1px solid #FEDF89',
+                      borderRadius: '999px',
+                      padding: '2px 7px'
+                    }}>
+                      SYNCING
+                    </span>
+                  )}
+                </div>
+
+                {/* 변경 이력 */}
+                {rows.length > 0 && (
+                  <div style={{ padding: '8px 12px 10px' }}>
+                    <div style={{
+                      fontSize: '9px',
+                      fontWeight: '800',
+                      color: '#98A2B3',
+                      letterSpacing: '0.7px',
+                      marginBottom: '6px'
+                    }}>
+                      PRICE HISTORY · {priceCellTooltip.historyTotal}
+                    </div>
+                    {rows.map((entry, idx) => {
+                      const hasChange = Number.isFinite(entry?.oldPrice) && Number.isFinite(entry?.newPrice)
+                        && entry.oldPrice !== entry.newPrice;
+                      const up = hasChange && entry.newPrice > entry.oldPrice;
+                      const when = Number.isFinite(entry?.ts) && entry.ts > 0
+                        ? formatJstShortDateTime(entry.ts)
+                        : (entry?.fallbackTime || "");
+                      const who = entry?.source === 'beds24' ? 'Beds24' : (entry?.worker || 'System');
+                      // 캘린더 dot 규칙과 같은 색: beds24 빨강, 그 외 파랑
+                      const dot = entry?.source === 'beds24' ? '#EF4444' : '#2563EB';
+                      return (
+                        <div key={idx} style={{ display: 'flex', gap: '7px', marginTop: idx === 0 ? 0 : '7px' }}>
+                          <span style={{
+                            width: '6px', height: '6px', borderRadius: '999px',
+                            background: dot, flexShrink: 0, marginTop: '5px'
+                          }} />
+                          <div style={{ minWidth: 0, flex: 1 }}>
+                            {hasChange ? (
+                              <div style={{
+                                fontSize: '12px',
+                                fontWeight: '700',
+                                fontFamily: CALENDAR_NUMERIC_FONT_FAMILY,
+                                color: up ? '#B42318' : '#175CD3',
+                                whiteSpace: 'nowrap'
+                              }}>
+                                ¥{entry.oldPrice.toLocaleString()} → ¥{entry.newPrice.toLocaleString()}
+                              </div>
+                            ) : (
+                              <div style={{ fontSize: '12px', fontWeight: '600', color: '#475467' }}>
+                                No price change
+                              </div>
+                            )}
+                            <div style={{
+                              fontSize: '10px',
+                              color: '#98A2B3',
+                              marginTop: '1px',
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap'
+                            }}>
+                              {[when, who].filter(Boolean).join(' · ')}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {moreCount > 0 && (
+                      <div style={{ fontSize: '10px', color: '#98A2B3', marginTop: '7px', fontWeight: '600' }}>
+                        +{moreCount} more
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        );
+      })()}
 
       <div className="dashboard-content" style={{
         display: 'flex',
@@ -10748,25 +10872,37 @@ function BuildingCalendar() {
                           ? priceHistoryByRoomDate[`${calendarBuilding}__${roomSourceKey}__${dateStr}`]
                           : priceHistoryAnyBuildingByRoomDate[`${roomSourceKey}__${dateStr}`];
                         const cellPriceHistory = cellHistoryBucket?.list || [];
-                        let historyBlock = "";
-                        if (cellPriceHistory.length > 0) {
-                          const shown = cellPriceHistory.slice(0, PRICE_HISTORY_DISPLAY_LIMIT);
-                          // total은 상한과 무관하게 집계된 실제 변경 횟수다.
-                          const moreCount = (cellHistoryBucket?.total || cellPriceHistory.length) - shown.length;
-                          historyBlock = `\n\n[History] ${cellHistoryBucket?.total || cellPriceHistory.length}건\n`
-                            + shown.map(formatPriceHistoryLine).join("\n")
-                            + (moreCount > 0 ? `\n외 ${moreCount}건` : "");
-                        } else if (lastModInfo) {
-                          // 로그 윈도우 밖의 오래된 셀 — price_sync 캐시의 lm으로 폴백
-                          historyBlock = `\n\n[History]\n${lastModInfo.s === 'beds24' ? "Beds24" : (lastModInfo.u || "System")}`
-                            + (lastModInfo.t ? ` · ${lastModInfo.t}` : "")
-                            + (Number.isFinite(lastModInfo.o) && Number.isFinite(lastModInfo.n)
-                              ? ` · ¥${lastModInfo.o.toLocaleString()} -> ¥${lastModInfo.n.toLocaleString()}`
-                              : "");
-                        }
-                        const priceCellHoverText = (priceMode || showBeds24DetailView) && (airbnbPrice || minStay)
-                          ? `Airbnb: ¥${airbnbPrice.toLocaleString()}\nMin Stay: ${minStay || 0} nights${isPendingPriceCell ? "\nStatus: Pending sync" : ""}${historyBlock}`
-                          : (isPastDate && priceMode ? "Cannot edit past dates" : "");
+                        // 툴팁은 문자열이 아니라 구조화된 데이터로 넘긴다.
+                        // 예전에는 전부 \n으로 이어붙인 한 덩어리라 가격·시각·작성자가
+                        // 구분되지 않아 읽기 어려웠다.
+                        const tooltipHistory = cellPriceHistory.length > 0
+                          ? cellPriceHistory.slice(0, PRICE_HISTORY_DISPLAY_LIMIT)
+                          : (lastModInfo
+                            ? [{
+                                ts: Number(lastModInfo.ts) || 0,
+                                source: lastModInfo.s === 'beds24' ? 'beds24' : 'system',
+                                worker: lastModInfo.s === 'beds24' ? 'Beds24' : (lastModInfo.u || 'System'),
+                                fallbackTime: lastModInfo.t || "",
+                                oldPrice: Number.isFinite(lastModInfo.o) ? lastModInfo.o : null,
+                                newPrice: Number.isFinite(lastModInfo.n) ? lastModInfo.n : null
+                              }]
+                            : []);
+                        // total은 상한과 무관하게 집계된 실제 변경 횟수다.
+                        const tooltipHistoryTotal = cellPriceHistory.length > 0
+                          ? (cellHistoryBucket?.total || cellPriceHistory.length)
+                          : tooltipHistory.length;
+                        const priceCellTooltipData = (priceMode || showBeds24DetailView) && (airbnbPrice || minStay)
+                          ? {
+                              room,
+                              dateStr,
+                              airbnbPrice,
+                              bookingPrice,
+                              minStay,
+                              pending: isPendingPriceCell,
+                              history: tooltipHistory,
+                              historyTotal: tooltipHistoryTotal
+                            }
+                          : (isPastDate && priceMode ? { message: "Cannot edit past dates" } : null);
 
                         return (
                           <div
@@ -10859,9 +10995,9 @@ function BuildingCalendar() {
                               if (!showBeds24DetailView && canSelect && !isSelected && !isInQuickSelectionRange && !isSelectionStart && !isDragging) {
                                 e.currentTarget.style.background = gapEditMode ? "rgba(139, 92, 246, 0.1)" : "rgba(245, 158, 11, 0.08)";
                               }
-                              if (priceCellHoverText) {
+                              if (priceCellTooltipData) {
                                 updatePriceCellTooltip({
-                                  text: priceCellHoverText,
+                                  ...priceCellTooltipData,
                                   x: e.clientX + 14,
                                   y: e.clientY + 14
                                 });
@@ -10870,9 +11006,9 @@ function BuildingCalendar() {
                               }
                             }}
                             onMouseMove={(e) => {
-                              if (!priceCellHoverText) return;
+                              if (!priceCellTooltipData) return;
                               updatePriceCellTooltip({
-                                text: priceCellHoverText,
+                                ...priceCellTooltipData,
                                 x: e.clientX + 14,
                                 y: e.clientY + 14
                               });
