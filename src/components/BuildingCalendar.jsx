@@ -7004,13 +7004,29 @@ function BuildingCalendar() {
                           <div style={{ minWidth: 0, flex: 1 }}>
                             {hasChange ? (
                               <div style={{
+                                display: 'flex',
+                                alignItems: 'baseline',
+                                gap: '6px',
                                 fontSize: '12px',
                                 fontWeight: '700',
                                 fontFamily: CALENDAR_NUMERIC_FONT_FAMILY,
                                 color: up ? '#B42318' : '#175CD3',
                                 whiteSpace: 'nowrap'
                               }}>
-                                ¥{entry.oldPrice.toLocaleString()} → ¥{entry.newPrice.toLocaleString()}
+                                <span>¥{entry.oldPrice.toLocaleString()} → ¥{entry.newPrice.toLocaleString()}</span>
+                                {/* 증감액. 방향은 색으로도 보이지만 "얼마나"가 한눈에 필요하다. */}
+                                <span style={{
+                                  marginLeft: 'auto',
+                                  flexShrink: 0,
+                                  fontSize: '11px',
+                                  fontWeight: '800',
+                                  padding: '1px 6px',
+                                  borderRadius: '5px',
+                                  background: up ? '#FEF3F2' : '#EFF8FF',
+                                  border: `1px solid ${up ? '#FECDCA' : '#B2DDFF'}`
+                                }}>
+                                  {up ? '+' : '−'}{Math.abs(entry.newPrice - entry.oldPrice).toLocaleString()}
+                                </span>
                               </div>
                             ) : (
                               <div style={{ fontSize: '12px', fontWeight: '600', color: '#475467' }}>
