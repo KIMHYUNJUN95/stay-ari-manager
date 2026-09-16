@@ -6922,8 +6922,8 @@ function BuildingCalendar() {
                 <div style={{
                   padding: '8px 12px 0',
                   fontSize: '11px',
-                  fontWeight: '600',
-                  color: '#98A2B3',
+                  fontWeight: '700',
+                  color: '#667085',
                   letterSpacing: '0.1px'
                 }}>
                   {getRoomNameEN(priceCellTooltip.room)} · {dayjs(priceCellTooltip.dateStr).format('M/D (ddd)')}
@@ -6979,7 +6979,7 @@ function BuildingCalendar() {
                     <div style={{
                       fontSize: '9px',
                       fontWeight: '800',
-                      color: '#98A2B3',
+                      color: '#667085',
                       letterSpacing: '0.7px',
                       marginBottom: '6px'
                     }}>
@@ -7033,22 +7033,49 @@ function BuildingCalendar() {
                                 No price change
                               </div>
                             )}
+                            {/* 시각·작성자. 회색이 너무 옅어 안 읽혀서 대비를 올리고,
+                                시각은 숫자 전용 폰트로 분리해 이메일과 구분되게 한다. */}
                             <div style={{
-                              fontSize: '10px',
-                              color: '#98A2B3',
-                              marginTop: '1px',
-                              overflow: 'hidden',
-                              textOverflow: 'ellipsis',
-                              whiteSpace: 'nowrap'
+                              display: 'flex',
+                              alignItems: 'baseline',
+                              gap: '5px',
+                              fontSize: '11px',
+                              marginTop: '2px',
+                              minWidth: 0
                             }}>
-                              {[when, who].filter(Boolean).join(' · ')}
+                              {when && (
+                                <span style={{
+                                  flexShrink: 0,
+                                  fontFamily: CALENDAR_NUMERIC_FONT_FAMILY,
+                                  fontWeight: '700',
+                                  color: '#344054',
+                                  letterSpacing: '-0.1px'
+                                }}>
+                                  {when}
+                                </span>
+                              )}
+                              {when && who && (
+                                <span style={{ flexShrink: 0, color: '#D0D5DD', fontWeight: '700' }}>·</span>
+                              )}
+                              {who && (
+                                <span style={{
+                                  minWidth: 0,
+                                  fontWeight: '600',
+                                  color: '#475467',
+                                  overflow: 'hidden',
+                                  textOverflow: 'ellipsis',
+                                  whiteSpace: 'nowrap'
+                                }}>
+                                  {who}
+                                </span>
+                              )}
                             </div>
                           </div>
                         </div>
                       );
                     })}
                     {moreCount > 0 && (
-                      <div style={{ fontSize: '10px', color: '#98A2B3', marginTop: '7px', fontWeight: '600' }}>
+                      <div style={{ fontSize: '11px', color: '#475467', marginTop: '7px', fontWeight: '700' }}>
                         +{moreCount} more
                       </div>
                     )}
