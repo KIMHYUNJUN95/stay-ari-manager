@@ -316,7 +316,7 @@ function getLogSource(log) {
 }
 
 // 가격 설정 모달 (고급 버전)
-function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose, onSave, onJobQueued, selectedRooms, selectedCells, companyId, pendingPriceCellMap }) {
+function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose, onSave, onJobQueued, onApplyStart, onApplyFailed, selectedRooms, selectedCells, companyId, pendingPriceCellMap }) {
   // 조정 모드: 'direct' (직접입력), 'percent' (퍼센트)
   const [adjustMode, setAdjustMode] = useState("direct");
   const [percentValue, setPercentValue] = useState("");
@@ -529,6 +529,19 @@ function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose,
         worker: auth.currentUser?.displayName || auth.currentUser?.email || "Admin",
         workerEmail: auth.currentUser?.email || null
       };
+      // 서버 응답을 기다리기 전에 화면부터 바꾼다.
+      //
+      // 예전에는 fetch가 끝난 뒤에야 onJobQueued로 낙관적 오버레이를 걸어서,
+      // 모달이 "Saving..." 상태로 왕복(실측 0.4~1.4초) 내내 떠 있었다.
+      // 어차피 넘길 셀 값(confirmDisplayData)은 지금 이미 손에 있다.
+      const optimisticCells = confirmDisplayData.map((priceInfo) => ({
+        room: priceInfo.room,
+        date: priceInfo.date,
+        airbnbPrice: priceInfo.newAirbnbPrice
+      }));
+      onApplyStart && onApplyStart({ pendingCells: optimisticCells });
+      onClose && onClose();
+
       const response = await fetch(`${API_BASE_URL}/setRoomPrices`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -612,32 +625,28 @@ function PriceSettingModal({ building, room, selectedDates, roomPrices, onClose,
       }
 
       if (anyQueued) {
+        // 낙관적 오버레이를 실제 job 엔트리로 승격시킨다. (모달은 이미 닫혀 있다)
         onJobQueued && onJobQueued({
           jobId: lastJobId,
           roomCount: totalJobRoomCount,
-          pendingCells: confirmDisplayData.map((priceInfo) => ({
-            room: priceInfo.room,
-            date: priceInfo.date,
-            airbnbPrice: priceInfo.newAirbnbPrice
-          }))
+          pendingCells: optimisticCells
         });
-        onClose();
       } else if (allSuccess) {
-        alert(`Prices updated for ${roomsToUpdate.length} rooms!`);
-        setTimeout(() => {
-          onSave && onSave();
-          onClose();
-        }, 300);
+        onApplyFailed && onApplyFailed(null, `Prices updated for ${roomsToUpdate.length} rooms.`);
+        onSave && onSave();
       } else {
         const errorMsgs = allResults.filter(r => !r.success).map(r => {
           const roomId = r.roomId || r.room || "unknown";
           return `${roomId}: ${r.error || "Unknown error"}`;
-        }).join("\n");
-        setError(`Failed to update (${failCount} failed):\n${errorMsgs}`);
+        }).join(" · ");
+        setError(`Failed to update (${failCount} failed): ${errorMsgs}`);
+        // 모달을 이미 닫았으므로 인라인 에러는 보이지 않는다. 낙관적 값을 되돌리고 토스트로 알린다.
+        onApplyFailed && onApplyFailed(`Failed to update (${failCount}): ${errorMsgs}`);
       }
 
     } catch (err) {
       setError("Connection failed: " + err.message);
+      onApplyFailed && onApplyFailed("Connection failed: " + err.message);
       console.error("Price setting error:", err);
     } finally {
       setLoading(false);
@@ -3183,6 +3192,12 @@ function BuildingCalendar() {
   const [rollingStartDate, setRollingStartDate] = useState(new Date()); // 롤링 뷰 시작일
   const [dateSearchInput, setDateSearchInput] = useState(""); // date jump input (YYYY-MM-DD)
   // ✅ 가격 설정 job 상태 추적 관련
+  // job이 만들어지기 '전'의 낙관적 가격 셀.
+  //
+  // setRoomPrices 응답이 와야 jobId를 알 수 있어서, 그때까지 화면이 안 바뀌었다.
+  // 응답 전에는 이 상태가 오버레이를 대신하고, jobId가 생기면 pendingPriceJobs로 넘긴다.
+  // job 리스너는 pendingPriceJobs만 구독하므로 이 상태는 쓸데없는 구독을 만들지 않는다.
+  const [preQueuedPriceCells, setPreQueuedPriceCells] = useState(null); // { building, cellsByKey }
   const [pendingPriceJobs, setPendingPriceJobs] = useState({}); // { [jobId]: { jobId, building, roomCount, status, pendingCells, usePollingFallback } }
   const pendingPriceJobsRef = useRef({});
   const prevPendingJobIdsRef = useRef(new Set());
@@ -3722,6 +3737,12 @@ function BuildingCalendar() {
     // 유실) 새로고침 전까지 실제 가격을 영구히 덮어썼다. 절대 만료를 둬서 최악의 경우에도
     // 스스로 풀리게 한다. 정상 job은 수 초~수십 초에 끝나므로 이 상한에 닿지 않는다.
     const staleBefore = Date.now() - PENDING_PRICE_JOB_MAX_AGE_MS;
+    // 선-큐 오버레이를 먼저 깔고, 실제 job 엔트리가 덮어쓰게 한다.
+    if (preQueuedPriceCells && preQueuedPriceCells.building === calendarBuilding) {
+      Object.entries(preQueuedPriceCells.cellsByKey || {}).forEach(([cellKey, cellData]) => {
+        cellMap[cellKey] = cellData;
+      });
+    }
     pendingPriceJobList
       .filter((job) => job.building === calendarBuilding)
       .filter((job) => !job.createdAtMs || job.createdAtMs >= staleBefore)
@@ -3732,7 +3753,7 @@ function BuildingCalendar() {
         });
       });
     return cellMap;
-  }, [pendingPriceJobList, calendarBuilding]);
+  }, [pendingPriceJobList, calendarBuilding, preQueuedPriceCells]);
 
   // 뷰 모드에 따른 표시할 날짜 계산
   const displayDays = useMemo(() => {
@@ -7577,6 +7598,25 @@ function BuildingCalendar() {
               });
               fetchPrices(true, calendarBuilding);
             }}
+            onApplyStart={({ pendingCells = [] }) => {
+              // 응답을 기다리지 않고 바로 셀을 바꾼다.
+              const cellsByKey = {};
+              pendingCells.forEach((cell) => {
+                cellsByKey[getSelectedCellKey(cell.room, cell.date)] = cell;
+              });
+              setPreQueuedPriceCells({ building: calendarBuilding, cellsByKey });
+              clearCellSelection();
+              setSelectedRoom(null);
+            }}
+            onApplyFailed={(errorMessage, successMessage) => {
+              // 실패면 낙관적 값을 걷어내고, 성공(비큐 경로)이면 그대로 두고 알리기만 한다.
+              setPreQueuedPriceCells(null);
+              if (errorMessage) {
+                setPriceJobToast({ status: "error", message: errorMessage });
+              } else if (successMessage) {
+                setPriceJobToast({ status: "success", message: successMessage });
+              }
+            }}
             onJobQueued={({ jobId, roomCount, pendingCells = [] }) => {
               clearPriceCacheSession(companyId, calendarBuilding);
               clearCellSelection();
@@ -7599,6 +7639,8 @@ function BuildingCalendar() {
                   usePollingFallback: false
                 }
               }));
+              // 실제 job 엔트리가 오버레이를 이어받았으므로 선-큐 상태는 해제한다.
+              setPreQueuedPriceCells(null);
               setPriceJobToast({ status: "queued", message: `Saved. Syncing ${roomCount} room${roomCount === 1 ? "" : "s"} in the background.` });
               triggerPriceJobNow(jobId);
             }}
@@ -7844,13 +7886,8 @@ function BuildingCalendar() {
                       };
                     });
 
-                    // ✅ 백업 (롤백용)
-                    const backupRoomPrices = typeof structuredClone === 'function'
-                      ? structuredClone(roomPrices)
-                      : JSON.parse(JSON.stringify(roomPrices));
-                    const backupPriceCache = typeof structuredClone === 'function'
-                      ? structuredClone(priceCache)
-                      : JSON.parse(JSON.stringify(priceCache));
+                    // catch에서도 호출하므로 try 바깥에 선언하고 안에서 채운다.
+                    let restoreMinStayBackup = () => {};
 
                     try {
                       // ✅ 1단계: 낙관적 UI 업데이트 (API 호출 전 즉시 반영) - 활성 roomId만 (비활성 50/99 제외)
@@ -7869,6 +7906,74 @@ function BuildingCalendar() {
                           optimisticPatchMap[activeRoomId].add(dateKey);
                         });
                       });
+
+                      // 롤백용 백업 — 패치 대상 셀의 이전 minStay만 기록한다.
+                      //
+                      // 예전에는 roomPrices와 priceCache 전체를 structuredClone 했다. 이 둘은
+                      // 건물 전환 시 초기화되지 않고 계속 누적돼 수 MB가 되는데, 수십 개 셀을
+                      // 되돌리자고 전체를 두 번 깊은 복사하면서 적용 직후 메인 스레드가 멈칫했다.
+                      const minStayBackup = [];
+                      Object.entries(optimisticPatchMap).forEach(([roomId, dateKeySet]) => {
+                        dateKeySet.forEach((dateKey) => {
+                          minStayBackup.push({
+                            roomId,
+                            dateKey,
+                            prevRoomPricesM: roomPrices?.[roomId]?.dates?.[dateKey]?.m,
+                            prevCacheM: priceCache?.[calendarBuilding]?.[roomId]?.dates?.[dateKey]?.m
+                          });
+                        });
+                      });
+
+                      // m을 특정 값으로 되돌린다. 이전 값이 없던 셀은 키 자체를 지운다.
+                      const applyMinStayValues = (dates, entries, pick) => {
+                        const nextDates = { ...dates };
+                        let changed = false;
+                        entries.forEach(({ dateKey }) => {
+                          if (!nextDates[dateKey]) return;
+                          const prev = pick(dateKey);
+                          const cell = { ...nextDates[dateKey] };
+                          if (prev === undefined) delete cell.m;
+                          else cell.m = prev;
+                          nextDates[dateKey] = cell;
+                          changed = true;
+                        });
+                        return changed ? nextDates : dates;
+                      };
+
+                      restoreMinStayBackup = () => {
+                        const byRoom = {};
+                        minStayBackup.forEach((b) => {
+                          if (!byRoom[b.roomId]) byRoom[b.roomId] = [];
+                          byRoom[b.roomId].push(b);
+                        });
+                        setRoomPrices((prev) => {
+                          const updated = { ...prev };
+                          Object.entries(byRoom).forEach(([roomId, entries]) => {
+                            const roomEntry = updated[roomId];
+                            if (!roomEntry?.dates) return;
+                            const map = new Map(entries.map((e) => [e.dateKey, e.prevRoomPricesM]));
+                            updated[roomId] = {
+                              ...roomEntry,
+                              dates: applyMinStayValues(roomEntry.dates, entries, (k) => map.get(k))
+                            };
+                          });
+                          return updated;
+                        });
+                        updatePriceCache((prev) => {
+                          if (!prev[calendarBuilding]) return prev;
+                          const updatedBuilding = { ...prev[calendarBuilding] };
+                          Object.entries(byRoom).forEach(([roomId, entries]) => {
+                            const roomEntry = updatedBuilding[roomId];
+                            if (!roomEntry?.dates) return;
+                            const map = new Map(entries.map((e) => [e.dateKey, e.prevCacheM]));
+                            updatedBuilding[roomId] = {
+                              ...roomEntry,
+                              dates: applyMinStayValues(roomEntry.dates, entries, (k) => map.get(k))
+                            };
+                          });
+                          return { ...prev, [calendarBuilding]: updatedBuilding };
+                        });
+                      };
 
                       setRoomPrices(prev => {
                         const updated = { ...prev };
@@ -7906,6 +8011,10 @@ function BuildingCalendar() {
 
                         return { ...prev, [calendarBuilding]: updatedBuilding };
                       });
+
+                      // 캘린더는 위에서 이미 바뀌었다. 모달이 그걸 가린 채 응답을 기다릴 이유가 없다.
+                      // (블락 생성·해제와 같은 방식: 낙관적 반영 → 즉시 닫기 → 실패 시 롤백 + 토스트)
+                      closeMinStayModal();
 
                       // ✅ 2단계: 낙관적 업데이트 후 API 호출 (병렬 처리)
                       const requestPromise = fetch(`${API_BASE_URL}/setMinStay`, {
@@ -7997,8 +8106,7 @@ function BuildingCalendar() {
                         // 타임아웃은 Promise.race로 이미 resolve되어 catch에 도달하지 않았다.
                         // 그래서 서버가 실패해도 minStay 값이 화면과 priceCacheRef에 남아
                         // 건물을 바꿨다 돌아와도 되살아났다.
-                        setRoomPrices(backupRoomPrices);
-                        updatePriceCache(() => backupPriceCache);
+                        restoreMinStayBackup();
                       }
 
                       const elapsedTime = ((Date.now() - startTime) / 1000).toFixed(2);
@@ -8012,15 +8120,20 @@ function BuildingCalendar() {
                         if (timeoutRooms.length > 0) msg += `\nTimeout (may have applied on Beds24):\n${timeoutRooms.map(r => `- ${r.label}`).join('\n')}`;
                         if (actualFails.length > 0) msg += `\nFailed:\n${actualFails.map(r => `- ${r.label}: ${r.error}`).join('\n')}`;
                         msg += `\n\nSuccessful: ${successCount} cell(s)`;
-                        alert(msg);
+                        // alert은 사용자가 닫기 전까지 화면을 막는다. 이미 반영된 캘린더를
+                        // 못 보게 되므로 토스트로 알린다. (가격 수정 경로와 동일한 방식)
+                        setPriceJobToast({ status: "partial", message: msg.replace(/\s*\n+\s*/g, " · ") });
                       } else if (batchResult.queued) {
-                        alert(`${successCount} cell(s) saved.\nMin stay sync is running in the background.\n\nTime: ${elapsedTime}s`);
+                        setPriceJobToast({
+                          status: "queued",
+                          message: `${successCount} cell(s) saved. Syncing min stay in the background.`
+                        });
                       } else {
-                        alert(`${successCount} cell(s) updated!\nMin stay set to ${gapEditMinStay} for ${cellTargets.length} cell(s).\n\nTime: ${elapsedTime}s`);
+                        setPriceJobToast({
+                          status: "success",
+                          message: `${successCount} cell(s) updated — min stay ${gapEditMinStay}N (${elapsedTime}s)`
+                        });
                       }
-
-                      // Keep min-stay edit mode active until the user explicitly exits it.
-                      closeMinStayModal();
 
                       // ✅ 4단계: 최신 서버에서 최종 가격 새로고침 (Beds24 실제 상태 반영)
                       //
@@ -8035,9 +8148,12 @@ function BuildingCalendar() {
                     } catch (error) {
                       console.error("[Gap Apply] Fatal error:", error);
                       // 전체 롤백
-                      setRoomPrices(backupRoomPrices);
-                      updatePriceCache(() => backupPriceCache);
-                      alert(`Failed to update.\n\nError: ${error.message}\n\nAll changes have been rolled back.`);
+                      restoreMinStayBackup();
+                      closeMinStayModal();
+                      setPriceJobToast({
+                        status: "error",
+                        message: `Failed to update — rolled back. ${error.message}`
+                      });
                     } finally {
                       setIsGapApplying(false);
                     }
