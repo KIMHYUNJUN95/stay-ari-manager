@@ -548,6 +548,10 @@ function PriceChangeHistory() {
 
     // 그리드 컬럼: Time | OK | Building | Room | Period | Type | Modifier | Before | After | Δ%
     const COL = '54px 24px 132px 108px 156px 122px 150px 84px 84px 54px';
+    // 전환 목록도 같은 방식 — 전부 고정폭으로 왼쪽에 붙인다.
+    const CONV_COL = '108px 108px 76px 116px 120px 84px 90px 64px 92px 108px 56px';
+    // 컬럼 합 1022 + 컬럼 간격(10×6) + 좌우 패딩(20) = 1102
+    const CONV_MIN_WIDTH = 1102;
 
     const colHeaderStyle = {
         fontSize: '12px', fontWeight: '600', color: '#8E8E93',
@@ -892,107 +896,96 @@ function PriceChangeHistory() {
                         No matched booking found for current filters (rule: same room/date overlap and booking within 48h after price change).
                     </div>
                 ) : (
-                    <div style={{
-                        overflowX: 'auto'
-                    }}>
-                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px', tableLayout: 'fixed', minWidth: '860px' }}>
-                            <colgroup>
-                                {/* Guest / Stay 만 남는 폭을 흡수하고, 나머지는 내용 폭에 맞춰 붙인다 */}
-                                <col style={{ width: '132px' }} />
-                                <col style={{ width: '128px' }} />
-                                <col />
-                                <col style={{ width: '150px' }} />
-                                <col style={{ width: '96px' }} />
-                                <col style={{ width: '132px' }} />
-                                <col style={{ width: '64px' }} />
-                            </colgroup>
-                            <thead style={{ position: 'sticky', top: 0, zIndex: 1, background: '#FFFFFF' }}>
-                                <tr>
-                                    <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Booked At</th>
-                                    <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Building / Room</th>
-                                    <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Guest / Stay</th>
-                                    <th style={{ padding: '8px 10px', textAlign: 'right', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Price Change</th>
-                                    <th style={{ padding: '8px 10px', textAlign: 'right', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Revenue</th>
-                                    <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Intervention At</th>
-                                    <th style={{ padding: '8px 10px', textAlign: 'right', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Lag</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {filteredConversionRows.map((row, rowIdx) => (
-                                    <tr key={row.key} style={{
-                                        borderBottom: '1px solid #F1F5F9',
-                                        background: rowIdx % 2 === 1 ? '#FBFCFE' : '#FFFFFF'
+                    <div style={{ overflowX: 'auto' }}>
+                        <div style={{ minWidth: `${CONV_MIN_WIDTH}px` }}>
+                            {/* Column headers — 위 로그 목록과 같은 고정폭 그리드.
+                                가변 컬럼을 두면 남는 폭이 한가운데 몰려 행을 따라가기 어렵다. */}
+                            <div style={{
+                                display: 'grid', gridTemplateColumns: CONV_COL,
+                                padding: '0 10px', gap: '0 6px', height: '30px', alignItems: 'center',
+                                borderBottom: '1px solid #E5E5EA', background: '#F5F5F7',
+                                position: 'sticky', top: 0, zIndex: 1
+                            }}>
+                                <span style={colHeaderStyle}>Booked</span>
+                                <span style={colHeaderStyle}>Building</span>
+                                <span style={colHeaderStyle}>Room</span>
+                                <span style={colHeaderStyle}>Stay</span>
+                                <span style={colHeaderStyle}>Guest</span>
+                                <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Before</span>
+                                <span style={{ ...colHeaderStyle, textAlign: 'right' }}>After</span>
+                                <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Δ%</span>
+                                <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Revenue</span>
+                                <span style={colHeaderStyle}>Changed</span>
+                                <span style={{ ...colHeaderStyle, textAlign: 'right' }}>Lag</span>
+                            </div>
+
+                            {filteredConversionRows.map((row, rowIdx) => (
+                                <div key={row.key} style={{
+                                    display: 'grid', gridTemplateColumns: CONV_COL,
+                                    padding: '0 10px', gap: '0 6px', minHeight: '40px', alignItems: 'center',
+                                    borderTop: '1px solid #F2F2F7',
+                                    background: rowIdx % 2 === 0 ? '#FFFFFF' : '#FAFAFA'
+                                }}>
+                                    <span style={{ fontSize: '12px', color: '#8E8E93', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}
+                                        title={row.bookingAtSource === 'date_only_fallback' ? 'Date-only booking — no exact booking time provided.' : undefined}>
+                                        {row.bookingAtSource === 'exact'
+                                            ? formatDateTime(row.bookingAtMs)
+                                            : row.bookingAtSource === 'date_only_fallback'
+                                                ? <>{formatDateOnly(row.bookingAtMs)}<span style={{ color: '#C7C7CC', marginLeft: '3px' }}>~</span></>
+                                                : '-'}
+                                    </span>
+                                    <span style={{ fontSize: '13px', fontWeight: '500', color: '#1D1D1F', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                        {getBuildingName(row.building)}
+                                    </span>
+                                    <span style={{ fontSize: '12px', color: '#3C3C43', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                        {getRoomName(row.room)}
+                                    </span>
+                                    <span style={{ fontSize: '12px', color: '#0071E3', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+                                        {formatDateRange(row.arrival, row.departure)}
+                                    </span>
+                                    <span style={{ fontSize: '12px', color: '#3C3C43', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.guestName}>
+                                        {row.guestName}
+                                    </span>
+                                    <span style={{ fontSize: '12px', color: '#8E8E93', textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+                                        {formatPrice(row.oldPrice)}
+                                    </span>
+                                    <span style={{
+                                        fontSize: '13px', fontWeight: '700', textAlign: 'right',
+                                        fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap',
+                                        color: row.priceDelta > 0 ? '#16A34A' : row.priceDelta < 0 ? '#DC2626' : '#1D1D1F'
                                     }}>
-                                        <td style={{ padding: '8px 10px', color: '#0F172A', fontVariantNumeric: 'tabular-nums' }}
-                                            title={row.bookingAtSource === 'date_only_fallback' ? 'Date-only booking — no exact booking time provided.' : undefined}>
-                                            {row.bookingAtSource === 'exact'
-                                                ? formatDateTime(row.bookingAtMs)
-                                                : row.bookingAtSource === 'date_only_fallback'
-                                                    ? <span>{formatDateOnly(row.bookingAtMs)}<span style={{ marginLeft: '4px', fontSize: '10px', color: '#94A3B8', fontWeight: '600' }}>(date only)</span></span>
-                                                    : '-'}
-                                        </td>
-                                        <td style={{ padding: '8px 10px', color: '#0F172A' }}>
-                                            <div style={{ fontWeight: '600', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{getBuildingName(row.building)}</div>
-                                            <div style={{ fontSize: '11px', color: '#64748B', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{getRoomName(row.room)}</div>
-                                        </td>
-                                        <td style={{ padding: '8px 10px', color: '#0F172A' }}>
-                                            <div style={{ fontWeight: '600', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.guestName}>{row.guestName}</div>
-                                            <div style={{ fontSize: '11px', color: '#64748B', whiteSpace: 'nowrap' }}>{row.arrival} ~ {row.departure}</div>
-                                        </td>
-                                        <td style={{ padding: '8px 10px', textAlign: 'right', whiteSpace: 'nowrap' }}
-                                            title={row.priceApproximate
-                                                ? 'Log average — no per-night snapshot matched this stay.'
-                                                : `${row.changedNights} night(s) of this stay were changed.`}>
-                                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '5px' }}>
-                                                <span style={{ fontSize: '11px', color: '#94A3B8', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums' }}>
-                                                    {formatPrice(row.oldPrice)}
-                                                </span>
-                                                <span style={{ fontSize: '11px', color: '#CBD5E1' }}>→</span>
-                                                <span style={{
-                                                    fontSize: '12px', fontWeight: '700', fontVariantNumeric: 'tabular-nums',
-                                                    color: row.priceDelta > 0 ? '#16A34A' : row.priceDelta < 0 ? '#DC2626' : '#1D1D1F'
-                                                }}>
-                                                    {formatPrice(row.newPrice)}
-                                                </span>
-                                            </div>
-                                            <div style={{ marginTop: '3px' }}>
-                                                <span style={{
-                                                    fontSize: '10px', fontWeight: '700',
-                                                    padding: '1px 7px', borderRadius: '999px',
-                                                    fontVariantNumeric: 'tabular-nums',
-                                                    color: row.pricePercent == null ? '#64748B' : row.pricePercent > 0 ? '#166534' : row.pricePercent < 0 ? '#B91C1C' : '#64748B',
-                                                    background: row.pricePercent == null ? '#E2E8F0' : row.pricePercent > 0 ? '#DCFCE7' : row.pricePercent < 0 ? '#FEE2E2' : '#E2E8F0'
-                                                }}>
-                                                    {row.pricePercent == null
-                                                        ? '-'
-                                                        : `${row.pricePercent > 0 ? '+' : ''}${row.pricePercent}%`}
-                                                </span>
-                                                {row.priceApproximate && (
-                                                    <span style={{ marginLeft: '4px', fontSize: '9px', color: '#94A3B8', fontWeight: '600' }}>approx.</span>
-                                                )}
-                                            </div>
-                                        </td>
-                                        <td style={{ padding: '8px 10px', textAlign: 'right', color: '#0F172A', fontWeight: '700', fontVariantNumeric: 'tabular-nums' }}>
-                                            {formatPrice(row.totalPrice)}
-                                        </td>
-                                        <td style={{ padding: '8px 10px', color: '#0F172A', fontVariantNumeric: 'tabular-nums' }}>{formatDateTime(row.interventionAtMs)}</td>
-                                        <td style={{ padding: '8px 10px', textAlign: 'right' }}>
-                                            <span style={{
-                                                display: 'inline-block',
-                                                fontSize: '11px',
-                                                fontWeight: '700',
-                                                color: '#047857',
-                                                background: '#ECFDF5',
-                                                padding: '2px 8px',
-                                                borderRadius: '999px'
-                                            }}>
-                                                {row.hoursToBooking}h / {row.windowHours}h
-                                            </span>
-                                        </td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
+                                        {formatPrice(row.newPrice)}
+                                    </span>
+                                    <span style={{
+                                        fontSize: '12px', fontWeight: '700', textAlign: 'right',
+                                        fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap',
+                                        color: row.pricePercent == null ? '#C7C7CC' : row.pricePercent > 0 ? '#16A34A' : row.pricePercent < 0 ? '#DC2626' : '#8E8E93'
+                                    }}
+                                        title={row.priceApproximate
+                                            ? 'Log average — no per-night snapshot matched this stay.'
+                                            : `${row.changedNights} night(s) of this stay were changed.`}>
+                                        {row.pricePercent == null ? '—' : `${row.pricePercent > 0 ? '+' : ''}${row.pricePercent}%`}
+                                        {row.priceApproximate && <span style={{ color: '#C7C7CC', marginLeft: '2px' }}>*</span>}
+                                    </span>
+                                    <span style={{ fontSize: '12px', fontWeight: '600', color: '#1D1D1F', textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+                                        {formatPrice(row.totalPrice)}
+                                    </span>
+                                    <span style={{ fontSize: '12px', color: '#8E8E93', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+                                        {formatDateTime(row.interventionAtMs)}
+                                    </span>
+                                    <span style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                        <span style={{
+                                            display: 'inline-block', fontSize: '11px', fontWeight: '700',
+                                            color: '#047857', background: '#ECFDF5',
+                                            padding: '2px 7px', borderRadius: '999px',
+                                            fontVariantNumeric: 'tabular-nums'
+                                        }}>
+                                            {row.hoursToBooking}h
+                                        </span>
+                                    </span>
+                                </div>
+                            ))}
+                        </div>
                     </div>
                 )}
             </div>
