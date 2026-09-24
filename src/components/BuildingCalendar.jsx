@@ -5826,6 +5826,16 @@ function BuildingCalendar() {
   }), [activePriceInterventionLogs, reservations]);
   const priceAttributionByReservationKey = priceAttributionResult.byReservationKey;
 
+  // 이 목록이 대상으로 삼는 숙박 기간. 예약 구독이 화면 표시 기간으로 한정돼 있어
+  // Price History(bookDate 기준 전체 조회)와 건수가 다를 수 있다. 그 범위를 밝혀둔다.
+  const priceSuccessStayRange = useMemo(() => {
+    if (stableDisplayDays.length === 0) return "";
+    const first = stableDisplayDays[0]?.dateStr;
+    const last = stableDisplayDays[stableDisplayDays.length - 1]?.dateStr;
+    if (!first || !last) return "";
+    return `${dayjs(first).format("M/D")}–${dayjs(last).format("M/D")}`;
+  }, [stableDisplayDays]);
+
   // 현재 건물의 전환 목록 + 표시용 상세 (얼마를 바꿔서 몇 시간 만에 들어왔는가)
   const priceSuccessRows = useMemo(() => {
     const list = priceAttributionResult.conversionList || [];
@@ -7000,6 +7010,7 @@ function BuildingCalendar() {
               <span style={{ fontSize: "11px", color: "#667085" }}>
                 {calendarBuilding && calendarBuilding !== "전체" ? getBuildingNameEN(calendarBuilding) : "All buildings"}
                 {" · within "}{PRICE_ATTRIBUTION_DEFAULT_WINDOW_HOURS}h of a price change
+                {priceSuccessStayRange && ` · stays ${priceSuccessStayRange}`}
               </span>
               <div style={{ flex: 1 }} />
               <button
@@ -7011,6 +7022,22 @@ function BuildingCalendar() {
               >
                 Close
               </button>
+            </div>
+
+            {/* 이 목록은 캘린더가 이미 불러온 예약만 본다. 화면에 보이는 기간에 걸치지 않는
+                숙박(예: 지금 9월을 보는 중에 들어온 12월 예약)은 여기 없고 Price History에만 있다.
+                계산식은 양쪽이 같으므로, 같은 예약이 둘 다 나오면 값도 같다. */}
+            <div style={{
+              padding: "8px 20px",
+              borderBottom: "1px solid #F2F4F7",
+              background: "#FCFCFD",
+              fontSize: "11px",
+              color: "#667085",
+              lineHeight: 1.5
+            }}>
+              Covers stays shown on the calendar right now
+              {priceSuccessStayRange ? ` (${priceSuccessStayRange})` : ""}.
+              {" "}Bookings for stays outside this range appear in <strong style={{ color: "#475467" }}>Price History</strong>.
             </div>
 
             <div style={{ overflowY: "auto", padding: priceSuccessRows.length === 0 ? "28px 20px" : "8px 0" }}>
