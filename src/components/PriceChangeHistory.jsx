@@ -450,6 +450,36 @@ function PriceChangeHistory() {
         return conversionList;
     }, [conversionInterventions, reservations]);
 
+    // 이 예약에 실제로 적용된 가격 변동을 구한다.
+    //
+    // 로그의 oldPrice/newPrice는 그 수정에 포함된 전 객실·전 날짜의 평균이라,
+    // 특정 예약의 변동폭으로 쓰면 틀린 값이 나온다. priceSnapshot에서 그 예약의
+    // 객실 + 체류 기간(체크아웃일 제외)에 해당하는 행만 골라 평균낸다.
+    // 매칭되는 행이 없을 때만 로그 평균으로 폴백하고 approximate로 표시한다.
+    const resolveInterventionPriceChange = (intervention, reservation) => {
+        const snapshot = Array.isArray(intervention?.priceSnapshot) ? intervention.priceSnapshot : [];
+        const matched = snapshot.filter((row) =>
+            row
+            && row.room === reservation?.room
+            && row.date >= reservation?.arrival
+            && row.date < reservation?.departure
+        );
+        const avg = (rows, key) => Math.round(
+            rows.reduce((sum, row) => sum + (Number(row[key]) || 0), 0) / rows.length
+        );
+        const oldPrice = matched.length > 0 ? avg(matched, "oldPrice") : (Number(intervention?.oldPrice) || 0);
+        const newPrice = matched.length > 0 ? avg(matched, "newPrice") : (Number(intervention?.newPrice) || 0);
+        const delta = newPrice - oldPrice;
+        return {
+            oldPrice,
+            newPrice,
+            priceDelta: delta,
+            pricePercent: oldPrice > 0 ? Math.round((delta / oldPrice) * 1000) / 10 : null,
+            changedNights: matched.length,
+            priceApproximate: matched.length === 0
+        };
+    };
+
     const conversionRows = useMemo(() => (
         attributedConversions.map((item) => {
             const reservation = item.reservation || {};
@@ -466,7 +496,8 @@ function PriceChangeHistory() {
                 departure: reservation.departure || "-",
                 totalPrice: reservation.totalPrice ?? reservation.price ?? 0,
                 hoursToBooking: item.hoursToBooking,
-                windowHours: item.windowHours
+                windowHours: item.windowHours,
+                ...resolveInterventionPriceChange(intervention, reservation)
             };
         })
     ), [attributedConversions]);
@@ -870,6 +901,7 @@ function PriceChangeHistory() {
                                     <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Booked At</th>
                                     <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Building / Room</th>
                                     <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Guest / Stay</th>
+                                    <th style={{ padding: '8px 10px', textAlign: 'right', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Price Change</th>
                                     <th style={{ padding: '8px 10px', textAlign: 'right', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Revenue</th>
                                     <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Intervention At</th>
                                     <th style={{ padding: '8px 10px', textAlign: 'right', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Lag</th>
@@ -893,6 +925,39 @@ function PriceChangeHistory() {
                                         <td style={{ padding: '8px 10px', color: '#0F172A' }}>
                                             <div style={{ fontWeight: '600' }}>{row.guestName}</div>
                                             <div style={{ fontSize: '11px', color: '#64748B' }}>{row.arrival} ~ {row.departure}</div>
+                                        </td>
+                                        <td style={{ padding: '8px 10px', textAlign: 'right', whiteSpace: 'nowrap' }}
+                                            title={row.priceApproximate
+                                                ? 'Log average — no per-night snapshot matched this stay.'
+                                                : `${row.changedNights} night(s) of this stay were changed.`}>
+                                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '5px' }}>
+                                                <span style={{ fontSize: '11px', color: '#94A3B8', textDecoration: 'line-through', fontVariantNumeric: 'tabular-nums' }}>
+                                                    {formatPrice(row.oldPrice)}
+                                                </span>
+                                                <span style={{ fontSize: '11px', color: '#CBD5E1' }}>→</span>
+                                                <span style={{
+                                                    fontSize: '12px', fontWeight: '700', fontVariantNumeric: 'tabular-nums',
+                                                    color: row.priceDelta > 0 ? '#16A34A' : row.priceDelta < 0 ? '#DC2626' : '#1D1D1F'
+                                                }}>
+                                                    {formatPrice(row.newPrice)}
+                                                </span>
+                                            </div>
+                                            <div style={{ marginTop: '3px' }}>
+                                                <span style={{
+                                                    fontSize: '10px', fontWeight: '700',
+                                                    padding: '1px 7px', borderRadius: '999px',
+                                                    fontVariantNumeric: 'tabular-nums',
+                                                    color: row.pricePercent == null ? '#64748B' : row.pricePercent > 0 ? '#166534' : row.pricePercent < 0 ? '#B91C1C' : '#64748B',
+                                                    background: row.pricePercent == null ? '#E2E8F0' : row.pricePercent > 0 ? '#DCFCE7' : row.pricePercent < 0 ? '#FEE2E2' : '#E2E8F0'
+                                                }}>
+                                                    {row.pricePercent == null
+                                                        ? '-'
+                                                        : `${row.pricePercent > 0 ? '+' : ''}${row.pricePercent}%`}
+                                                </span>
+                                                {row.priceApproximate && (
+                                                    <span style={{ marginLeft: '4px', fontSize: '9px', color: '#94A3B8', fontWeight: '600' }}>approx.</span>
+                                                )}
+                                            </div>
                                         </td>
                                         <td style={{ padding: '8px 10px', textAlign: 'right', color: '#0F172A', fontWeight: '700', fontVariantNumeric: 'tabular-nums' }}>
                                             {formatPrice(row.totalPrice)}

@@ -5864,6 +5864,7 @@ function BuildingCalendar() {
           oldPrice: oldAvg,
           newPrice: newAvg,
           delta: newAvg - oldAvg,
+          percent: oldAvg > 0 ? Math.round(((newAvg - oldAvg) / oldAvg) * 1000) / 10 : null,
           matchedDays: source.length,
           // 로그 평균만 쓴 경우 표시에서 구분해준다 (정확한 셀 매칭이 아님)
           isApproximate: source.length === 0,
@@ -7055,6 +7056,11 @@ function BuildingCalendar() {
                         {hasDelta && (
                           <span style={{ marginLeft: "6px", fontSize: "11px", fontWeight: "800" }}>
                             {up ? "+" : "−"}{Math.abs(row.delta).toLocaleString()}
+                            {row.percent != null && (
+                              <span style={{ marginLeft: "4px", opacity: 0.85 }}>
+                                ({row.percent > 0 ? "+" : ""}{row.percent}%)
+                              </span>
+                            )}
                           </span>
                         )}
                       </div>
