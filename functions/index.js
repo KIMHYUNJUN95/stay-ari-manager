@@ -5712,7 +5712,11 @@ async function verifyBeds24PriceWrites(roomIds, roomUpdateByRoomId, attempts = 3
                 // Beds24는 minStay 1을 빈칸으로 돌려주므로 양쪽 모두 1 기준으로 정규화해 비교한다.
                 if (values?.m !== undefined) {
                     const expected = Number(normalizeBeds24MinStay(values.m));
-                    const actual = entry ? Number(normalizeBeds24MinStay(entry.minStay)) : null;
+                    // 그 날짜 행이 아예 없으면 Beds24에 아무 override가 없다는 뜻이고,
+                    // 그건 곧 기본값 1박이다. 예전에는 entry가 없을 때 null을 넣어
+                    // minStay 1로 맞춘 날짜가 매번 불일치로 잡혔다 — 3회 재시도로 느려지고,
+                    // 끝내 실패 처리돼 캐시 패치가 건너뛰어졌다.
+                    const actual = Number(normalizeBeds24MinStay(entry?.minStay));
                     if (actual !== expected) {
                         mismatches.push({ field: "minStay", date: dateStr, expected, actual });
                     }
@@ -6639,6 +6643,10 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300, memory: "1GiB"
             return acc;
         }, {});
 
+        // 활성 roomId를 못 찾아 건너뛴 셀. 예전에는 console.warn만 남기고 응답에 담지 않아,
+        // 10개 중 9개가 누락돼도 프론트는 성공 토스트를 받았다.
+        const skippedCells = [];
+
         for (const rn of roomNameList) {
             const roomInfos = roomInfosByName[rn];
             const getActiveRoomId = (dateKey, explicitRoomId = "") => {
@@ -6669,15 +6677,19 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300, memory: "1GiB"
                 for (const cell of cellsByRoomName[rn] || []) {
                     const v2Date = `${cell.dateKey.slice(0, 4)}-${cell.dateKey.slice(4, 6)}-${cell.dateKey.slice(6, 8)}`;
                     const rid = getActiveRoomId(cell.dateKey, cell.roomId);
-                    if (!rid) { console.warn(`[setMinStay] ${rn} 날짜 ${cell.dateKey} active roomId 없음, 스킵`); continue; }
+                    if (!rid) { skippedCells.push({ room: rn, date: v2Date }); continue; }
                     addToGroup(rid, v2Date, cell.minStay, cell.dateKey, String(cell.minStay));
                 }
             } else if (dates && typeof dates === "object") {
                 for (const [dateKey, values] of Object.entries(dates)) {
                     const v2Date = `${dateKey.slice(0, 4)}-${dateKey.slice(4, 6)}-${dateKey.slice(6, 8)}`;
                     const rid = getActiveRoomId(dateKey);
-                    if (!rid) { console.warn(`[setMinStay] ${rn} 날짜 ${dateKey} active roomId 없음, 스킵`); continue; }
-                    addToGroup(rid, v2Date, parseInt(values.m) || 1, dateKey, String(values.m));
+                    if (!rid) { skippedCells.push({ room: rn, date: v2Date }); continue; }
+                    // Beds24로 보내는 값과 캐시에 저장하는 값을 같게 맞춘다.
+                    // 예전에는 전송은 parseInt(...)||1, 캐시는 String(values.m) 원본이라
+                    // values.m이 비었을 때 캐시에 ""나 "undefined"가 들어갔다.
+                    const normalizedM = parseInt(values.m, 10) || 1;
+                    addToGroup(rid, v2Date, normalizedM, dateKey, String(normalizedM));
                 }
             } else if (dateFrom && dateTo && minStayValue !== undefined) {
                 const start = dayjs(dateFrom);
@@ -6688,7 +6700,7 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300, memory: "1GiB"
                     const dateKey = d.format("YYYYMMDD");
                     const v2Date = d.format("YYYY-MM-DD");
                     const rid = getActiveRoomId(dateKey);
-                    if (!rid) { console.warn(`[setMinStay] ${rn} 날짜 ${dateKey} active roomId 없음, 스킵`); continue; }
+                    if (!rid) { skippedCells.push({ room: rn, date: v2Date }); continue; }
                     addToGroup(rid, v2Date, minStayValue, dateKey, String(minStayValue));
                 }
             } else {
@@ -6736,12 +6748,18 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300, memory: "1GiB"
             jobType: "min_stay"
         });
 
-        console.log(`[setMinStay] Job created: ${jobRef.id} (${allTargetRoomIds.length} roomId)`);
+        if (skippedCells.length > 0) {
+            console.warn(`[setMinStay] active roomId 없어 건너뛴 셀 ${skippedCells.length}건:`,
+                skippedCells.slice(0, 5).map((c) => `${c.room} ${c.date}`).join(", "));
+        }
+        console.log(`[setMinStay] Job created: ${jobRef.id} (${allTargetRoomIds.length} roomId, 스킵 ${skippedCells.length})`);
         return res.json({
             success: true,
             queued: true,
             jobId: jobRef.id,
             message: "MinStay update queued",
+            skippedCells,
+            skippedCount: skippedCells.length,
             roomIds: allTargetRoomIds.map(String),
             results: allTargetRoomIds.map((rid) => ({ roomId: String(rid), success: true, queued: true }))
         });

@@ -8263,7 +8263,9 @@ function BuildingCalendar() {
                               queued: result.queued === true,
                               jobId: result.jobId || null,
                               roomIds: result.roomIds || [],
-                              results: result.results || []
+                              results: result.results || [],
+                              skippedCount: Number(result.skippedCount) || 0,
+                              skippedCells: result.skippedCells || []
                             };
                           } else {
                             console.error("[Gap Apply] API failure:", result);
@@ -8352,6 +8354,13 @@ function BuildingCalendar() {
                         // alert은 사용자가 닫기 전까지 화면을 막는다. 이미 반영된 캘린더를
                         // 못 보게 되므로 토스트로 알린다. (가격 수정 경로와 동일한 방식)
                         setPriceJobToast({ status: "partial", message: msg.replace(/\s*\n+\s*/g, " · ") });
+                      } else if (batchResult.queued && batchResult.skippedCount > 0) {
+                        // 활성 roomId를 못 찾아 서버가 건너뛴 셀. 예전에는 조용히 사라져서
+                        // 적용된 줄 알았다가 재조회 후 값이 되돌아왔다.
+                        setPriceJobToast({
+                          status: "partial",
+                          message: `${batchResult.skippedCount} cell(s) skipped — no active room on those dates. Syncing the rest.`
+                        });
                       } else if (batchResult.queued) {
                         setPriceJobToast({
                           status: "queued",
@@ -8366,10 +8375,18 @@ function BuildingCalendar() {
 
                       // ✅ 4단계: 최신 서버에서 최종 가격 새로고침 (Beds24 실제 상태 반영)
                       //
-                      // 주석만 있고 실제 재조회가 없어서, 화면은 낙관적 값만 보고 있었다.
-                      // queued인 경우에도 pendingPriceCellMap이 위에 덮이므로 안전하다.
+                      // queued일 때는 여기서 재조회하면 안 된다.
+                      //
+                      // 응답이 온 시점은 "job을 큐에 넣었다"까지다. Beds24 전송과 캐시 패치는
+                      // 그로부터 5~6초 뒤에 끝난다. 여기서 바로 읽으면 아직 옛 minStay가
+                      // 돌아오고, 그 값이 낙관적 패치를 덮어써서 화면이 되돌아갔다가 job이
+                      // 끝나면 또 바뀐다. 가격 경로는 pendingPriceCellMap이 덮어줘서 가려졌지만
+                      // minStay job은 pendingCells가 비어 있어 그대로 드러난다.
+                      //
+                      // 큐에 들어간 경우의 재조회는 job 완료 리스너(refreshCompletedPriceJob)가
+                      // 담당한다. 여기서는 즉시 반영된 경우만 다시 읽는다.
                       setLastPriceSyncByBuilding(prev => ({ ...prev, [calendarBuilding]: new Date() }));
-                      if (calendarBuilding && calendarBuilding !== "전체") {
+                      if (!batchResult.queued && calendarBuilding && calendarBuilding !== "전체") {
                         clearPriceCacheSession(companyId, calendarBuilding);
                         fetchPrices(true, calendarBuilding);
                       }
