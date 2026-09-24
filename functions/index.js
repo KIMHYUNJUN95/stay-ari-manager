@@ -7159,7 +7159,13 @@ exports.priceWebhook = onRequest({ cors: true, timeoutSeconds: 300, memory: "16G
                     const oldP1 = parseFloat(oldVal?.p1) || 0;
                     const newP1 = parseFloat(newVal?.p1) || 0;
                     if (oldP1 !== newP1 && (oldP1 > 0 || newP1 > 0)) {
-                        priceDiffs.push({ date: `${dk.slice(0,4)}-${dk.slice(4,6)}-${dk.slice(6,8)}`, oldPrice: oldP1, newPrice: newP1 });
+                        // room을 반드시 넣는다.
+                        //
+                        // 없으면 프론트의 buildTargetDatesByRoom이 빈 맵을 반환하고,
+                        // 대상 날짜가 dateFrom~dateTo 전 구간으로 넓어진다. Beds24가 5일과
+                        // 15일만 바꿔도 그 사이 11일 전부가 "가격을 바꾼 날짜"로 취급돼
+                        // 가격 개입 전환이 과다 집계됐다. (실측: 이 구간 중앙값 10일, 최대 31일)
+                        priceDiffs.push({ room: roomName, date: `${dk.slice(0,4)}-${dk.slice(4,6)}-${dk.slice(6,8)}`, oldPrice: oldP1, newPrice: newP1 });
                     }
                 }
                 priceDiffs.sort((a, b) => a.date.localeCompare(b.date));

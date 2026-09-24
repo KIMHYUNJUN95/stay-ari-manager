@@ -225,7 +225,15 @@ export function buildPriceAttributionResult({
   // 이 함수는 로그/예약 스냅샷이 올 때마다 재계산된다. 프로덕션에서 매번 콘솔에
   // 쓰면(특히 전환 건별 forEach) DevTools가 열려 있을 때 눈에 띄게 느려진다.
   // 진단이 필요하면 localStorage에 attributionDebug=1을 넣어 켠다.
-  const _dbgAfterSuccess = (interventions || []).filter((log) => log?.success !== false);
+  // partial_failed job의 로그도 받아들인다.
+  //
+  // processPriceJob은 status가 completed일 때만 success: true를 쓴다. 그래서 20개 객실 중
+  // 1개가 Beds24 오류로 실패하면 나머지 19개의 정상 전환까지 통째로 버려졌다.
+  // 그 로그의 priceSnapshot은 successRoomIds만 담고 있어(functions/index.js) 실패분이
+  // 섞일 염려가 없고, 애초에 성공분이 0이면 로그 자체를 쓰지 않는다.
+  const _dbgAfterSuccess = (interventions || []).filter((log) =>
+    log?.success !== false || (Array.isArray(log?.priceSnapshot) && log.priceSnapshot.length > 0)
+  );
   const _dbgBeds24Count = _dbgAfterSuccess.filter((log) => String(log?.origin || "").toLowerCase().includes("beds24")).length;
   if (ATTRIBUTION_DEBUG) console.debug(`[Attribution] input=${_dbgTotal} | success_pass=${_dbgAfterSuccess.length} | beds24=${_dbgBeds24Count}`);
 
