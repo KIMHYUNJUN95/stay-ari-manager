@@ -895,7 +895,17 @@ function PriceChangeHistory() {
                     <div style={{
                         overflowX: 'auto'
                     }}>
-                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
+                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px', tableLayout: 'fixed', minWidth: '860px' }}>
+                            <colgroup>
+                                {/* Guest / Stay 만 남는 폭을 흡수하고, 나머지는 내용 폭에 맞춰 붙인다 */}
+                                <col style={{ width: '132px' }} />
+                                <col style={{ width: '128px' }} />
+                                <col />
+                                <col style={{ width: '150px' }} />
+                                <col style={{ width: '96px' }} />
+                                <col style={{ width: '132px' }} />
+                                <col style={{ width: '64px' }} />
+                            </colgroup>
                             <thead style={{ position: 'sticky', top: 0, zIndex: 1, background: '#FFFFFF' }}>
                                 <tr>
                                     <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #EEF2F7', color: '#64748B', fontWeight: '600' }}>Booked At</th>
@@ -908,8 +918,11 @@ function PriceChangeHistory() {
                                 </tr>
                             </thead>
                             <tbody>
-                                {filteredConversionRows.map((row) => (
-                                    <tr key={row.key} style={{ borderBottom: '1px solid #F1F5F9' }}>
+                                {filteredConversionRows.map((row, rowIdx) => (
+                                    <tr key={row.key} style={{
+                                        borderBottom: '1px solid #F1F5F9',
+                                        background: rowIdx % 2 === 1 ? '#FBFCFE' : '#FFFFFF'
+                                    }}>
                                         <td style={{ padding: '8px 10px', color: '#0F172A', fontVariantNumeric: 'tabular-nums' }}
                                             title={row.bookingAtSource === 'date_only_fallback' ? 'Date-only booking — no exact booking time provided.' : undefined}>
                                             {row.bookingAtSource === 'exact'
@@ -919,12 +932,12 @@ function PriceChangeHistory() {
                                                     : '-'}
                                         </td>
                                         <td style={{ padding: '8px 10px', color: '#0F172A' }}>
-                                            <div style={{ fontWeight: '600' }}>{getBuildingName(row.building)}</div>
-                                            <div style={{ fontSize: '11px', color: '#64748B' }}>{getRoomName(row.room)}</div>
+                                            <div style={{ fontWeight: '600', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{getBuildingName(row.building)}</div>
+                                            <div style={{ fontSize: '11px', color: '#64748B', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{getRoomName(row.room)}</div>
                                         </td>
                                         <td style={{ padding: '8px 10px', color: '#0F172A' }}>
-                                            <div style={{ fontWeight: '600' }}>{row.guestName}</div>
-                                            <div style={{ fontSize: '11px', color: '#64748B' }}>{row.arrival} ~ {row.departure}</div>
+                                            <div style={{ fontWeight: '600', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.guestName}>{row.guestName}</div>
+                                            <div style={{ fontSize: '11px', color: '#64748B', whiteSpace: 'nowrap' }}>{row.arrival} ~ {row.departure}</div>
                                         </td>
                                         <td style={{ padding: '8px 10px', textAlign: 'right', whiteSpace: 'nowrap' }}
                                             title={row.priceApproximate
