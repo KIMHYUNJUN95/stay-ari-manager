@@ -5,7 +5,7 @@ import { db, auth } from '../firebase';
 import { useUser } from '../contexts/UserContext';
 import dayjs from 'dayjs';
 import axios from 'axios';
-import { buildPriceAttributionResult, getReservationIdentityKey, parseReservationCreatedAtMs } from '../utils/priceAttribution';
+import { buildPriceAttributionResult, getReservationIdentityKey, parseReservationCreatedAtMs, PRICE_ATTRIBUTION_DEFAULT_WINDOW_HOURS } from '../utils/priceAttribution';
 
 import { BUILDING_NAMES_EN as _BUILDING_NAMES_EN, EXCLUDED_BUILDING_UI, ACTIVE_BUILDING_ORDER } from '../constants/buildingData';
 
@@ -3215,6 +3215,13 @@ function BuildingCalendar() {
   ), [calendarBuilding, invalidatedPriceRoomIdsByBuilding]);
   const currentPriceConsistencyPending = !!priceConsistencyPendingByBuilding[calendarBuilding];
   const [vacantOnlyMode, setVacantOnlyMode] = useState(false);
+  // 가격 개입으로 성사된 예약(바에 남색 테두리가 붙는 것)만 도드라지게 보는 모드.
+  //
+  // 다른 예약을 목록에서 제거하지 않고 흐리게만 한다. calendarReservationIndex는
+  // 레인 배치·갭 판정·가동률 집계가 모두 공유하는 자료라, 거기서 예약을 빼면
+  // 관계없는 기능들이 함께 어긋난다.
+  const [priceSuccessOnly, setPriceSuccessOnly] = useState(false);
+  const [showPriceSuccessList, setShowPriceSuccessList] = useState(false);
   const toggleCalendarFullscreen = useCallback(() => {
     setIsCalendarFullscreen((prev) => !prev);
   }, []);
@@ -5808,16 +5815,68 @@ function BuildingCalendar() {
     setPriceCellTooltip(null);
   }, []);
 
-  const priceAttributionByReservationKey = useMemo(() => {
-    const { byReservationKey } = buildPriceAttributionResult({
-      interventions: activePriceInterventionLogs,
-      reservations,
-      defaultWindowHours: 48,
-      minInterventionDate: "2026-04-11",
-      minBookingDate: "2026-04-11"
-    });
-    return byReservationKey;
-  }, [activePriceInterventionLogs, reservations]);
+  // 가격 개입 → 예약 전환 결과. 바 테두리(byReservationKey)와 목록(conversionList)이
+  // 같은 계산을 공유해야 화면과 리스트가 어긋나지 않는다.
+  const priceAttributionResult = useMemo(() => buildPriceAttributionResult({
+    interventions: activePriceInterventionLogs,
+    reservations,
+    defaultWindowHours: 48,
+    minInterventionDate: "2026-04-11",
+    minBookingDate: "2026-04-11"
+  }), [activePriceInterventionLogs, reservations]);
+  const priceAttributionByReservationKey = priceAttributionResult.byReservationKey;
+
+  // 현재 건물의 전환 목록 + 표시용 상세 (얼마를 바꿔서 몇 시간 만에 들어왔는가)
+  const priceSuccessRows = useMemo(() => {
+    const list = priceAttributionResult.conversionList || [];
+    return list
+      .filter((c) => {
+        const r = c?.reservation;
+        if (!r || r.status === "cancelled" || r.status === "blackout") return false;
+        if (!calendarBuilding || calendarBuilding === "전체") return true;
+        return r.building === calendarBuilding;
+      })
+      .map((c) => {
+        const r = c.reservation;
+        // 이 예약의 객실·체류일에 해당하는 가격 변경분만 추린다.
+        // 로그의 평균(oldPrice/newPrice)은 다른 객실·날짜까지 섞여 있어 그대로 쓰면 틀린다.
+        const snapshot = Array.isArray(c.intervention?.priceSnapshot) ? c.intervention.priceSnapshot : [];
+        const matched = snapshot.filter((row) =>
+          row && row.room === r.room && row.date >= r.arrival && row.date < r.departure
+        );
+        const source = matched.length > 0 ? matched : [];
+        const oldAvg = source.length > 0
+          ? Math.round(source.reduce((sum, row) => sum + (Number(row.oldPrice) || 0), 0) / source.length)
+          : (Number(c.intervention?.oldPrice) || 0);
+        const newAvg = source.length > 0
+          ? Math.round(source.reduce((sum, row) => sum + (Number(row.newPrice) || 0), 0) / source.length)
+          : (Number(c.intervention?.newPrice) || 0);
+        return {
+          key: c.reservationKey,
+          reservation: r,
+          building: r.building,
+          room: r.room,
+          arrival: r.arrival,
+          departure: r.departure,
+          guestName: r.guestName || "",
+          platform: r.platform || r.channel || r.referer || "",
+          bookingAmount: Number(r.totalPrice ?? r.price) || 0,
+          oldPrice: oldAvg,
+          newPrice: newAvg,
+          delta: newAvg - oldAvg,
+          matchedDays: source.length,
+          // 로그 평균만 쓴 경우 표시에서 구분해준다 (정확한 셀 매칭이 아님)
+          isApproximate: source.length === 0,
+          worker: c.intervention?.worker || c.intervention?.origin || "System",
+          appliedAtMs: c.appliedAtMs,
+          bookingCreatedAtMs: c.bookingCreatedAtMs,
+          bookingCreatedAtSource: c.bookingCreatedAtSource,
+          hoursToBooking: c.hoursToBooking,
+          windowHours: c.windowHours
+        };
+      })
+      .sort((a, b) => b.bookingCreatedAtMs - a.bookingCreatedAtMs);
+  }, [priceAttributionResult, calendarBuilding]);
 
   const roomsVacantTodaySet = useMemo(() => {
     const set = new Set();
@@ -6723,6 +6782,7 @@ function BuildingCalendar() {
     const reservationIdentityKey = getReservationIdentityKey(reservation);
     const attributedConversion = priceAttributionByReservationKey[reservationIdentityKey] || null;
     const isPriceDrivenSuccess = !isCancelled && !isBlackout && !!attributedConversion;
+    const dimmedForPriceSuccessMode = priceSuccessOnly && !isPriceDrivenSuccess;
 
     return (
       <div
@@ -6766,7 +6826,11 @@ function BuildingCalendar() {
           border: isCancelled
             ? "1.5px dashed rgba(255,255,255,0.5)"
             : (isPriceDrivenSuccess ? "2px solid #1E3A8A" : "none"),
-          opacity: isCancelled ? 0.56 : (allowPriceEditThroughBlock ? 0.3 : (isPastReservation ? 0.44 : (showBeds24DetailView ? 0.94 : 1))),
+          opacity: dimmedForPriceSuccessMode
+            ? 0.08
+            : (isCancelled ? 0.56 : (allowPriceEditThroughBlock ? 0.3 : (isPastReservation ? 0.44 : (showBeds24DetailView ? 0.94 : 1)))),
+          // 거의 안 보이는 바를 실수로 클릭하지 않도록 막는다.
+          pointerEvents: dimmedForPriceSuccessMode ? "none" : undefined,
           borderRadius: "999px",
           color: barTextColor,
           fontSize: showBeds24DetailView ? "9px" : "11px",
@@ -6901,6 +6965,138 @@ function BuildingCalendar() {
           </div>
         );
       })()}
+
+      {showPriceSuccessList && (
+        <div
+          onClick={() => setShowPriceSuccessList(false)}
+          style={{
+            position: "fixed", inset: 0, zIndex: 99998,
+            background: "rgba(15, 23, 42, 0.45)",
+            display: "flex", alignItems: "center", justifyContent: "center", padding: "24px"
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: "min(920px, 100%)", maxHeight: "82vh", display: "flex", flexDirection: "column",
+              background: "#FFFFFF", borderRadius: "16px", overflow: "hidden",
+              boxShadow: "0 24px 64px rgba(16, 24, 40, 0.28)"
+            }}
+          >
+            <div style={{
+              display: "flex", alignItems: "center", gap: "10px",
+              padding: "16px 20px", borderBottom: "1px solid #EEF0F4",
+              background: "linear-gradient(180deg, #FAFAFF 0%, #F5F5FB 100%)"
+            }}>
+              <span style={{ fontSize: "15px", fontWeight: "800", color: "#101828" }}>Price-Driven Bookings</span>
+              <span style={{
+                fontSize: "11px", fontWeight: "700", color: "#3730A3",
+                background: "#EEF2FF", border: "1px solid #C7D2FE",
+                borderRadius: "999px", padding: "3px 10px"
+              }}>
+                {priceSuccessRows.length}
+              </span>
+              <span style={{ fontSize: "11px", color: "#667085" }}>
+                {calendarBuilding && calendarBuilding !== "전체" ? getBuildingNameEN(calendarBuilding) : "All buildings"}
+                {" · within "}{PRICE_ATTRIBUTION_DEFAULT_WINDOW_HOURS}h of a price change
+              </span>
+              <div style={{ flex: 1 }} />
+              <button
+                onClick={() => setShowPriceSuccessList(false)}
+                style={{
+                  padding: "6px 14px", borderRadius: "9px", border: "1px solid #D0D5DD",
+                  background: "#FFFFFF", color: "#475467", fontSize: "12px", fontWeight: "700", cursor: "pointer"
+                }}
+              >
+                Close
+              </button>
+            </div>
+
+            <div style={{ overflowY: "auto", padding: priceSuccessRows.length === 0 ? "28px 20px" : "8px 0" }}>
+              {priceSuccessRows.length === 0 ? (
+                <div style={{ textAlign: "center", color: "#667085", fontSize: "13px" }}>
+                  No bookings landed within the attribution window after a price change.
+                </div>
+              ) : priceSuccessRows.map((row) => {
+                const up = row.delta > 0;
+                const hasDelta = row.delta !== 0;
+                return (
+                  <div
+                    key={row.key}
+                    style={{
+                      display: "flex", alignItems: "center", gap: "14px",
+                      padding: "12px 20px", borderBottom: "1px solid #F2F4F7"
+                    }}
+                  >
+                    <div style={{ minWidth: 0, flex: "1 1 40%" }}>
+                      <div style={{ fontSize: "13px", fontWeight: "700", color: "#101828" }}>
+                        {getRoomNameEN(row.room)}
+                        <span style={{ color: "#98A2B3", fontWeight: "600" }}>
+                          {" · "}{dayjs(row.arrival).format("M/D")}–{dayjs(row.departure).format("M/D")}
+                        </span>
+                      </div>
+                      <div style={{
+                        fontSize: "11px", color: "#475467", marginTop: "2px",
+                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"
+                      }}>
+                        {[row.guestName, row.platform].filter(Boolean).join(" · ") || "—"}
+                      </div>
+                    </div>
+
+                    {/* 얼마를 바꿨는가 */}
+                    <div style={{ flex: "0 0 200px", textAlign: "right" }}>
+                      <div style={{
+                        fontSize: "12px", fontWeight: "700",
+                        fontFamily: CALENDAR_NUMERIC_FONT_FAMILY,
+                        color: hasDelta ? (up ? "#B42318" : "#175CD3") : "#475467",
+                        whiteSpace: "nowrap"
+                      }}>
+                        ¥{row.oldPrice.toLocaleString()} → ¥{row.newPrice.toLocaleString()}
+                        {hasDelta && (
+                          <span style={{ marginLeft: "6px", fontSize: "11px", fontWeight: "800" }}>
+                            {up ? "+" : "−"}{Math.abs(row.delta).toLocaleString()}
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: "10px", color: "#98A2B3", marginTop: "2px" }}>
+                        {row.isApproximate
+                          ? "log average"
+                          : `${row.matchedDays} night${row.matchedDays === 1 ? "" : "s"} changed`}
+                        {" · "}{row.worker}
+                      </div>
+                    </div>
+
+                    {/* 몇 시간 만에 들어왔는가 */}
+                    <div style={{ flex: "0 0 130px", textAlign: "right" }}>
+                      <div style={{
+                        fontSize: "14px", fontWeight: "800",
+                        fontFamily: CALENDAR_NUMERIC_FONT_FAMILY,
+                        color: "#1E3A8A"
+                      }}>
+                        {row.hoursToBooking}h
+                      </div>
+                      <div style={{ fontSize: "10px", color: "#98A2B3", marginTop: "2px" }}>
+                        {formatJstShortDateTime(row.appliedAtMs)} → {formatJstShortDateTime(row.bookingCreatedAtMs)}
+                        {row.bookingCreatedAtSource === "date_only_fallback" ? " (approx.)" : ""}
+                      </div>
+                    </div>
+
+                    <div style={{ flex: "0 0 110px", textAlign: "right" }}>
+                      <div style={{
+                        fontSize: "13px", fontWeight: "700",
+                        fontFamily: CALENDAR_NUMERIC_FONT_FAMILY, color: "#101828"
+                      }}>
+                        ¥{row.bookingAmount.toLocaleString()}
+                      </div>
+                      <div style={{ fontSize: "10px", color: "#98A2B3", marginTop: "2px" }}>booking</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
 
       {priceCellTooltip && (priceCellTooltip.message || priceCellTooltip.airbnbPrice !== undefined) && (() => {
         // 가로 위치는 left가 아니라 transform으로 준다.
@@ -10443,6 +10639,76 @@ function BuildingCalendar() {
                 </svg>
                 {vacantOnlyMode ? "Show All Rooms" : "Vacant Today"}
               </button>
+            )}
+            {showBeds24DetailView && (
+              <>
+                {/* 가격 개입으로 성사된 예약(남색 테두리)만 도드라지게 */}
+                <button
+                  onClick={() => setPriceSuccessOnly((prev) => !prev)}
+                  title="Highlight reservations booked shortly after a price change"
+                  style={{
+                    padding: isCalendarFullscreen ? "7px 14px" : "9px 17px",
+                    height: isCalendarFullscreen ? "34px" : "38px",
+                    borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                    border: priceSuccessOnly ? "none" : "1px solid #CBD5E1",
+                    background: priceSuccessOnly
+                      ? "linear-gradient(135deg, #1E3A8A 0%, #1E40AF 100%)"
+                      : "#FFFFFF",
+                    color: priceSuccessOnly ? "white" : "#334155",
+                    cursor: "pointer",
+                    fontWeight: "600",
+                    fontSize: isCalendarFullscreen ? "12px" : "13px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: isCalendarFullscreen ? "6px" : "8px",
+                    boxShadow: priceSuccessOnly ? "0 4px 14px rgba(30, 58, 138, 0.28)" : "0 1px 2px rgba(15,23,42,0.05)",
+                    transition: "all 0.2s ease"
+                  }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M3 17l6-6 4 4 7-7" />
+                    <path d="M14 8h6v6" />
+                  </svg>
+                  {priceSuccessOnly ? "Show All" : "Price Wins"}
+                  <span style={{
+                    minWidth: "18px",
+                    padding: "1px 6px",
+                    borderRadius: "999px",
+                    background: priceSuccessOnly ? "rgba(255,255,255,0.22)" : "#EEF2FF",
+                    color: priceSuccessOnly ? "#FFFFFF" : "#3730A3",
+                    fontSize: "11px",
+                    fontWeight: "800"
+                  }}>
+                    {priceSuccessRows.length}
+                  </span>
+                </button>
+                <button
+                  onClick={() => setShowPriceSuccessList(true)}
+                  title="Open the price-driven bookings list"
+                  style={{
+                    padding: isCalendarFullscreen ? "7px 12px" : "9px 14px",
+                    height: isCalendarFullscreen ? "34px" : "38px",
+                    borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                    border: "1px solid #CBD5E1",
+                    background: "#FFFFFF",
+                    color: "#334155",
+                    cursor: "pointer",
+                    fontWeight: "600",
+                    fontSize: isCalendarFullscreen ? "12px" : "13px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    boxShadow: "0 1px 2px rgba(15,23,42,0.05)"
+                  }}
+                >
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <line x1="8" y1="6" x2="21" y2="6" /><line x1="8" y1="12" x2="21" y2="12" />
+                    <line x1="8" y1="18" x2="21" y2="18" /><line x1="3" y1="6" x2="3.01" y2="6" />
+                    <line x1="3" y1="12" x2="3.01" y2="12" /><line x1="3" y1="18" x2="3.01" y2="18" />
+                  </svg>
+                  Details
+                </button>
+              </>
             )}
             {showBeds24DetailView && (
               <button
