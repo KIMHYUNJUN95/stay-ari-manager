@@ -2631,7 +2631,7 @@ async function beds24GetRoomCalendarAllPages(params, { maxPages = 20, label = "c
 
 // Beds24는 minStay가 설정되지 않은 날짜를 "빈칸"으로 반환하며, 이는 1박을 의미한다.
 // 이를 빈 문자열로 저장하면 프론트의 활성 roomId 판정(1 <= m < 50)과 setMinStay의
-// getActiveRoomId가 NaN을 만나 해당 roomId를 "비활성"으로 오인한다.
+// getActiveRoomIds가 NaN을 만나 해당 roomId를 "비활성"으로 오인한다.
 // 그 결과 ① minStay 재수정이 통째로 스킵되고 ② 듀얼룸에서 그 roomId의 blackout이 화면에서 누락된다.
 // 따라서 캐시에는 항상 1 이상의 숫자 문자열로 정규화해 저장/응답한다.
 /**
@@ -6649,11 +6649,20 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300, memory: "1GiB"
 
         for (const rn of roomNameList) {
             const roomInfos = roomInfosByName[rn];
-            const getActiveRoomId = (dateKey, explicitRoomId = "") => {
-                if (explicitRoomId && roomInfos.some((info) => String(info.roomId) === String(explicitRoomId))) {
-                    return String(explicitRoomId);
-                }
-                if (roomInfos.length === 1) return String(roomInfos[0].roomId);
+            // 그 날짜에 열려 있는 roomId를 '전부' 돌려준다.
+            //
+            // 예전에는 활성 ID 하나만 골라 거기에만 minStay를 썼다. 그런데 듀얼 ID 객실은
+            // 두 ID가 동시에 열리는 교차일이 있고(예: 202호 2026-10-02 → 403542 m=2,
+            // 601546 m=1), 한쪽만 고치면
+            //   1) 화면은 활성 ID들의 최솟값을 보여주므로 값이 안 바뀐 것처럼 보이고
+            //   2) 실제로 나머지 ID를 통해 더 짧은 숙박 예약이 그대로 들어온다.
+            // 블락이 모든 ID를 함께 막는 것과 같은 이유다.
+            //
+            // 단, minStay 50~99는 사내에서 "판매 중지"로 쓰는 값이다. 그 ID에 값을 쓰면
+            // 닫아둔 객실을 되살리는 셈이므로 활성(1~49) ID만 대상으로 한다.
+            const getActiveRoomIds = (dateKey, explicitRoomId = "") => {
+                if (roomInfos.length === 1) return [String(roomInfos[0].roomId)];
+
                 const activeRoomIds = [];
                 for (const info of roomInfos) {
                     const rid = String(info.roomId);
@@ -6663,33 +6672,34 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300, memory: "1GiB"
                     const m = parseInt(normalizeBeds24MinStay(dateEntry.m), 10);
                     if (m >= 1 && m < INACTIVE_MS_THRESHOLD) activeRoomIds.push(rid);
                 }
-                if (activeRoomIds.length === 0) return null;
-                if (building === "가부키초" && rn === "803호" && activeRoomIds.includes("648398")) {
-                    return "648398";
+
+                // 프론트가 지목한 ID는 활성 판정과 무관하게 포함한다 (그 화면이 보여주던 값이다).
+                if (explicitRoomId
+                    && roomInfos.some((info) => String(info.roomId) === String(explicitRoomId))
+                    && !activeRoomIds.includes(String(explicitRoomId))) {
+                    activeRoomIds.push(String(explicitRoomId));
                 }
-                if (building === "아라키초A" && rn === "501호" && activeRoomIds.includes("502229")) {
-                    return "502229";
-                }
-                return activeRoomIds[0];
+
+                return activeRoomIds;
             };
 
             if (normalizedCells.length > 0) {
                 for (const cell of cellsByRoomName[rn] || []) {
                     const v2Date = `${cell.dateKey.slice(0, 4)}-${cell.dateKey.slice(4, 6)}-${cell.dateKey.slice(6, 8)}`;
-                    const rid = getActiveRoomId(cell.dateKey, cell.roomId);
-                    if (!rid) { skippedCells.push({ room: rn, date: v2Date }); continue; }
-                    addToGroup(rid, v2Date, cell.minStay, cell.dateKey, String(cell.minStay));
+                    const rids = getActiveRoomIds(cell.dateKey, cell.roomId);
+                    if (rids.length === 0) { skippedCells.push({ room: rn, date: v2Date }); continue; }
+                    rids.forEach((rid) => addToGroup(rid, v2Date, cell.minStay, cell.dateKey, String(cell.minStay)));
                 }
             } else if (dates && typeof dates === "object") {
                 for (const [dateKey, values] of Object.entries(dates)) {
                     const v2Date = `${dateKey.slice(0, 4)}-${dateKey.slice(4, 6)}-${dateKey.slice(6, 8)}`;
-                    const rid = getActiveRoomId(dateKey);
-                    if (!rid) { skippedCells.push({ room: rn, date: v2Date }); continue; }
+                    const rids = getActiveRoomIds(dateKey);
+                    if (rids.length === 0) { skippedCells.push({ room: rn, date: v2Date }); continue; }
                     // Beds24로 보내는 값과 캐시에 저장하는 값을 같게 맞춘다.
                     // 예전에는 전송은 parseInt(...)||1, 캐시는 String(values.m) 원본이라
                     // values.m이 비었을 때 캐시에 ""나 "undefined"가 들어갔다.
                     const normalizedM = parseInt(values.m, 10) || 1;
-                    addToGroup(rid, v2Date, normalizedM, dateKey, String(normalizedM));
+                    rids.forEach((rid) => addToGroup(rid, v2Date, normalizedM, dateKey, String(normalizedM)));
                 }
             } else if (dateFrom && dateTo && minStayValue !== undefined) {
                 const start = dayjs(dateFrom);
@@ -6699,9 +6709,9 @@ exports.setMinStay = onRequest({ cors: true, timeoutSeconds: 300, memory: "1GiB"
                     const d = start.add(i, "day");
                     const dateKey = d.format("YYYYMMDD");
                     const v2Date = d.format("YYYY-MM-DD");
-                    const rid = getActiveRoomId(dateKey);
-                    if (!rid) { skippedCells.push({ room: rn, date: v2Date }); continue; }
-                    addToGroup(rid, v2Date, minStayValue, dateKey, String(minStayValue));
+                    const rids = getActiveRoomIds(dateKey);
+                    if (rids.length === 0) { skippedCells.push({ room: rn, date: v2Date }); continue; }
+                    rids.forEach((rid) => addToGroup(rid, v2Date, minStayValue, dateKey, String(minStayValue)));
                 }
             } else {
                 return res.status(400).json({ success: false, error: "dates 또는 dateFrom/dateTo/minStayValue가 필요합니다" });

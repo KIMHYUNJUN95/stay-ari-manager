@@ -8122,15 +8122,17 @@ function BuildingCalendar() {
                       // ✅ 1단계: 낙관적 UI 업데이트 (API 호출 전 즉시 반영) - 활성 roomId만 (비활성 50/99 제외)
                       const optimisticPatchMap = {};
                       cellTargets.forEach(({ roomName, date, dateKey, roomId }) => {
-                        if (roomId) {
-                          if (!optimisticPatchMap[roomId]) optimisticPatchMap[roomId] = new Set();
-                          optimisticPatchMap[roomId].add(dateKey);
-                          return;
-                        }
-
-                        const roomInfos = getActiveUnitInfosForDate(roomName, date);
-                        roomInfos.forEach((roomInfo) => {
-                          const activeRoomId = String(roomInfo.roomId);
+                        // 그 날짜에 열려 있는 ID를 전부 패치한다. 서버도 같은 기준으로 쓴다.
+                        //
+                        // 예전에는 roomId가 지정되면 그 하나만 패치했다. 그런데 셀에 보이는
+                        // minStay는 활성 ID들의 '최솟값'이라, 교차일에 한쪽만 올리면
+                        // (예: 403542를 2로 올려도 601546이 1이면) 화면 값이 그대로여서
+                        // 적용이 안 된 것처럼 보였다.
+                        const targetIds = new Set(
+                          getActiveUnitInfosForDate(roomName, date).map((info) => String(info.roomId))
+                        );
+                        if (roomId) targetIds.add(String(roomId));
+                        targetIds.forEach((activeRoomId) => {
                           if (!optimisticPatchMap[activeRoomId]) optimisticPatchMap[activeRoomId] = new Set();
                           optimisticPatchMap[activeRoomId].add(dateKey);
                         });
