@@ -163,6 +163,14 @@ function isBulkDeletableBlockEntry(block) {
   return !isManualBlockEntry(block) && !isAppCreatedBlockEntry(block);
 }
 
+// 건물별 '큰방' 목록.
+//
+// 운영상 큰방을 먼저 확인하는 일이 많아 캘린더 위쪽에 모아 보여준다.
+// 객실명은 BUILDING_DATA의 표기와 정확히 같아야 한다 (이 건물은 '호' 접미사가 없다).
+const LARGE_ROOMS_BY_BUILDING = {
+  "STAY ARI Apartment Hotel": ["101", "102", "201", "202", "302"]
+};
+
 // 비활성 계정 minStay 기준값 (50 이상 = 비활성 판단)
 const INACTIVE_MINSTAY_THRESHOLD = 50;
 const PREFERRED_DUAL_ROOM_IDS = {
@@ -3215,6 +3223,8 @@ function BuildingCalendar() {
   ), [calendarBuilding, invalidatedPriceRoomIdsByBuilding]);
   const currentPriceConsistencyPending = !!priceConsistencyPendingByBuilding[calendarBuilding];
   const [vacantOnlyMode, setVacantOnlyMode] = useState(false);
+  // 큰방 우선 표시. 기본 켜짐 — 끄면 BUILDING_DATA 원래 순서로 돌아간다.
+  const [largeRoomsFirst, setLargeRoomsFirst] = useState(true);
   // 가격 개입으로 성사된 예약(바에 남색 테두리가 붙는 것)만 도드라지게 보는 모드.
   //
   // 다른 예약을 목록에서 제거하지 않고 흐리게만 한다. calendarReservationIndex는
@@ -5911,12 +5921,36 @@ function BuildingCalendar() {
     return set;
   }, [roomReservationsMap, rooms]);
 
-  const visibleRooms = useMemo(() => {
-    if (!vacantOnlyMode) return rooms;
-    return rooms.filter((room) => roomsVacantTodaySet.has(room));
-  }, [rooms, roomsVacantTodaySet, vacantOnlyMode]);
+  // 큰방을 위로 모으는 기능. 기본 켜짐이고, 끄면 기존 순서 그대로다.
+  const largeRoomSet = useMemo(
+    () => new Set(LARGE_ROOMS_BY_BUILDING[calendarBuilding] || []),
+    [calendarBuilding]
+  );
+  const hasLargeRooms = largeRoomSet.size > 0;
 
-  const selectableRooms = vacantOnlyMode ? visibleRooms : rooms;
+  // 표시 순서만 바꾼다. 집계·갭 판정·레인 배치는 전부 객실명을 키로 쓰므로
+  // 순서가 달라져도 계산 결과는 그대로다.
+  const orderRoomsForDisplay = useCallback((list) => {
+    if (!largeRoomsFirst || largeRoomSet.size === 0) return list;
+    const large = [];
+    const rest = [];
+    list.forEach((room) => (largeRoomSet.has(room) ? large : rest).push(room));
+    if (large.length === 0) return list;
+    return [...large, ...rest];
+  }, [largeRoomsFirst, largeRoomSet]);
+
+  const visibleRooms = useMemo(() => {
+    const base = vacantOnlyMode
+      ? rooms.filter((room) => roomsVacantTodaySet.has(room))
+      : rooms;
+    return orderRoomsForDisplay(base);
+  }, [rooms, roomsVacantTodaySet, vacantOnlyMode, orderRoomsForDisplay]);
+
+  // Shift+클릭 사각 범위가 화면에 보이는 순서와 어긋나지 않도록 같은 순서를 쓴다.
+  const selectableRooms = useMemo(
+    () => (vacantOnlyMode ? visibleRooms : orderRoomsForDisplay(rooms)),
+    [vacantOnlyMode, visibleRooms, rooms, orderRoomsForDisplay]
+  );
 
   // 주간 선택 칩. 현재 뷰에 보이는 미래 날짜를 월요일 시작 주로 묶는다.
   const selectableWeeks = useMemo(() => {
@@ -10692,6 +10726,49 @@ function BuildingCalendar() {
                 {vacantOnlyMode ? "Show All Rooms" : "Vacant Today"}
               </button>
             )}
+            {showBeds24DetailView && hasLargeRooms && (
+              <button
+                onClick={() => setLargeRoomsFirst((prev) => !prev)}
+                title={largeRoomsFirst
+                  ? "Large rooms are pinned to the top — click to use the original order"
+                  : "Pin large rooms to the top"}
+                style={{
+                  padding: isCalendarFullscreen ? "7px 12px" : "9px 14px",
+                  height: isCalendarFullscreen ? "34px" : "38px",
+                  borderRadius: isCalendarFullscreen ? "10px" : "12px",
+                  border: largeRoomsFirst ? "none" : "1px solid #CBD5E1",
+                  background: largeRoomsFirst
+                    ? "linear-gradient(135deg, #7C3AED 0%, #6D28D9 100%)"
+                    : "#FFFFFF",
+                  color: largeRoomsFirst ? "white" : "#334155",
+                  cursor: "pointer",
+                  fontWeight: "600",
+                  fontSize: isCalendarFullscreen ? "12px" : "13px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  boxShadow: largeRoomsFirst ? "0 4px 14px rgba(124, 58, 237, 0.26)" : "0 1px 2px rgba(15,23,42,0.05)",
+                  transition: "all 0.2s ease"
+                }}
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <rect x="3" y="4" width="18" height="7" rx="1.5" />
+                  <line x1="3" y1="15" x2="21" y2="15" />
+                  <line x1="3" y1="19" x2="21" y2="19" />
+                </svg>
+                Large Rooms
+                <span style={{
+                  padding: "1px 6px",
+                  borderRadius: "999px",
+                  background: largeRoomsFirst ? "rgba(255,255,255,0.22)" : "#F5F3FF",
+                  color: largeRoomsFirst ? "#FFFFFF" : "#6D28D9",
+                  fontSize: "11px",
+                  fontWeight: "800"
+                }}>
+                  {largeRoomSet.size}
+                </span>
+              </button>
+            )}
             {showBeds24DetailView && (
               <>
                 {/* 가격 개입으로 성사된 예약(남색 테두리)만 도드라지게 */}
@@ -11128,6 +11205,8 @@ function BuildingCalendar() {
                             justifyContent: priceMode ? "space-between" : "flex-start",
                             padding: "0 10px",
                             borderRight: "1px solid #F5F7FA",
+                            // 큰방은 왼쪽에 강조선을 둬 위로 모인 묶음임을 드러낸다.
+                            borderLeft: largeRoomSet.has(room) ? "3px solid #7C3AED" : "3px solid transparent",
                             color: "#334155",
                             background: "linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(248,250,252,0.98) 100%)",
                             gap: "8px",
