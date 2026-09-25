@@ -13,6 +13,10 @@ const formatRoom = (room) => String(room || '').replace('호', '').trim();
 
 const safeArray = (value) => (Array.isArray(value) ? value : []);
 
+// 이 점수 이상이면 "확실한 일치"로 본다 (정확·부분·공백무시·순서무관).
+// 그 미만(오타 허용)은 확실한 일치가 없을 때만 후보로 내보낸다.
+const SEARCH_STRONG_SCORE = 700;
+
 const normalizeSearchText = (value) =>
   String(value || '')
     .toLowerCase()
@@ -186,14 +190,31 @@ const editDistance = (a, b) => {
   return prev[b.length];
 };
 
-// 오타 허용폭: 짧은 단어에 관대하면 엉뚱한 결과가 쏟아진다.
-const allowedTypos = (len) => (len <= 3 ? 0 : len <= 5 ? 1 : 2);
+// 오타 허용 최소 길이. 짧은 검색어에 오타를 허용하면 관계없는 이름이 쏟아진다.
+const FUZZY_MIN_LEN = 4;
 
-const isFuzzyTokenHit = (needle, hayTokens) =>
-  hayTokens.some((hay) => {
-    if (hay.includes(needle) || needle.includes(hay)) return true;
+// 허용폭: 4~6자는 1자, 7자 이상은 2자. 그 미만은 오타를 허용하지 않는다.
+const allowedTypos = (len) => (len < FUZZY_MIN_LEN ? 0 : len <= 6 ? 1 : 2);
+
+/**
+ * 토큰 단위 유사 일치. 이름 토큰만 대상으로 한다.
+ *
+ * 예전에는 needle.includes(hay)까지 허용해서 "kimchi"가 "Ki"라는 이름에 걸렸고,
+ * 한두 글자 검색어가 거의 모든 이름에 걸렸다. 다음 조건을 모두 만족해야 한다.
+ *   - 검색 토큰이 FUZZY_MIN_LEN 이상
+ *   - 이름 토큰에 그대로 포함되거나(부분일치), 편집 거리가 허용폭 이내
+ *   - 오타로 볼 때는 첫 글자가 같아야 한다 (이름 첫 글자를 틀리는 경우는 드물고,
+ *     이 조건 하나로 무관한 이름이 대부분 걸러진다)
+ */
+const isFuzzyTokenHit = (needle, hayTokens) => {
+  if (needle.length < FUZZY_MIN_LEN) return false;
+  return hayTokens.some((hay) => {
+    if (hay.length < 3) return false;
+    if (hay.includes(needle)) return true;
+    if (needle[0] !== hay[0]) return false;
     return editDistance(needle, hay) <= allowedTypos(needle.length);
   });
+};
 
 /**
  * 검색 점수. 0이면 제외, 클수록 정확한 일치.
@@ -238,12 +259,22 @@ const scoreSearch = (customer, term) => {
   if (hayTokens.length === 0) return 0;
 
   // 모든 토큰이 그대로 들어 있으면 순서만 다른 경우다.
-  if (termTokens.every((tk) => hayTokens.some((hay) => hay.includes(tk)))) return 700;
+  // 한 글자 토큰은 이름 토큰과 완전히 같을 때만 인정한다 (아무 이름에나 걸리는 것 방지).
+  const allTokensPresent = termTokens.every((tk) =>
+    tk.length === 1
+      ? hayTokens.includes(tk)
+      : hayTokens.some((hay) => hay.includes(tk))
+  );
+  if (allTokensPresent) return 700;
 
-  // 토큰별 부분일치/오타 허용. 전부 맞아야 하고, 맞은 정도로 점수를 깎는다.
+  // 오타 허용은 '이름'에만 적용한다. 전화번호·건물명·국가에까지 오타를 허용하면
+  // 숫자 몇 자나 지명이 엉뚱하게 걸린다.
+  const nameTokens = tokenizeSearch(nameText);
+  if (nameTokens.length === 0) return 0;
+
   let fuzzyHits = 0;
   for (const tk of termTokens) {
-    if (!isFuzzyTokenHit(tk, hayTokens)) return 0;
+    if (!isFuzzyTokenHit(tk, nameTokens)) return 0;
     fuzzyHits += 1;
   }
   return 400 + fuzzyHits;
@@ -624,10 +655,15 @@ const GuestSearchModal = ({ initialQuery = '', onClose }) => {
         searchSource = aggregateReservationsToCustomers(cachedReservationsRef.current);
       }
 
-      // 정확한 일치가 위로 오고, 유사 이름은 아래에 후보로 남는다.
-      const matched = searchSource
+      // 확실히 맞는 결과가 하나라도 있으면 유사 후보는 아예 보여주지 않는다.
+      // 섞어서 내보내면 "관계없는 이름까지 나온다"가 된다. 유사 후보는 확실한
+      // 일치가 전혀 없을 때만 대안으로 쓴다.
+      const scored = searchSource
         .map((customer) => ({ customer, score: scoreSearch(customer, trimmed) }))
-        .filter((row) => row.score > 0)
+        .filter((row) => row.score > 0);
+      const hasStrongHit = scored.some((row) => row.score >= SEARCH_STRONG_SCORE);
+      const matched = scored
+        .filter((row) => !hasStrongHit || row.score >= SEARCH_STRONG_SCORE)
         .sort((a, b) =>
           b.score - a.score
           || String(b.customer.lastVisit || '').localeCompare(String(a.customer.lastVisit || ''))
