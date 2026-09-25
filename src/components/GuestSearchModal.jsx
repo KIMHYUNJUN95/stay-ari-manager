@@ -156,9 +156,58 @@ const aggregateReservationsToCustomers = (reservations = []) => {
   });
 };
 
-const matchesSearch = (customer, term) => {
+// 검색어를 토큰으로 쪼갠다. 이름/이메일/전화에 쓰이는 문자만 남긴다.
+const tokenizeSearch = (value) =>
+  normalizeSearchText(value)
+    .split(/[^\p{L}\p{N}@._+-]+/u)
+    .filter(Boolean);
+
+// 공백·하이픈 같은 구분자를 모두 없앤 형태. "kimhyun"으로 "Kim Hyun"을 찾게 해준다.
+const squashSearchText = (value) =>
+  normalizeSearchText(value).replace(/[^\p{L}\p{N}@.]+/gu, '');
+
+// 편집 거리 (오타·유사 이름 허용). 길이 차가 크면 계산하지 않고 포기한다.
+const editDistance = (a, b) => {
+  if (a === b) return 0;
+  if (!a.length || !b.length) return Math.max(a.length, b.length);
+  if (Math.abs(a.length - b.length) > 3) return 99;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i += 1) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      cur[j] = Math.min(
+        prev[j] + 1,
+        cur[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+};
+
+// 오타 허용폭: 짧은 단어에 관대하면 엉뚱한 결과가 쏟아진다.
+const allowedTypos = (len) => (len <= 3 ? 0 : len <= 5 ? 1 : 2);
+
+const isFuzzyTokenHit = (needle, hayTokens) =>
+  hayTokens.some((hay) => {
+    if (hay.includes(needle) || needle.includes(hay)) return true;
+    return editDistance(needle, hay) <= allowedTypos(needle.length);
+  });
+
+/**
+ * 검색 점수. 0이면 제외, 클수록 정확한 일치.
+ *
+ * 예전에는 haystack.includes(term) 하나였다. 그래서 "Kim Hyun"을 "kim  hyun"이나
+ * "Hyun Kim"으로 찾을 수 없었고 오타는 아예 안 걸렸다. 다음 순서로 점수를 준다.
+ *   1) 이름/연락처 전체에 그대로 포함        (가장 정확)
+ *   2) 공백을 없앤 형태로 포함               (띄어쓰기 차이)
+ *   3) 모든 토큰이 순서 무관하게 포함        (성·이름 뒤바뀜)
+ *   4) 토큰별 부분일치 또는 오타 허용        (유사 이름)
+ */
+const scoreSearch = (customer, term) => {
   const normalized = normalizeCustomer(customer);
-  const lowerTerm = normalizeSearchText(term);
+  const nameText = normalizeSearchText(normalized.guestName);
   const haystack = [
     normalized.guestName,
     normalized.guestEmail,
@@ -173,8 +222,34 @@ const matchesSearch = (customer, term) => {
     .toLowerCase()
     .replace(/\s+/g, ' ');
 
-  return haystack.includes(lowerTerm);
+  const lowerTerm = normalizeSearchText(term);
+  if (!lowerTerm) return 0;
+
+  if (nameText && nameText === lowerTerm) return 1000;
+  if (haystack.includes(lowerTerm)) return 900;
+
+  const squashedHay = squashSearchText(haystack);
+  const squashedTerm = squashSearchText(term);
+  if (squashedTerm && squashedHay.includes(squashedTerm)) return 800;
+
+  const termTokens = tokenizeSearch(term);
+  if (termTokens.length === 0) return 0;
+  const hayTokens = tokenizeSearch(haystack);
+  if (hayTokens.length === 0) return 0;
+
+  // 모든 토큰이 그대로 들어 있으면 순서만 다른 경우다.
+  if (termTokens.every((tk) => hayTokens.some((hay) => hay.includes(tk)))) return 700;
+
+  // 토큰별 부분일치/오타 허용. 전부 맞아야 하고, 맞은 정도로 점수를 깎는다.
+  let fuzzyHits = 0;
+  for (const tk of termTokens) {
+    if (!isFuzzyTokenHit(tk, hayTokens)) return 0;
+    fuzzyHits += 1;
+  }
+  return 400 + fuzzyHits;
 };
+
+const matchesSearch = (customer, term) => scoreSearch(customer, term) > 0;
 
 const MetricCard = ({ label, value, accent = '#4F46E5' }) => (
   <div
@@ -549,10 +624,16 @@ const GuestSearchModal = ({ initialQuery = '', onClose }) => {
         searchSource = aggregateReservationsToCustomers(cachedReservationsRef.current);
       }
 
+      // 정확한 일치가 위로 오고, 유사 이름은 아래에 후보로 남는다.
       const matched = searchSource
-        .filter((customer) => matchesSearch(customer, trimmed))
-        .sort((a, b) => String(b.lastVisit || '').localeCompare(String(a.lastVisit || '')))
-        .slice(0, SEARCH_RESULT_LIMIT);
+        .map((customer) => ({ customer, score: scoreSearch(customer, trimmed) }))
+        .filter((row) => row.score > 0)
+        .sort((a, b) =>
+          b.score - a.score
+          || String(b.customer.lastVisit || '').localeCompare(String(a.customer.lastVisit || ''))
+        )
+        .slice(0, SEARCH_RESULT_LIMIT)
+        .map((row) => row.customer);
 
       setResults(matched);
       if (matched.length === 1) setSelectedCustomer(matched[0]);
