@@ -22,6 +22,8 @@ function PriceChangeHistory() {
     const showConversionOnly = originFilter === "conversion";
     const HISTORY_REFRESH_INTERVAL_MS = 30000;
     const HISTORY_PAGE_SIZE = 1000;
+    // attribution 하한. 기본 조회와 폴백이 같은 값을 써야 결과 범위가 어긋나지 않는다.
+    const ATTRIBUTION_MIN_DATE = "2026-04-11";
     const HISTORY_MAX_PAGES = 12;
 
     const getTokyoDateKey = (ts) => {
@@ -117,7 +119,7 @@ function PriceChangeHistory() {
                     const constraints = [
                         where("companyId", "==", companyId),
                         where("status", "==", "confirmed"),
-                        where("bookDate", ">=", "2026-04-11"),
+                        where("bookDate", ">=", ATTRIBUTION_MIN_DATE),
                         orderBy("bookDate", "desc"),
                         limit(HISTORY_PAGE_SIZE)
                     ];
@@ -137,25 +139,42 @@ function PriceChangeHistory() {
             } catch (indexedQueryError) {
                 console.warn("Reservation newest query fallback:", indexedQueryError?.message || indexedQueryError);
                 collected = [];
+            }
+
+            // 기본 조회가 아무것도 못 가져왔으면 오름차순으로 한 번 더 시도한다.
+            //
+            // 예전 폴백은 orderBy가 없었다. 그러면 Firestore가 문서 ID 순으로 주는데
+            // Beds24 예약 ID는 낮을수록 오래된 것이라, 12페이지 상한에 걸려 '오래된 예약만'
+            // 담겼다. 그래서 히스토리 전환 목록에 옛날 건만 보였다.
+            // 오름차순은 (companyId, status, bookDate ASC) 인덱스가 이미 있어 확실히 동작하고,
+            // bookDate >= ATTRIBUTION_MIN_DATE로 범위가 묶여 있어 양도 유한하다.
+            if (collected.length === 0) {
                 let lastDoc = null;
                 for (let page = 0; page < HISTORY_MAX_PAGES; page += 1) {
                     const constraints = [
                         where("companyId", "==", companyId),
                         where("status", "==", "confirmed"),
+                        where("bookDate", ">=", ATTRIBUTION_MIN_DATE),
+                        orderBy("bookDate", "asc"),
                         limit(HISTORY_PAGE_SIZE)
                     ];
                     if (lastDoc) constraints.push(startAfter(lastDoc));
 
-                    const fallbackQuery = query(collection(db, "reservations"), ...constraints);
-                    const snapshot = await getDocs(fallbackQuery);
-                    if (snapshot.empty) break;
+                    try {
+                        const fallbackQuery = query(collection(db, "reservations"), ...constraints);
+                        const snapshot = await getDocs(fallbackQuery);
+                        if (snapshot.empty) break;
 
-                    collected = collected.concat(
-                        snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }))
-                    );
+                        collected = collected.concat(
+                            snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }))
+                        );
 
-                    if (snapshot.docs.length < HISTORY_PAGE_SIZE) break;
-                    lastDoc = snapshot.docs[snapshot.docs.length - 1];
+                        if (snapshot.docs.length < HISTORY_PAGE_SIZE) break;
+                        lastDoc = snapshot.docs[snapshot.docs.length - 1];
+                    } catch (ascQueryError) {
+                        console.warn("Reservation ascending fallback failed:", ascQueryError?.message || ascQueryError);
+                        break;
+                    }
                 }
             }
 
